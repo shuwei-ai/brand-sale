@@ -72,9 +72,19 @@ const XHS_ERROR_HINT: Record<string, string> = {
   verification_required: "触发了小红书验证码：需人工在浏览器完成验证，代理侧会自动退避冷却后重试",
   ip_blocked: "出口 IP 被限流：需切换网络/出口 IP，并降低调用频率后重试",
   signature_error: "请求签名失败：通常是采集工具版本过旧，升级代理侧工具后重试",
-  unsupported_operation: "代理不支持该操作：适配器只请求只读子集",
-  api_error: "小红书上游接口报错（可能是笔记已删除或权限受限）",
+  tool_missing:
+    "代理未就绪：代理所在机器没装或无法执行 xhs CLI。这不是小红书侧的问题，也不是本系统的数据缺口。" +
+    "需在代理侧执行 uv tool install xiaohongshu-cli 并完成一次登录；若只想先跑通链路，" +
+    "可把 BM_XHS_BASE_URL 指向 npm run datasource:lab（mock 模式，数据自带 synthetic 标记）。",
+  proxy_error: "代理自身出错（CLI 进程启动失败或代理内部异常）：看代理侧日志定位，与小红书限流无关",
+  unsupported_operation: "代理不支持该操作：适配器只请求只读子集（note/comments/user/userPosts）",
+  api_error: "小红书上游接口报错（可能是笔记已删除、链接缺 xsec_token，或字段结构有变）",
 };
+
+/** 错误码 → 处置。未登记的码也要给出可动作的下一步，不能只丢一个码给运营。 */
+const xhsHint = (code: string): string =>
+  XHS_ERROR_HINT[code] ??
+  `代理返回未登记的错误码「${code}」：先确认代理实现是否与 docs/datasource-integration.md 的契约一致，再看代理侧日志`;
 
 /* ── 归一化小工具（与抖音适配器同一套口径，两个文件各自独立以免耦合） ── */
 
@@ -237,20 +247,39 @@ export function createXhsWebAdapter(config: Config): DataSourceAdapter {
         if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
         const resp = await fetch(target, { method: "GET", headers, signal: controller.signal });
+        const text = await resp.text().catch(() => "");
+        // 先解析再判状态码。反过来的话，"代理未就绪"（503）与"代理内部错"（502）会在
+        // HTTP 分支上被压成一句 `代理 HTTP 503`，永远走不到上面的处置表 —— 而归一化
+        // 错误码的全部意义就是让这几种失败各自带上可执行的下一步。
+        let env: Json | null = null;
+        try {
+          const j = JSON.parse(text) as unknown;
+          // 不用 asObj：它对非对象返回 {} 而不是 null，"是不是 JSON 对象"这个判断会永远为真
+          env = j !== null && typeof j === "object" && !Array.isArray(j) ? (j as Json) : null;
+        } catch {
+          env = null;
+        }
         if (!resp.ok) {
-          const body = await resp.text().catch(() => "");
-          throw new Error(`小红书代理 HTTP ${resp.status}：${body.slice(0, 200)}`);
+          const err = asObj(env?.error);
+          const code = str(err.code ?? env?.code ?? `http_${resp.status}`);
+          throw new Error(
+            `小红书采集失败 [${code}]（代理 HTTP ${resp.status}）：${xhsHint(code)}` +
+              (err.message ? `（原文：${str(err.message).slice(0, 200)}）` : text ? `（响应：${text.slice(0, 200)}）` : ""),
+          );
+        }
+        if (!env) {
+          throw new Error(`小红书代理返回的不是 JSON（前 200 字符）：${text.slice(0, 200) || "(空响应)"}`);
         }
 
-        const env = asObj(await resp.json());
         // 联调工具返回的假数据带 `_lab:{mock:true}`，据此把 synthetic 置 true。
         // 理由同抖音适配器：假数据必须在 provenance 里显式可见，不能被当成真实采集。
         const labMock = asObj(env._lab).mock === true;
         if (env.ok === false || env.error !== undefined) {
           const err = asObj(env.error);
           const code = str(err.code ?? env.code ?? "api_error");
-          const hint = XHS_ERROR_HINT[code] ?? `代理返回未登记的错误码「${code}」`;
-          throw new Error(`小红书采集失败 [${code}]：${hint}${err.message ? `（原文：${str(err.message).slice(0, 120)}）` : ""}`);
+          throw new Error(
+            `小红书采集失败 [${code}]：${xhsHint(code)}${err.message ? `（原文：${str(err.message).slice(0, 200)}）` : ""}`,
+          );
         }
 
         // CLI 的输出信封把载荷放在 data 下；代理契约保持一致

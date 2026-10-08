@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 联网搜索 `volc_web_search` | ✅ 就绪 | ✅ **实测连通** | 火山引擎联网搜索 Lite，凭 `.env` 里的 Key 抓公开网页 |
 | 抖音公开内容 `douyin_web_public` | ✅ 就绪 | ⏳ 待接自托管服务 | 填 `BM_DOUYIN_BASE_URL` 即生效；本地联调走 `datasource:lab` |
-| 小红书公开内容 `xhs_web_public` | ✅ 就绪 | ⏳ 待接只读代理 | 填 `BM_XHS_BASE_URL` 即生效；本地联调走 `datasource:lab` |
+| 小红书公开内容 `xhs_web_public` | ✅ 就绪 | ⏳ 待接只读代理 | 只读代理（含错误码归一化）已实现并跑通进程级验收；缺的是代理侧那次 `xhs` 登录。填 `BM_XHS_BASE_URL` 即生效 |
 
 **「代码就绪」与「数据就绪」是两件事**，本文所有结论都按这个口径写。
 三个源都遵守同一条装配规则：**未配置就不注册**——适配器不存在 → 工具不进 Agent 工具清单 →
@@ -139,7 +139,8 @@ BM_XHS_PATH_USER_POSTS=/xhs/user-posts
 
 所以划一条硬边界：适配器不 spawn 任何东西，只认一个**只暴露只读子命令**的 HTTP 代理。
 `scripts/datasource-lab.ts` 里实现了参考代理：命令白名单写死在路由表上，
-写命令**根本不存在于**它的路由表里。
+写命令**根本不存在于**它的路由表里（`XHS_CLI_READONLY` 只有 `read` / `comments` /
+`user` / `user-posts` 四条，其余子命令连拼接的机会都没有）。
 
 ### 契约
 
@@ -185,9 +186,46 @@ GET {baseUrl}/xhs/user-posts?user_id=<id>&count=20
 | `verification_required` | 触发验证码：需人工在浏览器完成验证，代理会退避冷却 |
 | `ip_blocked` | 出口 IP 被限流：需切换网络/出口 IP 并降频 |
 | `signature_error` | 请求签名失败：通常是采集工具版本过旧 |
-| `tool_missing` | 本机未安装 CLI（代理自检抛出） |
+| `tool_missing` | 代理所在机器没装或无法执行 xhs CLI（**代理未就绪，不是小红书侧问题**） |
+| `proxy_error` | 代理自身出错（CLI 启动失败/内部异常），看代理日志 |
+| `unsupported_operation` | 代理不支持该操作（适配器只请求只读子集） |
 
 每条都能回答"我现在该做什么"。只写"小红书不可用"等于把排查成本推给运营。
+
+### 归一层：CLI 的失败词汇不稳定，不能原样透传
+
+上表要能命中，前提是错误码已经落在契约词汇里。但**真实 CLI 的输出不是这样**：
+
+```
+只给一句中文 "登录已过期，请重新登录"          ← 连 code 都没有
+给一个自造的码 E_RISK，信息全在 message 里      ← 码不在契约里
+连 JSON 都没有，只在 stderr 打 "请求过于频繁，IP 已被限流 (429)" + 非零退出码
+英文 "Error: no a1 cookie found, not logged in"
+```
+
+原样透传的话，适配器的处置表**永远命中不了**，运营看到的仍是"小红书不可用"——
+而归一化存在的唯一理由就是消灭这句话。
+
+所以代理侧多了一层 `classifyXhsFailure()`：按「登录态过期 → 未登录 → 验证码 → 限流 →
+签名」的顺序用文案特征识别，把结果压成上表里的**闭合码集**。两条原则：
+
+1. **CLI 若已给出契约里的码，原样尊重**——不要用文案去覆盖一个明确的结构化声明。
+2. **认不出来就说认不出来**，退到 `api_error`，并把 CLI 的原始码与原文写进 `message`
+   （形如 `[CLI 原始码 E_RISK] 触发验证码…`），不猜、不丢信息。
+
+判定顺序有讲究：`session_expired` 必须排在 `not_authenticated` 前面，因为"登录已过期"
+里也含"登录"二字，反过来会把过期误报成未登录；`verification_required` 排在 `ip_blocked`
+前面，因为触发验证的文案里常带"风控"。
+
+### 代理未就绪走 5xx，业务失败走 200
+
+`tool_missing` / `proxy_error` 是**代理自身**的问题（没装 CLI、CLI 不可执行、启动超时），
+用 503/504/502；`not_authenticated` 等是**小红书侧**的业务失败，与 `xhs-cli` 的失败信封
+一致地用 200 返回。
+
+这条区分必须在适配器里被正确对待：HTTP 状态检查若排在信封解析**之前**，
+503 会被压成一句 `代理 HTTP 503`，处置表就白写了。所以适配器先解析响应体、
+再判状态码，两条路径都汇总到同一张处置表。
 
 ---
 
@@ -197,12 +235,22 @@ GET {baseUrl}/xhs/user-posts?user_id=<id>&count=20
 
 ```bash
 npm run datasource:lab            # 默认 127.0.0.1:8899
-npm run datasource:lab -- --xhs-real   # 小红书侧改调真实 xhs CLI
+npm run datasource:lab -- --xhs-real   # 小红书侧改调真实 xhs CLI（只读子命令白名单）
+npm run datasource:lab -- --xhs-real --xhs-bin=/path/to/xhs   # 换一个可执行文件
 
 # 另一个终端
 BM_DOUYIN_BASE_URL=http://127.0.0.1:8899 \
 BM_XHS_BASE_URL=http://127.0.0.1:8899 npm start
 ```
+
+`--xhs-bin` 默认是 `xhs`。它的用途是把**归一层**也纳入验收：真要跑一遍
+"未登录 / 登录态过期 / 验证码 / 限流 / 签名失败 / 认不出来"这几条路径，得先
+`uv tool install xiaohongshu-cli` 再扫码登录 —— 既污染部署机，又没法在 CI 里复现。
+所以测试用 `tests/fixtures/fake-xhs.mjs` 顶替：它逐一复刻上面几种真实输出形态，
+由 `tests/xhs-proxy.test.ts` 真实 spawn 子进程跑完整链路（含"本机未装 CLI"那条）。
+
+> 夹具的成功响应带 `_lab: { mock: true }`，代理透传、适配器据此把 `synthetic` 置为
+> true —— 夹具产出的假数据不会冒充真实采集，`datasource:smoke` 也会打一行醒目提示。
 
 **它不是"内置的假数据源"**，区别在这里：假数据源会伪装成真实源，让报告出现
 "看起来像实测值的假数据"（本项目删过一次，不会再犯）。本工具返回的每个响应都带
@@ -262,7 +310,12 @@ npm run datasource:smoke -- --douyin-sec-user-id=MS4wLjABAAAA...
 
 **小红书**：在部署机器上 `uv tool install xiaohongshu-cli` 并完成一次登录，
 然后以 `--xhs-real` 模式运行代理（或自行实现同契约的服务），
-把地址填进 `BM_XHS_BASE_URL`。
+把地址填进 `BM_XHS_BASE_URL`。若 CLI 不在 PATH 里，可用 `--xhs-bin=<路径>` 指定。
+
+> 代理已经不是待办项了：只读子命令白名单、路由表隔离、错误码归一化都已在
+> `scripts/datasource-lab.ts` 里实现，并由 `tests/xhs-proxy.test.ts` 用真实子进程验过。
+> 剩下的只有"在一台有登录态的机器上把它跑起来"这一步——**代码就绪 ≠ 数据就绪**，
+> 本文件的结论一律按这个口径写。
 
 **验证**：`npm run datasource:smoke` 应显示 `synthetic=false` 且拿到真实行数。
 

@@ -17,6 +17,8 @@
  *
  *   默认（mock）：抖音按 DTK v4 响应形态、小红书按只读代理契约，返回确定性假数据
  *   `--xhs-real`：小红书侧改为调用真实的 `xhs` CLI（只读子命令白名单）
+ *                可用 `--xhs-bin=<路径>` 换掉可执行文件名（默认 `xhs`），
+ *                便于用假 CLI 夹具验证错误码归一化，或指向 uv tool 装的另一份拷贝
  *
  * ── 快速开始 ────────────────────────────────────────────────
  *
@@ -48,6 +50,15 @@ const HOST = opt("host", "127.0.0.1");
 const XHS_REAL = flag("xhs-real");
 /** 真实模式下单个 CLI 命令的超时（要留出 CLI 内置的 1-1.5s 人类化延迟） */
 const CLI_TIMEOUT_MS = Number(opt("cli-timeout", "20000"));
+/**
+ * 可执行文件名/路径。默认 `xhs`；给测试夹具或另一份安装留出口子。
+ *
+ * 它不削弱"只读"这条边界：边界落在**参数怎么拼**上（`XHS_CLI_READONLY` 只生成
+ * read/comments/user/user-posts 四个子命令），换二进制不改变会调用哪些命令。
+ * 一个被换掉的二进制能干的事，和 PATH 上一个被投毒的 `xhs` 能干的事是一样的，
+ * 所以这里没有引入新的信任假设。
+ */
+const XHS_BIN = opt("xhs-bin", "xhs");
 
 /* ── 确定性假数据（与 scripts/seed.ts 里的达人保持一致的观感） ── */
 
@@ -223,9 +234,76 @@ const XHS_CLI_READONLY: Record<string, CliPlan> = {
   userPosts: { argv: (v) => ["user-posts", v, "--json"] },
 };
 
+/* ── CLI 原生失败 → 契约标准错误码 ───────────────────────────
+ *
+ * 为什么需要这一层：CLI 的失败词汇**不稳定**。它有时给出自己的 `err.code`（且命名
+ * 不一定与契约一致），有时只打印一句中文/英文报错，有时连 JSON 都不给、只能靠退出码
+ * 判断。如果原样透传，适配器那张「错误码 → 处置」表就永远命中不了，
+ * 运营最终看到的仍然是一句"小红书不可用"——而归一化的全部意义就是消灭这句话。
+ *
+ * 所以这里只做一件事：把能识别的失败压成契约里固定的那几个码。
+ * **认不出来就如实说认不出来**，不猜——留原始片段，让人去看。
+ *
+ * 判定顺序有讲究：先"登录态过期"再"未登录"，因为"登录已过期"同时含"登录"，
+ * 反过来会把过期误报成未登录；"验证码"排在"限流"前，因为触发验证的文案里常带"风控"。
+ */
+const XHS_CANONICAL_CODES = new Set([
+  "not_authenticated",
+  "session_expired",
+  "verification_required",
+  "ip_blocked",
+  "signature_error",
+  "tool_missing",
+  "unsupported_operation",
+  "api_error",
+]);
+
+const XHS_FAIL_PATTERNS: { code: string; re: RegExp }[] = [
+  // 登录态过期：Cookie 约 7 天，这是最高频的一类
+  { code: "session_expired", re: /(登录|登陆|登入)[^\n]{0,8}(已)?(过期|失效|超时)|session[^\n]{0,10}expir|token[^\n]{0,10}expir|cookie[^\n]{0,10}expir/i },
+  // 从未登录：代理侧还没做过那一次登录
+  { code: "not_authenticated", re: /未登录|尚未登录|请先登录|需要登录|请登录|重新登录|未认证|未授权|缺少\s*cookie|没有\s*cookie|cookie\s*(缺失|为空)|no\s*a1\s*cookie|not\s*(logged|authenticated)|login\s*required|unauthenticated/i },
+  // 验证码 / 人机校验：需要人工介入，自动重试没有意义
+  { code: "verification_required", re: /验证码|captcha|人机(验证|校验)|滑块|安全验证|verify[_ ]?(code|failed)|verification[^\n]{0,10}(required|failed)/i },
+  // 限流 / IP 被封
+  { code: "ip_blocked", re: /(ip)[^\n]{0,10}(封|限|拉黑|异常)|ip[^\n]{0,10}(block|ban|limit)|too\s*many\s*request|rate[^\n]{0,6}limit|请求(过于)?频繁|频率(过高|限制)|限流|风控拦截|\b429\b/i },
+  // 签名失败：通常是采集工具版本过旧
+  { code: "signature_error", re: /签名(错误|失败|校验|不合法|异常)|signature[^\n]{0,10}(error|fail|invalid)|sign[^\n]{0,6}fail/i },
+];
+
+/** 命中返回标准码，否则返回 null（= 认不出来，不猜） */
+function classifyXhsFailure(text: string): string | null {
+  for (const { code, re } of XHS_FAIL_PATTERNS) if (re.test(text)) return code;
+  return null;
+}
+
+/**
+ * 把「CLI 给的错误码 + 原文」归一化成契约码。
+ *
+ * 返回的码**一定落在 XHS_CANONICAL_CODES 里**。理由：错误码空间必须是闭合的，
+ * 否则适配器的处置表就是一个永远补不完的表格，而"未登记的错误码"对运营毫无信息量。
+ * 认不出来时退到 `api_error`，但 CLI 的原始码会由调用方写进 message 里，不丢信息。
+ *
+ * @param code CLI 自己给的码（可能没有、可能不是契约词汇）
+ * @param text 原文（stdout + stderr），用于在 code 不可用时兜底识别
+ */
+function normalizeXhsFailure(code: string, text: string): string {
+  // CLI 若已经给出契约里的码，尊重它——不要用文案去覆盖一个明确的结构化声明
+  if (XHS_CANONICAL_CODES.has(code)) return code;
+  // 否则用 code + 原文一起识别（code 本身可能就是有信息量的英文单词）
+  return classifyXhsFailure(`${code}\n${text}`) ?? "api_error";
+}
+
+/** 把 CLI 的原始码与原文拼成一条不丢信息的 message */
+function xhsFailureMessage(code: string, text: string): string {
+  const excerpt = text.replace(/\s+/g, " ").trim().slice(0, 240);
+  const tag = code && !XHS_CANONICAL_CODES.has(code) ? `[CLI 原始码 ${code}] ` : "";
+  return `${tag}${excerpt || "(CLI 未输出任何错误信息)"}`;
+}
+
 function runXhsCli(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("xhs", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(XHS_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
@@ -257,9 +335,14 @@ function extractJson(text: string): Record<string, unknown> | null {
   }
 }
 
+const xhsErr = (code: string, message: string): { ok: false; error: { code: string; message: string } } => ({
+  ok: false,
+  error: { code, message },
+});
+
 async function callXhsCli(op: string, input: string, count: number): Promise<{ status: number; body: unknown }> {
   const plan = XHS_CLI_READONLY[op];
-  if (!plan) return { status: 400, body: { ok: false, error: { code: "unsupported_operation", message: `未登记的操作 ${op}` } } };
+  if (!plan) return { status: 400, body: xhsErr("unsupported_operation", `未登记的操作 ${op}`) };
 
   let r: { code: number; stdout: string; stderr: string };
   try {
@@ -267,32 +350,68 @@ async function callXhsCli(op: string, input: string, count: number): Promise<{ s
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     // ENOENT：本机没装 CLI。这属于"代理未就绪"，不是"小红书不可用"，要说清区别
-    const code = /ENOENT/.test(msg) ? "tool_missing" : "proxy_error";
+    if (/ENOENT/.test(msg)) {
+      return {
+        status: 503,
+        body: xhsErr(
+          "tool_missing",
+          `本机未安装 xhs CLI（可执行文件 "${XHS_BIN}" 不存在）。在部署机器上执行 uv tool install xiaohongshu-cli 并完成一次登录；` +
+            `若只想先跑通链路，用 npm run datasource:lab（mock 模式）并把 BM_XHS_BASE_URL 指向它。`,
+        ),
+      };
+    }
+    if (/EACCES/.test(msg)) {
+      // EACCES 和 ENOENT 都是"代理未就绪"，但对运维来说修复动作不同，不能合并成一句
+      return {
+        status: 503,
+        body: xhsErr("tool_missing", `xhs CLI 存在但不可执行（权限不足）：给 "${XHS_BIN}" 补上执行位，或换用 --xhs-bin 指向可执行的拷贝。`),
+      };
+    }
+    if (/超时/.test(msg)) {
+      return { status: 504, body: xhsErr("proxy_error", `${msg}。CLI 内置人类化延迟，可用 --cli-timeout 调大，或降低并发。`) };
+    }
+    return { status: 502, body: xhsErr("proxy_error", `无法启动 xhs CLI：${msg}`) };
+  }
+
+  const raw = `${r.stderr}\n${r.stdout}`.trim();
+  const parsed = extractJson(r.stdout) ?? extractJson(r.stderr);
+
+  if (parsed) {
+    // CLI 自己的信封已经是 { ok, data, error }（见其 SCHEMA.md），先看它是不是失败
+    const err = parsed.error as { code?: unknown; message?: unknown } | undefined;
+    if (err !== undefined || parsed.ok === false) {
+      const cliCode = String(err?.code ?? "");
+      const cliMsg = String(err?.message ?? "");
+      return {
+        status: 200,
+        body: xhsErr(normalizeXhsFailure(cliCode, `${cliMsg}\n${raw}`), xhsFailureMessage(cliCode, cliMsg || raw)),
+      };
+    }
+    // 上游若自己带了 `_lab`（测试夹具会带），原样透传 —— 适配器据此把 synthetic 置 true。
+    // 真实 xhs CLI 不带这个字段，所以这一分支只在夹具上生效，不影响真实链路。
+    const lab = parsed._lab;
     return {
-      status: 503,
-      body: {
-        ok: false,
-        error: {
-          code,
-          message: /ENOENT/.test(msg)
-            ? "本机未安装 xhs CLI（uv tool install xiaohongshu-cli）。用 --xhs-mock 可先跑通链路。"
-            : msg,
-        },
-      },
+      status: 200,
+      body: { ok: true, ...(lab ? { _lab: lab } : {}), data: parsed.data ?? parsed, meta: { via: "xhs-cli" } },
     };
   }
 
-  const parsed = extractJson(r.stdout) ?? extractJson(r.stderr);
-  if (!parsed) {
-    return { status: 502, body: { ok: false, error: { code: "api_error", message: `无法解析 CLI 输出：${(r.stderr || r.stdout).slice(0, 200)}` } } };
+  // 没有可解析的 JSON：可能是升级提示、可能只是把错误打在了 stderr。用原文归一化。
+  if (r.code === 0) {
+    return { status: 502, body: xhsErr("api_error", `CLI 退出码 0 但输出不是 JSON，无法解析：${raw.slice(0, 240)}`) };
   }
-
-  // CLI 自己的信封已经是 { ok, data, error }（见其 SCHEMA.md），直接透传
-  const err = parsed.error as { code?: string; message?: string } | undefined;
-  if (err?.code || parsed.ok === false) {
-    return { status: 200, body: { ok: false, error: { code: err?.code ?? "api_error", message: err?.message ?? "CLI 返回失败" } } };
+  const sniffed = classifyXhsFailure(raw);
+  if (sniffed) {
+    // 认出来了：按契约码返回（业务错误走 200，与 xhs-cli 的失败信封一致）
+    return { status: 200, body: xhsErr(sniffed, xhsFailureMessage("", raw)) };
   }
-  return { status: 200, body: { ok: true, data: parsed.data ?? parsed, meta: { via: "xhs-cli" } } };
+  return {
+    status: 502,
+    body: xhsErr(
+      "api_error",
+      `xhs CLI 退出码 ${r.code}，输出既不匹配任何已知失败模式、也不是 JSON：${raw.slice(0, 240) || "(无输出)"}`,
+    ),
+  };
 }
 
 /* ── HTTP 服务 ───────────────────────────────────────────── */
@@ -317,6 +436,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     sendJson(res, 200, {
       ok: true,
       mode: XHS_REAL ? "xhs-real" : "mock",
+      xhsBin: XHS_REAL ? XHS_BIN : null,
       douyinEndpoints: [
         "/api/douyin/web/fetch_user_profile",
         "/api/douyin/web/fetch_user_post_videos",
@@ -403,7 +523,7 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   const base = `http://${HOST}:${PORT}`;
-  console.log(`[lab] 监听 ${base}  模式：${XHS_REAL ? "小红书走真实 xhs CLI" : "全部 mock"}`);
+  console.log(`[lab] 监听 ${base}  模式：${XHS_REAL ? `小红书走真实 CLI（${XHS_BIN}）` : "全部 mock"}`);
   console.log(`[lab] 抖音假数据源：${base}/api/douyin/web/fetch_user_profile 等 4 个端点`);
   console.log(`[lab] 小红书只读代理：${base}/xhs/note|comments|user|user-posts`);
   console.log("");
