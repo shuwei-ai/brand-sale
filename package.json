@@ -1,0 +1,35 @@
+{
+  "name": "brandsale",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "品牌营销 AI 策略咨询系统 · 可运行纵切（Phase 1）",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "migrate": "tsx packages/storage/src/cli.ts migrate",
+    "seed": "tsx scripts/seed.ts",
+    "dev": "tsx watch apps/gateway/src/main.ts",
+    "start": "tsx apps/gateway/src/main.ts",
+    "demo": "tsx scripts/demo.ts",
+    "demo:mock": "BM_LLM_MODE=mock tsx scripts/demo.ts",
+    "test": "BM_LLM_MODE=mock node --import tsx --test tests/*.test.ts",
+    "check:boundaries": "tsx scripts/check-boundaries.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "1.0.3",
+    "@earendil-works/pi-ai": "1.0.3",
+    "@earendil-works/pi-durable": "1.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

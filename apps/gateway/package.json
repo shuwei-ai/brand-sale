@@ -1,0 +1,19 @@
+{
+  "name": "@brandsale/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/main.ts",
+  "dependencies": {
+    "@brandsale/agent-pack": "*",
+    "@brandsale/config": "*",
+    "@brandsale/contracts": "*",
+    "@brandsale/governance": "*",
+    "@brandsale/knowledge": "*",
+    "@brandsale/model-gateway": "*",
+    "@brandsale/orchestrator": "*",
+    "@brandsale/render": "*",
+    "@brandsale/storage": "*",
+    "@brandsale/datasource": "*"
+  }
+}

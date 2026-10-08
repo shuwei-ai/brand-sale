@@ -1,0 +1,26 @@
+{
+  "slides": 13,
+  "bodySlides": 10,
+  "blockTypes": [
+    "bullets",
+    "callout",
+    "chart",
+    "kpi",
+    "matrix",
+    "quote",
+    "table",
+    "text",
+    "timeline"
+  ],
+  "missingRequiredTypes": [],
+  "visualBlocks": 4,
+  "traceableRatio": 0.9,
+  "declaredSources": 4,
+  "sourceKeys": [
+    "internal_review",
+    "methodology",
+    "pricing",
+    "public_intel"
+  ],
+  "htmlHasSvg": true
+}

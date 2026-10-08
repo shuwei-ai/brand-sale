@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": false,
+    "resolveJsonModule": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": false,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@brandsale/contracts": ["packages/contracts/src/index.ts"],
+      "@brandsale/config": ["packages/config/src/index.ts"],
+      "@brandsale/datasource": ["packages/datasource/src/index.ts"],
+      "@brandsale/storage": ["packages/storage/src/index.ts"],
+      "@brandsale/governance": ["packages/governance/src/index.ts"],
+      "@brandsale/model-gateway": ["packages/model-gateway/src/index.ts"],
+      "@brandsale/knowledge": ["packages/knowledge/src/index.ts"],
+      "@brandsale/agent-pack": ["packages/agent-pack/src/index.ts"],
+      "@brandsale/orchestrator": ["packages/orchestrator/src/index.ts"],
+      "@brandsale/render": ["packages/render/src/index.ts"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "apps/*/src/**/*.ts",
+    "scripts/**/*.ts",
+    "tests/**/*.ts"
+  ]
+}
