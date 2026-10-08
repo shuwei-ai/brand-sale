@@ -15,7 +15,8 @@
  *
  * ── 两种模式 ────────────────────────────────────────────────
  *
- *   默认（mock）：抖音按 DTK v4 响应形态、小红书按只读代理契约，返回确定性假数据
+ *   默认（mock）：抖音**两代形态都提供**（v4 老路径 + v5 `/api/v1/douyin/*`）、
+ *                小红书按只读代理契约，返回确定性假数据
  *   `--xhs-real`：小红书侧改为调用真实的 `xhs` CLI（只读子命令白名单）
  *                可用 `--xhs-bin=<路径>` 换掉可执行文件名（默认 `xhs`），
  *                便于用假 CLI 夹具验证错误码归一化，或指向 uv tool 装的另一份拷贝
@@ -77,34 +78,41 @@ const KNOWN_CREATORS: Record<string, { nickname: string; followers: number; awem
   MS4wLjABAAAA_demo_1005: { nickname: "精致阿姨的梳妆台", followers: 890_000, awemeCount: 256 },
 };
 
-function creatorPayload(secUserId: string): Record<string, unknown> {
+/* ── 抖音假后端 ─────────────────────────────────────────────
+ *
+ * 两代形态**都提供**，因为它们的信封与路径毫无交集：
+ *   v4：`{ code, router, _lab, data }`       路径 /api/douyin/web/fetch_*
+ *   v5：`{ success, _lab, data, error, meta }` 路径 /api/v1/douyin/*
+ * 下面的 builder 只产出**内层 data**，由 HTTP 层按路径选信封 —— 这样两代共用一份
+ * 假数据，且不会出现"改了 v4 忘了改 v5"的静默漂移。
+ *
+ * 为什么必须提供 v5：适配器的默认形态就是 v5（当前仓库 compose 装出来的 DTK 是 5.1.x）。
+ * 只有 v4 假后端的话，`npm run datasource:smoke` 跑的是默认配置，却打到一个不存在的
+ * 路径上 —— 联调工具会以"服务不通"的形式掩盖真正的形态问题。
+ */
+
+const creatorData = (secUserId: string): Record<string, unknown> => {
   const known = KNOWN_CREATORS[secUserId];
   const nickname = known?.nickname ?? `Demo 达人 ${String(seedNum(secUserId, 1000, 9999))}`;
   const followers = known?.followers ?? seedNum(secUserId, 30_000, 800_000);
   return {
-    code: 200,
-    router: "/api/douyin/web/fetch_user_profile",
-    // `_lab` 会被适配器识别成"联调假数据"，从而把 provenance.synthetic 置 true
-    _lab: { mock: true, tool: "datasource-lab" },
-    data: {
-      user: {
-        sec_uid: secUserId,
-        unique_id: `demo_${String(seedNum(secUserId, 100000, 999999))}`,
-        nickname,
-        signature: "成分党 · 只讲有证据的成分（联调假数据）",
-        follower_count: followers,
-        following_count: seedNum(secUserId + "f", 20, 400),
-        total_favorited: Math.round(followers * (seedNum(secUserId + "l", 30, 90) / 10)),
-        aweme_count: known?.awemeCount ?? seedNum(secUserId + "a", 20, 400),
-        ip_location: "上海",
-        verified: true,
-        avatar_thumb: { url_list: ["https://example.invalid/avatar.jpg"] },
-      },
+    user: {
+      sec_uid: secUserId,
+      unique_id: `demo_${String(seedNum(secUserId, 100000, 999999))}`,
+      nickname,
+      signature: "成分党 · 只讲有证据的成分（联调假数据）",
+      follower_count: followers,
+      following_count: seedNum(secUserId + "f", 20, 400),
+      total_favorited: Math.round(followers * (seedNum(secUserId + "l", 30, 90) / 10)),
+      aweme_count: known?.awemeCount ?? seedNum(secUserId + "a", 20, 400),
+      ip_location: "上海",
+      verified: true,
+      avatar_thumb: { url_list: ["https://example.invalid/avatar.jpg"] },
     },
   };
-}
+};
 
-function worksPayload(secUserId: string, count: number): Record<string, unknown> {
+const worksData = (secUserId: string, count: number): Record<string, unknown> => {
   const now = Date.now();
   const list = Array.from({ length: count }, (_, i) => {
     const id = `${seedNum(secUserId + i, 7_000_000_000_000_000_000, 7_999_999_999_999_999_999)}`;
@@ -121,10 +129,10 @@ function worksPayload(secUserId: string, count: number): Record<string, unknown>
       cover: { url_list: ["https://example.invalid/cover.jpg"] },
     };
   });
-  return { code: 200, router: "/api/douyin/web/fetch_user_post_videos", _lab: { mock: true }, data: { aweme_list: list } };
-}
+  return { aweme_list: list };
+};
 
-function commentsPayload(awemeId: string, count: number): Record<string, unknown> {
+const commentsData = (awemeId: string, count: number): Record<string, unknown> => {
   const now = Date.now();
   const platitudes = ["成分表看懂了，已加购", "求链接！", "这个浓度会不会刺激", "主播讲得太清楚了", "同款用过，确实好用"];
   const list = Array.from({ length: count }, (_, i) => {
@@ -139,8 +147,37 @@ function commentsPayload(awemeId: string, count: number): Record<string, unknown
       create_time: Math.floor((now - i * 3_600_000) / 1000),
     };
   });
-  return { code: 200, router: "/api/douyin/web/fetch_video_comments", _lab: { mock: true }, data: { comments: list, total: list.length } };
-}
+  return { comments: list, total: list.length };
+};
+
+/** 单条作品。适配器对 `video` op 的约定是"data 就是那一条作品本身" */
+const oneVideo = (): Record<string, unknown> => (worksData("video", 1).aweme_list as Record<string, unknown>[])[0] ?? {};
+
+/** v4 信封 */
+const v4Envelope = (router: string, data: unknown): Record<string, unknown> => ({
+  code: 200,
+  router,
+  _lab: { mock: true },
+  data,
+});
+
+/** v5 信封。真实 v5 的字段是 `{success, data, error, meta}`，`_lab` 是我们的约定扩展 */
+const v5Envelope = (data: unknown): Record<string, unknown> => ({
+  success: true,
+  _lab: { mock: true, tool: "datasource-lab" },
+  data,
+  error: null,
+  meta: { request_id: "lab", duration_ms: 0 },
+});
+
+/** v5 的 202：任务句柄放在 data 里面。用来验证"适配器不会把它当成数据" */
+const v5Accepted = (): Record<string, unknown> => ({
+  success: true,
+  _lab: { mock: true, tool: "datasource-lab" },
+  data: { task_id: "00000000-0000-4000-8000-000000000000", state: "running" },
+  error: null,
+  meta: { request_id: "lab" },
+});
 
 function xhsNotePayload(noteId: string): Record<string, unknown> {
   return {
@@ -438,6 +475,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       mode: XHS_REAL ? "xhs-real" : "mock",
       xhsBin: XHS_REAL ? XHS_BIN : null,
       douyinEndpoints: [
+        "/api/v1/douyin/user",
+        "/api/v1/douyin/user/posts",
+        "/api/v1/douyin/video",
+        "/api/v1/douyin/video/comments",
+      ],
+      douyinV4Endpoints: [
         "/api/douyin/web/fetch_user_profile",
         "/api/douyin/web/fetch_user_post_videos",
         "/api/douyin/web/fetch_one_video",
@@ -457,26 +500,80 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  /* ── 抖音（DTK v4 响应形态） ── */
+  /* ── 抖音 v4 形态（DTK 老版本：同步 GET，无鉴权） ── */
   if (path === "/api/douyin/web/fetch_user_profile") {
     const id = q.get("sec_user_id") ?? "";
     if (!id) return sendJson(res, 400, { code: 400, msg: "缺少 sec_user_id" });
-    return sendJson(res, 200, creatorPayload(id));
+    return sendJson(res, 200, v4Envelope(path, creatorData(id)));
   }
   if (path === "/api/douyin/web/fetch_user_post_videos") {
     const id = q.get("sec_user_id") ?? "";
     if (!id) return sendJson(res, 400, { code: 400, msg: "缺少 sec_user_id" });
-    return sendJson(res, 200, worksPayload(id, num(q.get("count"), 20)));
+    return sendJson(res, 200, v4Envelope(path, worksData(id, num(q.get("count"), 20))));
   }
   if (path === "/api/douyin/web/fetch_one_video") {
     const id = q.get("aweme_id") ?? "";
     if (!id) return sendJson(res, 400, { code: 400, msg: "缺少 aweme_id" });
-    return sendJson(res, 200, { code: 200, _lab: { mock: true }, data: (worksPayload("video", 1).data as { aweme_list: unknown[] }).aweme_list[0] });
+    return sendJson(res, 200, v4Envelope(path, oneVideo()));
   }
   if (path === "/api/douyin/web/fetch_video_comments") {
     const id = q.get("aweme_id") ?? "";
     if (!id) return sendJson(res, 400, { code: 400, msg: "缺少 aweme_id" });
-    return sendJson(res, 200, commentsPayload(id, num(q.get("count"), 20)));
+    return sendJson(res, 200, v4Envelope(path, commentsData(id, num(q.get("count"), 20))));
+  }
+
+  /* ── 抖音 v5 形态（dtk 5.1.x：/api/v1 前缀、wait 是秒数、默认强制鉴权） ──
+   *
+   * 与真实 v5 的三处差异都在**故意为之**，因为它们正是联调要验的东西：
+   *   · `wait=true` 一律 422 —— 真实 v5 的类型校验就这么严；把布尔量放过去的话，
+   *     "形态选错"这个最贵的错会在联调阶段被掩盖；
+   *   · `?__v5=202`（或缺少 wait）时返回任务句柄 —— 用来验证适配器不会把它当成数据；
+   *   · 不校验 API Key（联调工具不该逼迫使用者配一个假 Key），但在响应头里点明这件事。
+   */
+  if (path.startsWith("/api/v1/douyin/")) {
+    const wait = q.get("wait");
+    // HTTP 头只能是 latin1：中文放进去 Node 会抛
+    // `Invalid character in header content`，本地能跑的服务到线上就是 500。
+    res.setHeader("X-Lab-Note", "mock backend: auth is NOT enforced here; real DTK v5 requires an API key");
+    if (wait === "true") {
+      return sendJson(res, 422, {
+        detail: [
+          {
+            type: "float_parsing",
+            loc: ["query", "wait"],
+            msg: "Input should be a valid number, unable to parse string as a number",
+            input: "true",
+          },
+        ],
+      });
+    }
+    const secUserId = q.get("sec_user_id") ?? "";
+    const awemeId = q.get("aweme_id") ?? "";
+    const count = num(q.get("count"), 20);
+    const asyncWanted = wait === null || Number(wait) <= 0 || q.get("__v5") === "202";
+
+    if (path === "/api/v1/douyin/user") {
+      if (!secUserId) return sendJson(res, 422, { detail: [{ loc: ["query", "sec_user_id"], msg: "one of url or sec_user_id is required" }] });
+      return sendJson(res, asyncWanted ? 202 : 200, asyncWanted ? v5Accepted() : v5Envelope(creatorData(secUserId)));
+    }
+    if (path === "/api/v1/douyin/user/posts") {
+      if (!secUserId) return sendJson(res, 422, { detail: [{ loc: ["query", "sec_user_id"], msg: "one of url or sec_user_id is required" }] });
+      return sendJson(res, asyncWanted ? 202 : 200, asyncWanted ? v5Accepted() : v5Envelope(worksData(secUserId, count)));
+    }
+    if (path === "/api/v1/douyin/video") {
+      if (!awemeId) return sendJson(res, 422, { detail: [{ loc: ["query", "aweme_id"], msg: "one of url or aweme_id is required" }] });
+      return sendJson(res, asyncWanted ? 202 : 200, asyncWanted ? v5Accepted() : v5Envelope(oneVideo()));
+    }
+    if (path === "/api/v1/douyin/video/comments") {
+      if (!awemeId) return sendJson(res, 422, { detail: [{ loc: ["query", "aweme_id"], msg: "one of url or aweme_id is required" }] });
+      return sendJson(res, asyncWanted ? 202 : 200, asyncWanted ? v5Accepted() : v5Envelope(commentsData(awemeId, count)));
+    }
+    return sendJson(res, 404, {
+      success: false,
+      error: { code: "not_found", message: `lab 未登记的 v5 路由 ${path}` },
+      data: null,
+      meta: {},
+    });
   }
 
   /* ── 小红书（只读代理契约） ── */
@@ -524,7 +621,8 @@ const server = createServer((req, res) => {
 server.listen(PORT, HOST, () => {
   const base = `http://${HOST}:${PORT}`;
   console.log(`[lab] 监听 ${base}  模式：${XHS_REAL ? `小红书走真实 CLI（${XHS_BIN}）` : "全部 mock"}`);
-  console.log(`[lab] 抖音假数据源：${base}/api/douyin/web/fetch_user_profile 等 4 个端点`);
+  console.log(`[lab] 抖音假数据源 v5：${base}/api/v1/douyin/user 等 4 个端点（wait 是秒数，传 wait=true 会 422）`);
+  console.log(`[lab] 抖音假数据源 v4：${base}/api/douyin/web/fetch_user_profile 等 4 个端点（老版本用）`);
   console.log(`[lab] 小红书只读代理：${base}/xhs/note|comments|user|user-posts`);
   console.log("");
   console.log("把下面两行加进 .env 即可让网关接到本服务：");

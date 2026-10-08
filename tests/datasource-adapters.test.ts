@@ -128,7 +128,15 @@ async function freshContainer(env: Record<string, string>): Promise<{ c: Contain
   };
 }
 
-const BOTH_ON = { BM_DOUYIN_BASE_URL: "http://127.0.0.1:8899", BM_XHS_BASE_URL: "http://127.0.0.1:8899" };
+/* 本文件里的抖音桩数据是 **v4 形态**（`/api/douyin/web/fetch_*` + `{code, router_data}`），
+ * 所以这里显式把形态钉成 v4。默认值已经是 v5（当前仓库 docker compose 装出来的就是 v5），
+ * 若不开这个开关，本文件的断言会去撞一条不存在的路径 —— 那是另一组用例的正题，
+ * 不属于这里。v5 的请求形态与异步信封见 tests/douyin-style.test.ts。 */
+const BOTH_ON = {
+  BM_DOUYIN_BASE_URL: "http://127.0.0.1:8899",
+  BM_DOUYIN_STYLE: "v4",
+  BM_XHS_BASE_URL: "http://127.0.0.1:8899",
+};
 
 interface CreatorOut {
   result: { creator: { nickname: string; followerCount: number | null; awemeCount: number | null } | null; works: { awemeId: string; diggCount: number | null }[]; workCount: number };
@@ -163,9 +171,9 @@ test("抖音 采集达人主页+作品：字段归一化、L3 分级、请求形
     assert.equal(out.provenance[0]?.sourceId, "douyin_web_public");
 
     assert.equal(stub.sent.length, 2, "主页 + 作品各一次请求");
-    assert.match(stub.sent[0]!.url, /\/api\/douyin\/web\/fetch_user_profile\?/, "应打到可配置的端点路径");
+    assert.match(stub.sent[0]!.url, /\/api\/douyin\/web\/fetch_user_profile\?/, "应打到 v4 端点路径");
     assert.match(stub.sent[0]!.url, /sec_user_id=MS4wLjABAAAA_demo_1001/);
-    assert.match(stub.sent[0]!.url, /wait=true/, "应带 wait=true 以兼容 DTK v5 的同步模式");
+    assert.match(stub.sent[0]!.url, /wait=true/, "v4 形态的 wait 是布尔开关");
   } finally {
     stub.restore();
     dispose();

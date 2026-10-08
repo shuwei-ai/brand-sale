@@ -11,7 +11,7 @@
 | 源 | 代码 | 真实链路 | 说明 |
 |---|---|---|---|
 | 联网搜索 `volc_web_search` | ✅ 就绪 | ✅ **实测连通** | 火山引擎联网搜索 Lite，凭 `.env` 里的 Key 抓公开网页 |
-| 抖音公开内容 `douyin_web_public` | ✅ 就绪 | ⏳ 待接自托管服务 | 填 `BM_DOUYIN_BASE_URL` 即生效；本地联调走 `datasource:lab` |
+| 抖音公开内容 `douyin_web_public` | ✅ 就绪 | ⏳ 待接自托管服务 | 已按**真实 dtk 5.1 路由**对齐（`BM_DOUYIN_STYLE`，默认 v5）；v5 还需建 Key + 加身份。本地联调走 `datasource:lab`（两种形态都提供） |
 | 小红书公开内容 `xhs_web_public` | ✅ 就绪 | ⏳ 待接只读代理 | 只读代理（含错误码归一化）已实现并跑通进程级验收；缺的是代理侧那次 `xhs` 登录。填 `BM_XHS_BASE_URL` 即生效 |
 
 **「代码就绪」与「数据就绪」是两件事**，本文所有结论都按这个口径写。
@@ -68,14 +68,17 @@ BM_WEB_SEARCH_COUNT=20
 
 # 抖音（自托管 DTK）
 BM_DOUYIN_ENABLED=true
+BM_DOUYIN_STYLE=v5                # v4 | v5，默认 v5
 BM_DOUYIN_BASE_URL=               # 空 = 能力缺席
-BM_DOUYIN_API_KEY=                # 仅 DTK v5 需要
+BM_DOUYIN_API_KEY=                # v5 默认强制鉴权
+BM_DOUYIN_WAIT=20                 # v5 是秒数（上限 api.max_wait_seconds，DTK 默认 30）
 BM_DOUYIN_TIMEOUT_MS=15000
 BM_DOUYIN_CACHE_TTL=1800
-BM_DOUYIN_PATH_PROFILE=/api/douyin/web/fetch_user_profile
-BM_DOUYIN_PATH_POSTS=/api/douyin/web/fetch_user_post_videos
-BM_DOUYIN_PATH_VIDEO=/api/douyin/web/fetch_one_video
-BM_DOUYIN_PATH_COMMENTS=/api/douyin/web/fetch_video_comments
+# 以下四项留空 = 按 BM_DOUYIN_STYLE 取默认路径
+BM_DOUYIN_PATH_PROFILE=
+BM_DOUYIN_PATH_POSTS=
+BM_DOUYIN_PATH_VIDEO=
+BM_DOUYIN_PATH_COMMENTS=
 
 # 小红书（自托管只读代理）
 BM_XHS_ENABLED=true
@@ -97,24 +100,61 @@ BM_XHS_PATH_USER_POSTS=/xhs/user-posts
 
 ---
 
-## 3. 抖音：端点与两代形态差异
+## 3. 抖音：v4 / v5 是两套完全不同的东西
 
-对接 `Evil0ctal/Douyin_TikTok_Download_API`（Apache-2.0，自托管）。该项目的 v4 与 v5 差异很大：
+```bash
+BM_DOUYIN_BASE_URL=http://127.0.0.1:8000
+BM_DOUYIN_STYLE=v5          # 默认就是 v5（当前仓库 docker compose 装出来的是 dtk 5.1.x）
+BM_DOUYIN_API_KEY=...       # v5 默认强制鉴权
+BM_DOUYIN_WAIT=20           # v5 是**秒数**；v4 是 true
+```
 
-| | v4 | v5 |
+对接 `Evil0ctal/Douyin_TikTok_Download_API`（Apache-2.0，自托管）。它有两代形态，
+**差异大到不能共用一套配置**：
+
+| | v4 | v5（dtk 5.1.x） |
 |---|---|---|
-| 调用方式 | 同步 `GET` | 默认异步 `202 + task_id`，带 `?wait=` 可归类同步 |
-| 鉴权 | 无 | API Key |
-| 身份 | 手工填 Cookie | 自动维护的身份池 |
+| 端点 | `GET /api/douyin/web/fetch_user_profile` 等 4 条 | `GET /api/v1/douyin/{user, user/posts, video, video/comments}` |
+| 同步 | 直接返回结果 | 默认 `202 + data.{task_id,state}`；`?wait=<秒>` 可同步 |
+| 鉴权 | 无 | `X-API-Key` / `Authorization: Bearer`，**默认强制** |
+| 信封 | `{code, router, data, router_data?}` | `{success, data, error, meta}` |
+| 依赖 | 无 | PostgreSQL + Redis + **身份池**（要先去控制台加身份） |
 
-适配器共用一份代码兼容两者：请求固定带 `wait=true`（v4 未声明该参数会忽略），
-响应解开时优先取 `router_data`（DTK 自己归一化过的）→ `data` → 顶层；
-若判定为"仍在异步处理中"，明确抛错而**不是**把 `task_id` 当数据返回。
+`BM_DOUYIN_STYLE` 决定四条件路径与 `wait` 的默认值（`DOUYIN_DEFAULT_PATHS` /
+`DOUYIN_DEFAULT_WAIT`）。显式设的 `BM_DOUYIN_PATH_*` / `BM_DOUYIN_WAIT` 永远优先，
+所以对接"v5 但改了路径"的部署不用改代码。
 
-**只做只读四件套**：达人主页 / 作品列表 / 作品详情 / 评论。
-不做搜索、不做热榜（这两个端点在 DTK 里定义了却没进注册表，等于不存在），
-不做关注/粉丝列表（需登录态，作者已明确拒绝）。不去"补上"它们——那意味着自己去补签名与登录态，
-等于绕过平台风控。
+**形态写错不静默退回默认**：`BM_DOUYIN_STYLE=v6` 直接抛错，而不是按 v5 去请求 ——
+后者得到的是四个 404，排查成本远高于当场报错。
+
+### 三个踩过的坑，都写进了代码
+
+1. **`wait` 的语义不同，而且这是类型层面的不兼容**。v4 是布尔开关 `true`；
+   v5 是**秒数**，超过 `api.max_wait_seconds`（DTK 默认 30）会被 400 拒掉。
+   传 `true` 连 FastAPI 的类型校验都过不了，直接 422。所以"共用一份代码兼容两者"
+   这件事**做不到自动兼容**，只能靠 `BM_DOUYIN_STYLE` 显式声明。
+
+2. **v5 把任务句柄放在 `data` 里面**。这是最贵的一个坑：
+   ```json
+   { "success": true, "data": { "task_id": "…", "state": "running" }, "meta": {…} }
+   ```
+   只在**顶层**找 `task_id` 的话，这个 202 会被当成成功响应 —— `data` 非空 → 返回 →
+   `toCreator({task_id, state})` 得到一行**所有字段为空、但 `synthetic=false`、
+   `tier=L3`、口径声称"真实采集"** 的记录。它不报错，只是让报告里多一个
+   "查到了但全是缺失"的达人。所以异步判定做了两层，命中就**明确抛错**。
+
+   注意反面：v5 同步成功时 `finished()` 会把 `task_id` 放进 **`meta`**（不是 `data`），
+   所以不能"看到 task_id 就判为未完成"。两条都有用例钉着。
+
+3. **4xx 要翻译成动作**。v5 用 401/403、404、400、422 分别表达"没带 Key"、
+   "路径不存在"、"wait 超上限"、"参数类型不对"，这四种的排查动作完全不同。
+   只抛一句 `HTTP 404` 等于把区别丢掉。
+
+### 只做只读四件套
+
+达人主页 / 作品列表 / 作品详情 / 评论。不做搜索、不做热榜
+（v5 里这些端点存在但没进注册表，等于不存在），不做关注/粉丝列表（需登录态）。
+不去"补上"它们——那意味着自己去补签名与登录态，等于绕过平台风控。
 
 ### 字段归一化是宽容的，不是猜的
 
@@ -304,9 +344,16 @@ npm run datasource:smoke -- --douyin-sec-user-id=MS4wLjABAAAA...
 
 ## 8. 换成真实后端要做什么
 
-**抖音**：部署 DTK（`docker compose up`）→ 把地址填进 `BM_DOUYIN_BASE_URL`。
-若是 v5，同时填 `BM_DOUYIN_API_KEY`；若端点路径不同，改 `BM_DOUYIN_PATH_*`（无需动代码）。
-重启后 `douyin_creator` 自动出现在 CI/CT 的工具清单里。
+**抖音**：部署 DTK → 把地址填进 `BM_DOUYIN_BASE_URL`。
+当前仓库 `docker compose up` 装出来的是 **v5（dtk 5.1.x）**，也就是默认形态，通常不用改别的。
+但 v5 比 v4 多两道前置步骤，**只起容器是拿不到数据的**：
+
+1. **建 API Key**（v5 默认强制鉴权）→ 填 `BM_DOUYIN_API_KEY`，
+   或把端点加进 `api.public_endpoints` 显式放开；
+2. **在控制台加至少一个身份**（identity pool）。没有可用身份时，请求不会报错，
+   而是返回 `202 + task_id` —— 适配器会明确报"仍在异步处理中"并提示去补身份。
+
+若你自建的是老的 v4，设 `BM_DOUYIN_STYLE=v4`（路径与 `wait` 语义一起切回去）。
 
 **小红书**：在部署机器上 `uv tool install xiaohongshu-cli` 并完成一次登录，
 然后以 `--xhs-real` 模式运行代理（或自行实现同契约的服务），
@@ -318,6 +365,7 @@ npm run datasource:smoke -- --douyin-sec-user-id=MS4wLjABAAAA...
 > 本文件的结论一律按这个口径写。
 
 **验证**：`npm run datasource:smoke` 应显示 `synthetic=false` 且拿到真实行数。
+（`synthetic=true` + "联调假数据"说明你打的是 `datasource:lab`，不是真实后端。）
 
 ---
 

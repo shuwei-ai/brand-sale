@@ -12,9 +12,8 @@ export type Env = "dev" | "staging" | "prod";
 /**
  * 抖音自托管采集服务的端点路径。
  *
- * 为什么路径要可覆盖：DTK 有两代形态——v4 是同步 `GET /api/douyin/web/...`，
- * v5 改成异步 `202 + task_id`（请求时带 `wait=true` 可归类同步）。自建版本若不兼容，
- * 改这几个值即可，不必动适配器代码。默认取 v4 路径。
+ * 为什么路径要可覆盖：DTK 有两代形态，端点前缀完全不同。默认值随
+ * `BM_DOUYIN_STYLE` 走（见 `DOUYIN_DEFAULT_PATHS`），显式设了 `BM_DOUYIN_PATH_*` 就以它为准。
  */
 export interface DouyinPaths {
   profile: string;
@@ -22,6 +21,47 @@ export interface DouyinPaths {
   video: string;
   comments: string;
 }
+
+/**
+ * 自托管 DTK 的**形态**。两代的差异大到必须显式区分，不能共用一套默认值：
+ *
+ * | | v4 | v5 |
+ * |---|---|---|
+ * | 端点前缀 | `/api/douyin/web/fetch_*` | `/api/v1/douyin/{user,user/posts,video,video/comments}` |
+ * | 同步方式 | `?wait=true` | `?wait=<秒数>`（传 `true` 会被 FastAPI 判 422） |
+ * | 鉴权 | 无 | `X-API-Key` / `Authorization: Bearer`，默认强制 |
+ * | 响应信封 | `{code, router_data?}` | `{success, data, error, meta}` |
+ * | 异步 | 无 | 默认 `202 + data.{task_id,state}` |
+ *
+ * 默认取 **v5**：当前仓库 `docker compose up` 装出来的就是 v5（dtk 5.1.x），
+ * 而 v4 的四个路径在 v5 上**一个都不存在**——照 v4 默认值配过去，全是 404。
+ * 对接老的 v4 部署时把 `BM_DOUYIN_STYLE=v4` 显式设回来。
+ */
+export type DouyinStyle = "v4" | "v5";
+
+/** 两代的默认端点。显式 `BM_DOUYIN_PATH_*` 仍然优先。 */
+export const DOUYIN_DEFAULT_PATHS: Record<DouyinStyle, DouyinPaths> = {
+  v4: {
+    profile: "/api/douyin/web/fetch_user_profile",
+    posts: "/api/douyin/web/fetch_user_post_videos",
+    video: "/api/douyin/web/fetch_one_video",
+    comments: "/api/douyin/web/fetch_video_comments",
+  },
+  v5: {
+    profile: "/api/v1/douyin/user",
+    posts: "/api/v1/douyin/user/posts",
+    video: "/api/v1/douyin/video",
+    comments: "/api/v1/douyin/video/comments",
+  },
+};
+
+/**
+ * `wait` 的默认值。两代语义不同，这是最容易踩的一脚：
+ *   v4：布尔开关，`true` = "在服务端等结果"。
+ *   v5：**秒数**，且超过 `api.max_wait_seconds`（DTK 默认 30）会被 400 拒掉；
+ *       传 `true` 连类型都过不了，直接 422。
+ */
+export const DOUYIN_DEFAULT_WAIT: Record<DouyinStyle, string> = { v4: "true", v5: "20" };
 
 /** 小红书自托管**只读**代理的端点路径。契约定义见 docs/datasource-integration.md */
 export interface XhsPaths {
@@ -136,6 +176,13 @@ export interface Config {
     baseUrl: string;
     /** DTK v5 需要 API Key；v4 留空即可。非空时带 Authorization: Bearer */
     apiKey: string;
+    /** DTK 形态（决定端点默认值与 `wait` 语义），默认 v5 */
+    style: DouyinStyle;
+    /**
+     * 同步等待参数。v4 用 `true`，v5 用**秒数**。默认随 style 走，
+     * 单独可覆盖（v5 身份池繁忙时可以调大，上限是 DTK 的 `api.max_wait_seconds`）。
+     */
+    wait: string;
     timeoutMs: number;
     /** 采集类结果变化慢，默认缓存 30 分钟 */
     cacheTtlSeconds: number;
@@ -241,6 +288,21 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
   const get = (k: string, fallback?: string): string | undefined =>
     overrides[k] ?? process.env[k] ?? env[k] ?? fallback;
 
+  /**
+   * DTK 形态。认不出的值**不静默退回默认**——写错 `BM_DOUYIN_STYLE=v6` 却按 v5
+   * 的路径去请求，得到的是四个 404，排查成本远高于现在直接报错。
+   */
+  const douyinStyle = (): DouyinStyle => {
+    const raw = str(get("BM_DOUYIN_STYLE"), "v5").toLowerCase();
+    if (raw !== "v4" && raw !== "v5") {
+      throw new Error(
+        `BM_DOUYIN_STYLE 只能是 v4 或 v5，收到「${raw}」。` +
+          `当前仓库 docker compose 装出来的 DTK 是 v5；若你自建的是老版本，显式设成 v4。`,
+      );
+    }
+    return raw;
+  };
+
   const dataDir = resolve(cwd, str(get("BM_DATA_DIR"), "./.data"));
   const envName = str(get("BM_ENV"), "dev") as Env;
 
@@ -315,13 +377,15 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
       // 去掉结尾斜杠：适配器按 `${baseUrl}${path}` 拼接，双斜杠在某些反代上会 404
       baseUrl: str(get("BM_DOUYIN_BASE_URL")).replace(/\/+$/, ""),
       apiKey: str(get("BM_DOUYIN_API_KEY")),
+      style: douyinStyle(),
+      wait: str(get("BM_DOUYIN_WAIT")) || DOUYIN_DEFAULT_WAIT[douyinStyle()],
       timeoutMs: num(get("BM_DOUYIN_TIMEOUT_MS"), 15_000),
       cacheTtlSeconds: num(get("BM_DOUYIN_CACHE_TTL"), 1_800),
       paths: {
-        profile: str(get("BM_DOUYIN_PATH_PROFILE"), "/api/douyin/web/fetch_user_profile"),
-        posts: str(get("BM_DOUYIN_PATH_POSTS"), "/api/douyin/web/fetch_user_post_videos"),
-        video: str(get("BM_DOUYIN_PATH_VIDEO"), "/api/douyin/web/fetch_one_video"),
-        comments: str(get("BM_DOUYIN_PATH_COMMENTS"), "/api/douyin/web/fetch_video_comments"),
+        profile: str(get("BM_DOUYIN_PATH_PROFILE")) || DOUYIN_DEFAULT_PATHS[douyinStyle()].profile,
+        posts: str(get("BM_DOUYIN_PATH_POSTS")) || DOUYIN_DEFAULT_PATHS[douyinStyle()].posts,
+        video: str(get("BM_DOUYIN_PATH_VIDEO")) || DOUYIN_DEFAULT_PATHS[douyinStyle()].video,
+        comments: str(get("BM_DOUYIN_PATH_COMMENTS")) || DOUYIN_DEFAULT_PATHS[douyinStyle()].comments,
       },
     },
 
@@ -395,6 +459,14 @@ export function assertConfigInvariants(c: Config): string[] {
     problems.push(
       "BM_DOUYIN_ENABLED=true 但 BM_DOUYIN_BASE_URL 为空：抖音公开数据适配器与 douyin_* 工具都不会注册。" +
         "自建 DTK（Evil0ctal/Douyin_TikTok_Download_API）后把地址填进去即可；本地联调可用 npm run datasource:lab",
+    );
+  }
+  // v5 默认强制鉴权（dtk 5.1 起每个端点都要 API Key 或有 `api.public_endpoints` 显式放开），
+  // 而 v4 完全不校验。这里只提醒，不阻断——运维可能确实放开了公开端点。
+  if (c.douyin.enabled && c.douyin.baseUrl && c.douyin.style === "v5" && !c.douyin.apiKey) {
+    problems.push(
+      "BM_DOUYIN_STYLE=v5 但 BM_DOUYIN_API_KEY 为空：DTK v5 默认要求鉴权，" +
+        "四个端点会返回 401/403。请在 DTK 控制台建一个 Key，或把对应端点加入 api.public_endpoints",
     );
   }
   if (c.xiaohongshu.enabled && !c.xiaohongshu.baseUrl) {

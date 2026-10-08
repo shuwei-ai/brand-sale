@@ -95,22 +95,88 @@ const clamp = (n: number, min: number, max: number): number =>
   Number.isFinite(n) ? Math.min(max, Math.max(min, Math.trunc(n))) : min;
 
 /**
+ * HTTP 失败 → 可执行的排查方向。
+ *
+ * 为什么要翻译而不是直接抛状态码：自托管 DTK 的 4xx 每一种都对应一个不同的动作，
+ * 而"HTTP 404"这句话无法区分"路径配错了形态"和"服务没起来"。这两件事的排查成本
+ * 差一个数量级，把区别丢掉等于把成本推给运维。
+ */
+function describeHttpFailure(status: number, raw: unknown, text: string, style: string, path: string): string {
+  const root = asObj(raw);
+  const err = asObj(root.error);
+  // FastAPI 的校验失败把 detail 写成**数组**（每个字段一条）。直接 String() 会得到
+  // "[object Object]"，等于把唯一的线索丢掉，所以这里逐条取 msg。
+  const rawDetail = err.message || root.detail || root.msg;
+  const detail = Array.isArray(rawDetail)
+    ? rawDetail.map((d) => str(asObj(d).msg ?? d)).filter(Boolean).join("；")
+    : str(rawDetail);
+  const tail = detail ? `（服务说明：${detail}）` : text ? `（响应：${text.slice(0, 160)}）` : "";
+
+  switch (status) {
+    case 401:
+    case 403:
+      return (
+        `鉴权未通过。DTK v5 默认要求每个端点带 API Key —— 在控制台建一个 Key 填进 BM_DOUYIN_API_KEY，` +
+        `或把该端点加进 api.public_endpoints 显式放开${tail}`
+      );
+    case 404:
+      return (
+        `端点不存在。当前 BM_DOUYIN_STYLE=${style}，请求路径 ${path}。` +
+        `v4 与 v5 的前缀完全不同（v5 是 /api/v1/douyin/...），形态选错时四个端点会**全部** 404${tail}`
+      );
+    case 400:
+      return `参数被拒。最常见的是 wait 超出上限：DTK 的 api.max_wait_seconds（默认 30）会拒绝而不是截断${tail}`;
+    case 422:
+      return `参数类型不对（服务端校验失败）。v5 的 wait 是**秒数**，传 wait=true 会直接 422 —— 检查 BM_DOUYIN_WAIT${tail}`;
+    case 429:
+      return `被服务端限流。降低调用频率或调大缓存 TTL（BM_DOUYIN_CACHE_TTL）${tail}`;
+    default:
+      return status >= 500
+        ? `自托管服务自身出错（可能没起来、或身份池/数据库不可用）${tail}`
+        : `未归类的服务端拒绝${tail}`;
+  }
+}
+
+/**
  * 解开 DTK 响应信封。
  *
  * 兼容两代形态：
- *   v4：`{ code: 200, router, params, data: {…原始…}, router_data: {…归一化…} }`
- *   v5：`{ code: 200, data: {…} }`；默认异步 `202 + task_id`，带 `wait=true` 时同步返回
+ *   v4：`{ code: 200, router, data: {…原始…}, router_data: {…归一化…} }`
+ *   v5：`{ success: true, data: {…}, error: null, meta: {…} }`
  *
  * 取值优先级 `router_data → data → 顶层`：`router_data` 是 DTK 自己归一化过的，
- * 比原始结构稳定。返回 null 表示"仍在异步处理中"，由调用方明确报错 ——
- * **绝不能把 task_id 当成数据返回**，那会让下游拿到一个空对象却以为查到了人。
+ * 比原始结构稳定（v5 已去掉该字段，这一支对 v5 不会命中）。
+ *
+ * ── 异步判定为什么必须做在**两层**上 ────────────────────────────
+ *
+ * v4 把 `task_id` 放在顶层；v5 放在 `data` 里面：
+ *   `{ success: true, data: { task_id: "…", state: "running" }, meta: {…} }`
+ * 只看顶层的话，v5 的 202 会被当成成功响应 —— `data` 非空 → 返回 → 下游
+ * `toCreator({task_id, state})` 得到一行**字段全空但 synthetic=false、tier=L3**
+ * 的"达人数据"。那是最坏的一种错：报告会把它当成一次真实采集，
+ * 而实际上什么也没查到。所以这里要往下再探一层。
+ *
+ * 返回 null 表示"仍在异步处理中"，由调用方**明确报错** ——
+ * 绝不能把 task_id 当成数据返回。
  */
+const TERMINAL_STATES = ["done", "success", "succeeded", "finished", "completed"];
+
 function unwrap(payload: unknown): Json | null {
   const root = asObj(payload);
 
-  const status = str(root.status ?? root.state ?? root.task_status).toLowerCase();
-  if (root.task_id !== undefined && status && !["done", "success", "succeeded", "finished", "completed"].includes(status)) {
-    return null;
+  // 顶层异步（v4 与 v5 的某些中间层都会有）
+  if (isPendingTask(root)) return null;
+
+  // 嵌在 data 里的异步：v5 的 202 形态
+  const inner0 = asObj(root.router_data ?? root.data);
+  if (isPendingTask(inner0)) return null;
+
+  // v5 的失败信封：{ success: false, error: {...} }
+  const err = asObj(root.error);
+  if (root.success === false || Object.keys(err).length > 0) {
+    throw new Error(
+      `抖音采集服务业务错误 ${str(err.code) || "(no code)"}：${str(err.message) || str(root.msg) || "未提供说明"}`,
+    );
   }
 
   const code = numOrNull(root.code);
@@ -118,8 +184,15 @@ function unwrap(payload: unknown): Json | null {
     throw new Error(`抖音采集服务业务错误 code=${code}${root.msg ? ` message=${str(root.msg)}` : ""}`);
   }
 
-  const inner = asObj(root.router_data ?? root.data);
+  const inner = inner0;
   return Object.keys(inner).length ? inner : root;
+}
+
+/** 一个对象是不是"还没做完的任务句柄"（有 task_id 且状态不是终态） */
+function isPendingTask(o: Json): boolean {
+  if (o.task_id === undefined) return false;
+  const status = str(o.state ?? o.status ?? o.task_status).toLowerCase();
+  return !TERMINAL_STATES.includes(status);
 }
 
 /* ── 三类结果的归一化 ────────────────────────────────────── */
@@ -224,7 +297,7 @@ function isoFromUnix(v: unknown): string {
 /* ── 适配器 ─────────────────────────────────────────────── */
 
 export function createDouyinWebAdapter(config: Config): DataSourceAdapter {
-  const { baseUrl, apiKey, timeoutMs, cacheTtlSeconds, paths } = config.douyin;
+  const { baseUrl, apiKey, style, wait, timeoutMs, cacheTtlSeconds, paths } = config.douyin;
 
   return {
     sourceId: DOUYIN_WEB_SOURCE_ID,
@@ -247,9 +320,10 @@ export function createDouyinWebAdapter(config: Config): DataSourceAdapter {
 
       const url = new URL(`${baseUrl}${paths[spec.pathKey]}`);
       url.searchParams.set(spec.idParam, id);
-      // v5 默认异步（202 + task_id）；wait=true 让它归类同步返回。
-      // v4 未声明该参数会直接忽略，两种部署共用一份代码。
-      url.searchParams.set("wait", "true");
+      // 两代的 wait 语义不同，取值由 config.douyin.wait 决定（默认随 style）：
+      //   v4 是布尔开关 `true`；v5 是**秒数**，传 `true` 会被 FastAPI 直接判 422。
+      // 这也是"共用一份代码兼容两者"唯一做不到自动兼容的地方 —— 类型层面就不兼容。
+      url.searchParams.set("wait", wait);
       const count = clamp(Number(query.params?.count ?? query.limit ?? 20), 1, 50);
       if (spec.paged) url.searchParams.set("count", String(count));
 
@@ -260,12 +334,22 @@ export function createDouyinWebAdapter(config: Config): DataSourceAdapter {
         if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
         const resp = await fetch(url, { method: "GET", headers, signal: controller.signal });
+        const text = await resp.text().catch(() => "");
+        // 先解析再判状态码：v5 用 400/403/404 分别表达"参数不合法 / 没带 Key / 路径不存在"，
+        // 这三种的排查动作完全不同。只报一句 `HTTP 404` 等于把区别丢掉。
+        let raw: unknown = null;
+        try {
+          raw = text ? JSON.parse(text) : null;
+        } catch {
+          raw = null;
+        }
         if (!resp.ok) {
-          const body = await resp.text().catch(() => "");
-          throw new Error(`抖音采集 HTTP ${resp.status}：${body.slice(0, 200)}`);
+          throw new Error(`抖音采集失败（服务 HTTP ${resp.status}）：${describeHttpFailure(resp.status, raw, text, style, paths[spec.pathKey])}`);
+        }
+        if (raw === null) {
+          throw new Error(`抖音采集服务的响应不是 JSON（前 200 字符）：${text.slice(0, 200) || "(空响应)"}`);
         }
 
-        const raw = (await resp.json()) as unknown;
         /* 联调工具（scripts/datasource-lab.ts）返回的假数据带 `_lab:{mock:true}`。
          * 识别它并把 synthetic 置为 true —— 目的是让"假数据"在 provenance 里**显式可见**。
          * 不加这一步的话，联调数据会被报告当成真实采集的 L3 内容，
@@ -274,7 +358,10 @@ export function createDouyinWebAdapter(config: Config): DataSourceAdapter {
         const data = unwrap(raw);
         if (!data) {
           throw new Error(
-            "抖音采集仍在异步处理中（服务未在等待窗口内返回结果）。请确认自建 DTK 已启用同步/等待模式。",
+            `抖音采集仍在异步处理中（${style} 的服务未在等待窗口内返回结果，wait=${wait}）。` +
+              (style === "v5"
+                ? "v5 常见原因：身份池里还没有可用身份，或 api.max_wait_seconds 被调小。请在 DTK 控制台补一个身份后重试。"
+                : "请确认自建 DTK 已启用同步/等待模式。"),
           );
         }
 
