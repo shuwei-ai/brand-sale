@@ -15,6 +15,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import {
   API_PREFIX,
+  KB_COLLECTIONS,
   PHASE_LABEL,
   PHASE_ORDER,
   type JobSpec,
@@ -270,6 +271,121 @@ export function createGateway(container: Container) {
           degraded: out.degraded ?? null,
           hits: out.hits.map((h) => ({ chunkId: h.chunk.chunkId, collection: h.chunk.collection, score: h.score, rerankScore: h.rerankScore, text: h.chunk.text.slice(0, 200) })),
         });
+      }
+
+      /* ── KB 入库通道（P1-5） ─────────────────────────────
+       *
+       * 这是"结合甲方资料让策略更精准"从口号变成能力的唯一路径：
+       * 此前 knowledge.ingest() 全库只有 seed.ts 一处调用，
+       * 运营无法自助往知识库放东西，甲方的行业资料只能靠改代码灌进去。
+       *
+       * 出错用 4xx 而不是项目惯用的 200：那条"业务错误一律 200"的规则
+       * 针对的是**长任务内的降级**（前端要继续渲染其余结果），
+       * 而入库是同步请求——前提条件不满足却回 200，调用方会以为写进去了。
+       */
+
+      if (path === `${API_PREFIX}/kb/documents` && method === "POST") {
+        const body = (await readBody(req)) as {
+          title?: string;
+          collection?: string;
+          sourceId?: string;
+          mime?: string;
+          publishedAt?: string;
+          sampleSize?: number;
+          humanVerified?: boolean;
+          global?: boolean;
+          meta?: Record<string, string | number | boolean>;
+          content?: string;
+          contentBase64?: string;
+          filename?: string;
+        };
+
+        const collection = String(body.collection ?? "").trim();
+        if (!KB_COLLECTIONS.includes(collection as never)) {
+          throw new AppError({
+            code: "E-INGEST-001",
+            message: `collection 必填且必须为 ${KB_COLLECTIONS.join(" / ")} 之一，收到「${collection}」`,
+            details: { field: "collection" },
+          });
+        }
+
+        // 全局写入是部署级开关，不是用户级权限（见 Config.kb 的注释）
+        const isGlobal = Boolean(body.global);
+        if (isGlobal && !config.kb.allowGlobalWrite) {
+          throw new AppError({
+            code: "E-INGEST-001",
+            message: "本部署未开启全局语料写入（BM_KB_ALLOW_GLOBAL_WRITE=false）",
+            userMessage: "跨租户共享的知识库写入已关闭。如需上传面向所有租户的公开情报，请让管理员开启该能力。",
+            details: { field: "global" },
+          });
+        }
+
+        const hasBinary = typeof body.contentBase64 === "string" && body.contentBase64.length > 0;
+        const mime = String(body.mime ?? (hasBinary ? "application/octet-stream" : "text/plain"));
+        const filename = body.filename ? String(body.filename) : undefined;
+
+        // 解析在写入之前：拿不到文本就不写、不建文档行。
+        // 未配置 BM_PARSER_URL 时 pdf/docx 会在这里被 415 拦下，
+        // 而不是被当成二进制文本塞进 KB 变成乱码 chunk。
+        let text = typeof body.content === "string" ? body.content : "";
+        let parserName = "textonly";
+        if (hasBinary) {
+          const buf = Buffer.from(body.contentBase64!, "base64");
+          const parsed = await container.parser.parse(new Uint8Array(buf), mime, filename);
+          text = parsed.text;
+          parserName = parsed.parser;
+        } else if (!text.trim()) {
+          throw new AppError({
+            code: "E-INGEST-001",
+            message: "content 与 contentBase64 至少提供一个且不能为空",
+            details: { field: "content" },
+          });
+        }
+
+        const result = await container.knowledge.ingestDocument(
+          {
+            title: String(body.title ?? "").trim(),
+            collection: collection as never,
+            sourceId: String(body.sourceId ?? "").trim(),
+            mime,
+            content: text,
+            publishedAt: body.publishedAt ? String(body.publishedAt) : new Date().toISOString(),
+            ...(body.sampleSize !== undefined ? { sampleSize: Number(body.sampleSize) } : {}),
+            ...(body.humanVerified !== undefined ? { humanVerified: Boolean(body.humanVerified) } : {}),
+            ...(body.meta ? { meta: body.meta } : {}),
+            ...(isGlobal ? { global: true } : {}),
+          },
+          ctx,
+        );
+
+        repos.audit.add({
+          tenantId: ctx.tenantId,
+          kind: "kb.ingest",
+          reason: `${result.replaced ? "覆盖" : "新增"}文档「${result.docId}」到 ${collection}（来源 ${result.sourceId}，${result.chunks} 块，解析器 ${parserName}）`,
+          traceId: ctx.traceId,
+        });
+
+        return json(res, 201, { ...result, parser: parserName, global: isGlobal });
+      }
+
+      if (path === `${API_PREFIX}/kb/documents` && method === "GET") {
+        const collection = url.searchParams.get("collection") ?? undefined;
+        return json(res, 200, {
+          items: container.knowledge.listDocuments(ctx.tenantId, collection as never),
+        });
+      }
+
+      const kbDocRoute = new RegExp(`^${API_PREFIX}/kb/documents/([^/]+)$`).exec(path);
+      if (kbDocRoute && method === "DELETE") {
+        const docId = decodeURIComponent(kbDocRoute[1]!);
+        const out = container.knowledge.deleteDocument(ctx.tenantId, docId);
+        repos.audit.add({
+          tenantId: ctx.tenantId,
+          kind: "kb.ingest",
+          reason: `删除文档「${docId}」及其 ${out.removedChunks} 个块`,
+          traceId: ctx.traceId,
+        });
+        return json(res, 200, out);
       }
 
       if (path === `${API_PREFIX}/audit` && method === "GET") {

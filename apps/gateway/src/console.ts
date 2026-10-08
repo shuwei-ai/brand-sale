@@ -305,6 +305,32 @@ export function consoleHtml({ config, mocked }: ConsoleContext): string {
     </div>
 
     <div class="card">
+      <h2>知识库入库</h2>
+      <div class="hint">把行业报告、算数画像、复盘材料贴进来，报告会引用它并标注来源。入库要求「来源」已在台账登记且授权有效，否则会被拒绝。</div>
+      <div class="grid-2">
+        <div class="field"><label>归入知识库</label>
+          <select id="kb-collection">
+            <option value="KB-3">KB-3 行业公开情报</option>
+            <option value="KB-2">KB-2 历史执行与私域知识</option>
+            <option value="KB-4">KB-4 方法论与案例模板</option>
+            <option value="KB-1">KB-1 客户授权平台效果</option>
+          </select>
+        </div>
+        <div class="field"><label>数据来源</label><select id="kb-source"><option value="">加载中…</option></select></div>
+      </div>
+      <div class="field"><label>标题</label><input id="kb-title" type="text" placeholder="如：2026 Q3 美妆行业公开情报"></div>
+      <div class="field"><label>数据时点</label><input id="kb-published" type="date"></div>
+      <div class="field"><label>正文（纯文本 / Markdown，用 # 与空行分章可提升检索命中）</label>
+        <textarea id="kb-content" rows="5" placeholder="# 一、类目大盘&#10;&#10;正文……"></textarea></div>
+      <div class="row-actions">
+        <button id="btn-kb-submit" class="primary">入库</button>
+        <button id="btn-kb-reload">刷新列表</button>
+      </div>
+      <div class="hint" id="kb-hint"></div>
+      <div id="kb-docs" class="empty">—</div>
+    </div>
+
+    <div class="card">
       <h2>任务列表</h2>
       <div id="job-list" class="empty">加载中…</div>
       <button id="btn-reload-jobs" style="width:100%">刷新列表</button>
@@ -809,8 +835,97 @@ export function consoleHtml({ config, mocked }: ConsoleContext): string {
     b.addEventListener('click', function () { switchTab(b.getAttribute('data-tab')); });
   });
 
+  /* ── 知识库入库（P1-5） ─────────────────────────────────
+   * 没有这个面板，入库通道就等于只有 curl 能用，
+   * "让甲方运营把资料放进来"这条产品承诺就落不了地。 */
+
+  function kbHint(msg, ok) {
+    var el = document.getElementById('kb-hint');
+    el.style.color = ok ? '#12864a' : '#c62828';
+    el.textContent = msg;
+  }
+
+  function loadKbSources() {
+    return req(api + '/sources').then(function (j) {
+      var sel = document.getElementById('kb-source');
+      var items = (j && j.items) || [];
+      if (!items.length) {
+        sel.innerHTML = '<option value="">（台账无数据源，请先登记）</option>';
+        return;
+      }
+      sel.innerHTML = items.map(function (s) {
+        var az = s.authz ? '' : '（无授权）';
+        return '<option value="' + esc(s.sourceId) + '">' + esc(s.name) + ' · ' + esc(s.tier) + az + '</option>';
+      }).join('');
+    }).catch(function (e) {
+      document.getElementById('kb-source').innerHTML = '<option value="">加载失败：' + esc(e.message) + '</option>';
+    });
+  }
+
+  function loadKbDocs() {
+    var box = document.getElementById('kb-docs');
+    return req(api + '/kb/documents').then(function (j) {
+      var items = (j && j.items) || [];
+      if (!items.length) { box.className = 'empty'; box.innerHTML = '知识库暂无文档。'; return; }
+      box.className = '';
+      box.innerHTML = items.slice(0, 12).map(function (d) {
+        return '<div style="display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid #eef0f6">' +
+          '<span class="chip dim">' + esc(d.collection) + '</span>' +
+          '<span style="flex:1;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(d.title) + '">' + esc(d.title) + '</span>' +
+          '<span class="sub">' + d.chunkCount + ' 块</span>' +
+          '<button data-del-doc="' + esc(d.docId) + '" class="sub" style="cursor:pointer">删除</button>' +
+          '</div>';
+      }).join('');
+      Array.prototype.forEach.call(box.querySelectorAll('[data-del-doc]'), function (b) {
+        b.addEventListener('click', function () {
+          var docId = b.getAttribute('data-del-doc');
+          if (!window.confirm('确认删除该文档及其全部知识块？')) return;
+          req(api + '/kb/documents/' + encodeURIComponent(docId), { method: 'DELETE' })
+            .then(function (r) { kbHint('已删除 ' + r.removedChunks + ' 个块', true); return loadKbDocs(); })
+            .catch(function (e) { kbHint('删除失败：' + e.message, false); });
+        });
+      });
+    }).catch(function (e) { box.className = 'empty'; box.innerHTML = '加载失败：' + esc(e.message); });
+  }
+
+  function submitKbDoc() {
+    var btn = document.getElementById('btn-kb-submit');
+    var content = document.getElementById('kb-content').value;
+    var sourceId = document.getElementById('kb-source').value;
+    if (!sourceId) { kbHint('请先选择一个数据来源', false); return; }
+    if (!document.getElementById('kb-title').value.trim()) { kbHint('请填写标题', false); return; }
+    if (!content.trim()) { kbHint('正文不能为空', false); return; }
+
+    var published = document.getElementById('kb-published').value;
+    btn.disabled = true; btn.textContent = '入库中…';
+    req(api + '/kb/documents', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': uuid() },
+      body: {
+        title: document.getElementById('kb-title').value.trim(),
+        collection: document.getElementById('kb-collection').value,
+        sourceId: sourceId,
+        mime: 'text/markdown',
+        content: content,
+        publishedAt: published ? new Date(published + 'T00:00:00Z').toISOString() : new Date().toISOString()
+      }
+    }).then(function (r) {
+      kbHint((r.replaced ? '已覆盖既有文档，' : '入库成功，') + '共 ' + r.chunks + ' 个知识块（docId ' + r.docId + '）', true);
+      document.getElementById('kb-content').value = '';
+      return loadKbDocs();
+    }).catch(function (e) {
+      // 失败原因是可解释的：来源未登记/未授权 → E-INGEST-001；格式不支持 → E-INGEST-002
+      kbHint('入库失败：' + e.message, false);
+    }).then(function () { btn.disabled = false; btn.textContent = '入库'; });
+  }
+
+  document.getElementById('btn-kb-submit').addEventListener('click', submitKbDoc);
+  document.getElementById('btn-kb-reload').addEventListener('click', function () { loadKbSources(); loadKbDocs(); });
+
   loadHealth();
   loadJobs();
+  loadKbSources();
+  loadKbDocs();
   setInterval(loadHealth, 30000);
 })();
 </script>

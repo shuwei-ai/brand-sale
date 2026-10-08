@@ -12,8 +12,13 @@
  */
 
 import {
+  AppError,
+  chunkText,
   type Citation,
   type IKnowledgeService,
+  type IngestDocumentInput,
+  type IngestDocumentResult,
+  type IngestSourceGuard,
   type KbChunk,
   type KbCollection,
   type RetrievalHit,
@@ -74,8 +79,7 @@ export function hashEmbed(text: string): Float32Array {
   return v;
 }
 
-export const cosine = (a: Float32Array, b: Float32Array): number => {
-  let s = 0;
+export const cosine = (a: Float32Array, b: Float32Array): number => {  let s = 0;
   for (let i = 0; i < a.length; i++) s += a[i]! * b[i]!;
   return s;
 };
@@ -122,6 +126,41 @@ export interface RerankOptions {
 const GLOBAL_SCOPE_SQL = `(tenant_id = '' OR tenant_id IS NULL)`;
 const VISIBLE_SCOPE_SQL = `(tenant_id = ? OR ${GLOBAL_SCOPE_SQL})`;
 
+/** kb_docs 的查询投影 */
+interface DocRow {
+  doc_id: string;
+  title: string;
+  collection: string;
+  source_id: string;
+  chunk_count: number;
+  ingested_at: string;
+}
+
+/**
+ * 由内容指纹推导稳定的 doc_id。
+ *
+ * 为什么不用自增/随机 id：入库必须**幂等**。同一份文件重复上传
+ * （运营手滑点两次、网关重试、批处理重跑）应当得到同一个 doc_id 并覆盖，
+ * 而不是产生两份几乎相同的语料——后者会让同一句话在检索结果里出现两次，
+ * 挤占 topK 名额，还会让报告里出现"两个来源说同一件事"的假交叉验证。
+ *
+ * 指纹取 4 个维度：租户 + 来源 + 标题 + 数据时点。
+ * 只要其中之一变化（例如更新了 2026-10 的版本），就是一份新文档，符合预期。
+ */
+export function stableDocId(parts: string[]): string {
+  const s = parts.join("\u0001");
+  let h1 = 2166136261;
+  let h2 = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619);
+    h2 = Math.imul(h2 ^ (c + 0x9e3779b9), 16777619);
+  }
+  const a = (h1 >>> 0).toString(36).padStart(7, "0");
+  const b = (h2 >>> 0).toString(36).padStart(7, "0");
+  return `doc_${a}${b}`;
+}
+
 export class KnowledgeService implements IKnowledgeService {
   private readonly embedCache = new Map<string, Float32Array>();
   private rerankCooldownUntil = 0;
@@ -130,54 +169,226 @@ export class KnowledgeService implements IKnowledgeService {
   constructor(
     private readonly db: Db,
     private readonly config: Config,
+    /**
+     * 入库来源守卫，由装配层（container）注入。
+     *
+     * 为什么不让 KnowledgeService 自己查表：来源校验需要 sources 与 authz 两张表的
+     * "当前是否生效"语义，那套语义已经在 AuthzRepo.active() 里写过一次；
+     * 在 knowledge 里再写一遍 SQL 就是第二份真相，改一处漏一处。
+     * 而 knowledge **不能**依赖 governance（会让依赖矩阵多一条边），
+     * 所以改成把校验能力注入进来。
+     *
+     * 未注入时**一律拒绝**（fail-closed）：一个没接校验的入库通道等于没有来源门槛。
+     */
+    private readonly sourceGuard?: IngestSourceGuard,
   ) {}
 
   /* ── 入库 ─────────────────────────────────────────────── */
 
   async ingest(chunks: KbChunk[], ctx: { tenantId: string; jobId?: string; traceId: string }): Promise<{ ingested: number; rejected: number }> {
+    void ctx; // 调用方负责审计落库；本方法只保证写入的原子性
+    return this.db.tx(() => this.writeChunks(chunks));
+  }
+
+  /**
+   * 文档级入库：切分 → 来源校验 → 覆盖写 → 落 kb_docs。
+   *
+   * **校验先于写入**：来源不合法时一行都不写。否则会出现"内容进去了、
+   * 来源是假的"的中间态，而报告会把它当合法来源引用。
+   *
+   * **幂等**：doc_id 由 (tenantId, sourceId, title, publishedAt) 稳定推导，
+   * 同键重复上传 = 覆盖（先删旧 chunk 与倒排词项）。chunk_id = `${docId}#${index}`，
+   * 天然稳定。
+   */
+  async ingestDocument(
+    input: IngestDocumentInput,
+    ctx: { tenantId: string; jobId?: string; traceId: string },
+  ): Promise<IngestDocumentResult> {
+    const title = (input.title ?? "").trim();
+    const content = input.content ?? "";
+    const sourceId = (input.sourceId ?? "").trim();
+
+    if (!title) throw new AppError({ code: "E-INGEST-001", message: "文档标题不能为空", details: { field: "title" } });
+    if (!sourceId) throw new AppError({ code: "E-INGEST-001", message: "sourceId 必填", details: { field: "sourceId" } });
+    if (!content.trim()) throw new AppError({ code: "E-INGEST-001", message: "文档内容为空，无可入库的文本", details: { field: "content" } });
+
+    const verdict = this.sourceGuard
+      ? this.sourceGuard(ctx.tenantId, sourceId)
+      : { ok: false as const, reason: "未配置来源守卫（装配层未注入），拒绝入库" };
+    if (!verdict.ok) {
+      throw new AppError({
+        code: "E-INGEST-001",
+        message: `来源校验未通过：${verdict.reason ?? "来源未登记或授权已失效"}`,
+        userMessage: `数据来源「${sourceId}」未登记或授权已失效，无法入库。请先在来源台账登记并授权。`,
+        details: { sourceId, tenantId: ctx.tenantId },
+      });
+    }
+
+    const publishedAt = input.publishedAt || nowIso();
+
+    // 全局语料只允许公开情报与方法论两类。KB-1/KB-2 装的是客户授权数据，
+    // 写成全局等于把甲方的私域数据对所有租户可见。
+    const isGlobal = Boolean(input.global);
+    if (isGlobal && input.collection !== "KB-3" && input.collection !== "KB-4") {
+      throw new AppError({
+        code: "E-INGEST-001",
+        message: `${input.collection} 不允许写入全局作用域（仅 KB-3 公开情报 / KB-4 方法论可跨租户共享）`,
+        details: { collection: input.collection, global: true },
+      });
+    }
+    // 用空串表示全局，与 GLOBAL_SCOPE_SQL 的既有约定保持一致
+    const scopeTenant = isGlobal ? "" : ctx.tenantId;
+
+    const docId = stableDocId([scopeTenant, sourceId, title, publishedAt]);
+    const raw = chunkText(content);
+    if (raw.length === 0) {
+      throw new AppError({ code: "E-INGEST-001", message: "切分后没有有效内容", details: { field: "content" } });
+    }
+
+    const tier = verdict.tier ?? "L3";
+    const sourceType = verdict.sourceType ?? "l3_public";
+    const chunks: KbChunk[] = raw.map((c) => ({
+      chunkId: `${docId}#${c.index}`,
+      docId,
+      collection: input.collection,
+      tenantId: scopeTenant,
+      text: c.text,
+      sourceId,
+      sourceType,
+      tier,
+      sampleSize: input.sampleSize ?? c.sampleSize,
+      publishedAt,
+      humanVerified: Boolean(input.humanVerified),
+      meta: {
+        ...(input.meta ?? {}),
+        chunkIndex: c.index,
+        ...(c.headingPath.length ? { headingPath: c.headingPath.join(" > ") } : {}),
+      },
+    }));
+
+    const replaced = Boolean(this.db.get<{ doc_id: string }>("SELECT doc_id FROM kb_docs WHERE doc_id = ?", docId));
+
+    const written = this.db.tx(() => {
+      this.purgeChunks(docId);
+      const out = this.writeChunks(chunks);
+      this.db.run(
+        `INSERT OR REPLACE INTO kb_docs
+         (doc_id, tenant_id, collection, title, source_id, mime, byte_size, chunk_count, ingested_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        docId,
+        scopeTenant,
+        input.collection,
+        title,
+        sourceId,
+        input.mime || "text/plain",
+        content.length,
+        out.ingested,
+        nowIso(),
+      );
+      return out;
+    });
+
+    return {
+      docId,
+      chunks: written.ingested,
+      rejected: written.rejected,
+      collection: input.collection,
+      sourceId,
+      replaced,
+    };
+  }
+
+  /**
+   * 清掉某文档的全部 chunk 与倒排词项。
+   *
+   * 顺序不能反：kb_terms 没有 doc_id 列，只能按 chunk_id 删，
+   * 所以**必须先查出 chunk_id 再删 chunk**。先删 chunk 会让随后的 SELECT 返回空集，
+   * 残留的词项在 BM25 里仍然能命中，回表时却查不到 chunk——
+   * 表现为"检索结果里出现空白条目"，而且不会报错。
+   */
+  private purgeChunks(docId: string): number {
+    const ids = this.db.all<{ chunk_id: string }>("SELECT chunk_id FROM kb_chunks WHERE doc_id = ?", docId);
+    for (const r of ids) this.db.run("DELETE FROM kb_terms WHERE chunk_id = ?", r.chunk_id);
+    if (ids.length === 0) return 0;
+    return this.db.run("DELETE FROM kb_chunks WHERE doc_id = ?", docId).changes;
+  }
+
+  /** 块写入的唯一实现。必须在事务内调用；`ingest` 与 `ingestDocument` 共用。 */
+  private writeChunks(chunks: KbChunk[]): { ingested: number; rejected: number } {
     let ingested = 0;
     let rejected = 0;
 
-    this.db.tx(() => {
-      for (const c of chunks) {
-        // 回灌不变量：无来源（sourceId/sourceType）的一律拒绝入库（E2E 用例 9）
-        if (!c.sourceId || !c.sourceType) {
-          rejected += 1;
-          continue;
-        }
-        const existing = this.db.get<{ chunk_id: string }>("SELECT chunk_id FROM kb_chunks WHERE chunk_id = ?", c.chunkId);
-        if (existing) {
-          rejected += 1;
-          continue;
-        }
-        this.db.run(
-          `INSERT INTO kb_chunks (chunk_id, doc_id, collection, tenant_id, text, source_id, source_type, tier,
-                                  sample_size, published_at, human_verified, meta_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          c.chunkId,
-          c.docId,
-          c.collection,
-          c.tenantId,
-          c.text,
-          c.sourceId,
-          c.sourceType,
-          c.tier,
-          c.sampleSize,
-          c.publishedAt,
-          c.humanVerified ? 1 : 0,
-          stringify(c.meta),
-        );
-        const seen = new Set<string>();
-        for (const t of tokenize(`${c.text} ${c.sourceId}`)) {
-          if (seen.has(t)) continue;
-          seen.add(t);
-          this.db.run("INSERT INTO kb_terms (chunk_id, term) VALUES (?, ?)", c.chunkId, t);
-        }
-        ingested += 1;
+    for (const c of chunks) {
+      // 回灌不变量：无来源（sourceId/sourceType）的一律拒绝入库（E2E 用例 9）
+      if (!c.sourceId || !c.sourceType) {
+        rejected += 1;
+        continue;
       }
-    });
+      const existing = this.db.get<{ chunk_id: string }>("SELECT chunk_id FROM kb_chunks WHERE chunk_id = ?", c.chunkId);
+      if (existing) {
+        rejected += 1;
+        continue;
+      }
+      this.db.run(
+        `INSERT INTO kb_chunks (chunk_id, doc_id, collection, tenant_id, text, source_id, source_type, tier,
+                                sample_size, published_at, human_verified, meta_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        c.chunkId,
+        c.docId,
+        c.collection,
+        c.tenantId,
+        c.text,
+        c.sourceId,
+        c.sourceType,
+        c.tier,
+        c.sampleSize,
+        c.publishedAt,
+        c.humanVerified ? 1 : 0,
+        stringify(c.meta),
+      );
+      const seen = new Set<string>();
+      for (const t of tokenize(`${c.text} ${c.sourceId}`)) {
+        if (seen.has(t)) continue;
+        seen.add(t);
+        this.db.run("INSERT INTO kb_terms (chunk_id, term) VALUES (?, ?)", c.chunkId, t);
+      }
+      ingested += 1;
+    }
 
     return { ingested, rejected };
+  }
+
+  /** 文档列表（运营视图）。 */
+  listDocuments(tenantId: string, collection?: KbCollection): { docId: string; title: string; collection: KbCollection; sourceId: string; chunkCount: number; ingestedAt: string }[] {
+    const rows = collection
+      ? this.db.all<DocRow>(
+          "SELECT doc_id, title, collection, source_id, chunk_count, ingested_at FROM kb_docs WHERE tenant_id = ? AND collection = ? ORDER BY ingested_at DESC",
+          tenantId,
+          collection,
+        )
+      : this.db.all<DocRow>(
+          "SELECT doc_id, title, collection, source_id, chunk_count, ingested_at FROM kb_docs WHERE tenant_id = ? ORDER BY ingested_at DESC",
+          tenantId,
+        );
+    return rows.map((r) => ({
+      docId: r.doc_id,
+      title: r.title,
+      collection: r.collection as KbCollection,
+      sourceId: r.source_id,
+      chunkCount: r.chunk_count,
+      ingestedAt: r.ingested_at,
+    }));
+  }
+
+  /** 软删：整份文档的 chunk 与倒排词项一并清掉，并移除文档行。 */
+  deleteDocument(tenantId: string, docId: string): { removedChunks: number } {
+    const doc = this.db.get<{ doc_id: string }>("SELECT doc_id FROM kb_docs WHERE doc_id = ? AND tenant_id = ?", docId, tenantId);
+    if (!doc) throw new AppError({ code: "E-INGEST-001", message: `文档不存在：${docId}`, details: { docId } });
+    return this.db.tx(() => {
+      const removed = this.purgeChunks(docId);
+      this.db.run("DELETE FROM kb_docs WHERE doc_id = ? AND tenant_id = ?", docId, tenantId);
+      return { removedChunks: removed };
+    });
   }
 
   async stats(tenantId: string): Promise<{ collection: KbCollection; chunks: number; scope: "tenant" | "global" }[]> {

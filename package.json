@@ -19,6 +19,8 @@
     "start": "tsx apps/gateway/src/main.ts",
     "demo": "tsx scripts/demo.ts",
     "demo:mock": "BM_LLM_MODE=mock tsx scripts/demo.ts",
+    "datasource:lab": "tsx scripts/datasource-lab.ts",
+    "datasource:smoke": "tsx scripts/datasource-smoke.ts",
     "test": "BM_LLM_MODE=mock node --import tsx --test tests/*.test.ts",
     "check:boundaries": "tsx scripts/check-boundaries.ts"
   },

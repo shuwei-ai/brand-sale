@@ -4,7 +4,7 @@
  * 内容对应四库分工与当前的数据现实：
  *   L2 历史执行库（达人 + 报价，这是「私域护城河」的雏形）
  *   KB-3 公开情报（行业趋势、竞品话语，出处标记为 public_intel）
- *   L3 联网检索：**唯一**真实外部源，凭 API Key 抓公开网页
+ *   L3 三条公开源：联网检索 + 抖音公开内容 + 小红书公开内容（全部未经人工核验）
  *   L4 第三方源：**登记但法务未批**，用于验证双重开关被正确拦截
  *
  * 注意：L1 平台源（千川/星图/蒲公英/生意参谋）与合成公开指数（巨量算数）
@@ -17,7 +17,7 @@ import { loadConfig, type Config } from "@brandsale/config";
 import { openDb, migrate, Repositories } from "@brandsale/storage";
 import { GovernanceGate } from "@brandsale/governance";
 import { KnowledgeService, PricingStore } from "@brandsale/knowledge";
-import { WEB_SEARCH_SOURCE_ID } from "@brandsale/datasource";
+import { WEB_SEARCH_SOURCE_ID, DOUYIN_WEB_SOURCE_ID, XHS_WEB_SOURCE_ID } from "@brandsale/datasource";
 import { createContainer } from "../apps/gateway/src/container.ts";
 
 export const DEMO_TENANT = "tenant_demo";
@@ -30,17 +30,35 @@ const daysAgo = (d: number): string => new Date(Date.now() - d * 86_400_000).toI
  * 避免两处各写一遍导致「新加的源只出现在空库自举里」。
  */
 const BUILTIN_SOURCES = [
-  // 唯一一条真实外部源：凭 API Key 抓公开网页，按 L3 处理（公开但未人工核验）。
+  // 三条真实外部源，全部 L3（公开、未经人工核验）。
   // 平台私有源（千川/星图/蒲公英/生意参谋）与合成公开指数（巨量算数）已全部移除：
   // 它们从未接入真实平台，登记在台账里只会让报告出现「已授权实测数据」的错觉。
-  // 将来接入真实平台时，在这里加回对应条目并补齐授权即可。
+  // 将来接入真实平台（如抖音开放平台 fans_data）时，在这里加回对应条目并补齐授权即可。
+  //
+  // 注意：L3 源**不填 contractRef**。contractRef 的语义是"授权合同"，公开采集没有合同，
+  // 填了就是把"公开采集"洗成"已授权实测" —— governance 的 assertSourceRegistration
+  // 会在登记期直接抛 E-GOV-005，所以这里连写都不该写。
   { sourceId: WEB_SEARCH_SOURCE_ID, name: "联网搜索（公开网页）", tier: "L3", authMethod: "火山引擎联网搜索 API Key" },
+  {
+    sourceId: DOUYIN_WEB_SOURCE_ID,
+    name: "抖音公开内容（自托管采集）",
+    tier: "L3",
+    authMethod: "自托管只读采集服务（与平台无授权合同）",
+  },
+  {
+    sourceId: XHS_WEB_SOURCE_ID,
+    name: "小红书公开内容（自托管只读代理）",
+    tier: "L3",
+    authMethod: "自托管只读代理（运营账号登录态，仅只读子命令）",
+  },
   { sourceId: "l4_example_vendor", name: "某第三方数据服务商", tier: "L4", authMethod: "商务合同", contractRef: "合同编号待法务确认", legalApproved: false },
 ] as const;
 
 /** 各内置源的授权有效期（天）。故意不含负数样本——过期样本由 grantAuthz 之后的流程另行构造 */
 const BUILTIN_GRANTS: { sourceId: string; days: number }[] = [
   { sourceId: WEB_SEARCH_SOURCE_ID, days: 365 },
+  { sourceId: DOUYIN_WEB_SOURCE_ID, days: 365 },
+  { sourceId: XHS_WEB_SOURCE_ID, days: 365 },
 ];
 
 /**

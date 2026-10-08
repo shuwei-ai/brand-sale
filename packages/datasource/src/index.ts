@@ -5,8 +5,15 @@
  * 适配器的工厂函数不导出给 AgentPack 之外的模块，由 `createGateBoundAdapterRegistry()`
  * 在装配时注入闸门引用，避免任何模块绕过闸门直连数据源。
  *
- * **当前数据现实**：本包只有**一个**适配器 —— `volc_web_search`（联网检索，见 web-search.ts），
- * 走火山引擎联网搜索 API 抓公开网页，`synthetic: false`。
+ * **当前数据现实**：本包有**三个**适配器，全部 `synthetic: false`，全部按 L3 处理：
+ *   1. `volc_web_search` —— 联网检索（web-search.ts），火山引擎联网搜索 API 抓公开网页；
+ *   2. `douyin_web_public` —— 抖音公开内容（douyin-web.ts），自托管 DTK，只读子集；
+ *   3. `xhs_web_public` —— 小红书公开内容（xiaohongshu.ts），自托管**只读**代理。
+ *
+ * 后两个都是"平台内公开内容"，补的是 web_search 抓不到的达人/作品/评论维度。
+ * 没有一个是 L1：与平台之间不存在授权合同，标成 L1 等于把公开采集洗成甲方授权实测。
+ * 真正的 L1（抖音开放平台 fans_data 粉丝画像）需要企业主体 + 权限审批 + 达人 OAuth，
+ * 未就绪之前**不注册**——这正是下面这段历史教训的延续：
  *
  * 早先随 Phase 0 纵切一起进来的 5 个合成适配器（千川 / 星图 / 蒲公英 / 生意参谋 / 巨量算数）
  * 已整体移除：它们只输出确定性伪随机数（`synthetic: true`），从未接入真实平台，
@@ -21,6 +28,8 @@ import type { Config } from "@brandsale/config";
 import type { Db } from "@brandsale/storage";
 import { parseJson, stringify } from "@brandsale/storage";
 import { WEB_SEARCH_SOURCE_ID, createWebSearchAdapter } from "./web-search.ts";
+import { DOUYIN_WEB_SOURCE_ID, createDouyinWebAdapter } from "./douyin-web.ts";
+import { XHS_WEB_SOURCE_ID, createXhsWebAdapter } from "./xiaohongshu.ts";
 
 /** 确定性哈希：仅用于缓存键，保证同输入同输出，便于回归与复现 */
 export function hashSeed(text: string): number {
@@ -139,13 +148,22 @@ export class DataSourceRegistry {
 /**
  * 装配注册表。
  *
- * 联网检索是**唯一**的真实外部源，同时是**可选能力**：没配 API Key 就不注册适配器，
- * 下游（M10 工具层）据此判断「能力是否就绪」，未就绪则不把 web_search 暴露给 Agent，
- * 避免 Agent 反复调用一个必然失败的工具、把预算烧在重试上。
+ * 三条真实外部源，各自**可选**：未配置就整体不注册，下游（M10 工具层）据此判断
+ * 「能力是否就绪」，未就绪则不把对应工具暴露给 Agent —— 避免 Agent 反复调用一个
+ * 必然失败的工具、把预算烧在重试上。
+ *
+ * 注册条件刻意不同，原因是凭据形态不同：
+ *   · web_search：`enabled && apiKey`（火山引擎按 Key 计费，没 Key 就是没能力）
+ *   · douyin / xiaohongshu：`enabled && baseUrl`（打的是自托管服务，地址在则能力在；
+ *     抖音的 apiKey 只在 v5 需要，小红书的令牌是可选的代理鉴权）
  */
 export function createRegistry(db: Db, config: Config): DataSourceRegistry {
   const webSearch = config.webSearch.enabled && config.webSearch.apiKey ? [createWebSearchAdapter(config)] : [];
-  const adapters = webSearch.map((a) => withCache(db, a, a.cacheTtlSeconds ?? 3600));
+  const douyin = config.douyin.enabled && config.douyin.baseUrl ? [createDouyinWebAdapter(config)] : [];
+  const xiaohongshu = config.xiaohongshu.enabled && config.xiaohongshu.baseUrl ? [createXhsWebAdapter(config)] : [];
+  const adapters = [...webSearch, ...douyin, ...xiaohongshu].map((a) =>
+    withCache(db, a, a.cacheTtlSeconds ?? 3600),
+  );
   return new DataSourceRegistry(adapters);
 }
 
@@ -156,7 +174,13 @@ export function mergeProvenance(list: Provenance[]): { sources: Provenance[]; an
 
 export const money = (amount: number): Money => ({ currency: "CNY", amount });
 
-/* ── 联网检索（唯一的真实外部源） ───────────────────────── */
+/* ── 三条真实外部源 ─────────────────────────────────────── */
 
 export { createWebSearchAdapter, WEB_SEARCH_SOURCE_ID } from "./web-search.ts";
 export type { WebSearchItem } from "./web-search.ts";
+
+export { createDouyinWebAdapter, DOUYIN_WEB_SOURCE_ID } from "./douyin-web.ts";
+export type { DouyinCreator, DouyinWork, DouyinComment, DouyinOp } from "./douyin-web.ts";
+
+export { createXhsWebAdapter, XHS_WEB_SOURCE_ID } from "./xiaohongshu.ts";
+export type { XhsNote, XhsComment, XhsUser, XhsOp } from "./xiaohongshu.ts";

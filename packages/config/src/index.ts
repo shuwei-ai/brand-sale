@@ -9,6 +9,28 @@ import { resolve } from "node:path";
 
 export type Env = "dev" | "staging" | "prod";
 
+/**
+ * 抖音自托管采集服务的端点路径。
+ *
+ * 为什么路径要可覆盖：DTK 有两代形态——v4 是同步 `GET /api/douyin/web/...`，
+ * v5 改成异步 `202 + task_id`（请求时带 `wait=true` 可归类同步）。自建版本若不兼容，
+ * 改这几个值即可，不必动适配器代码。默认取 v4 路径。
+ */
+export interface DouyinPaths {
+  profile: string;
+  posts: string;
+  video: string;
+  comments: string;
+}
+
+/** 小红书自托管**只读**代理的端点路径。契约定义见 docs/datasource-integration.md */
+export interface XhsPaths {
+  note: string;
+  comments: string;
+  user: string;
+  userPosts: string;
+}
+
 export interface Config {
   env: Env;
   httpPort: number;
@@ -45,7 +67,15 @@ export interface Config {
     rerankCooldownMs: number;
   };
 
-  parser: { url: string; fallback: "mineru" | "textonly" | "none" };
+  parser: {
+    url: string;
+    fallback: "mineru" | "textonly" | "none";
+    /**
+     * 文档解析超时（毫秒）。默认 60s——远高于普通接口，
+     * 因为 pdf/扫描件解析本身就慢，用 8s 这种默认值会必然超时。
+     */
+    timeoutMs: number;
+  };
   render: { engine: "markdown" | "presenton" };
 
   /**
@@ -85,9 +115,83 @@ export interface Config {
     prefetch: boolean;
   };
 
+  /**
+   * 抖音公开数据（自托管 DTK：Evil0ctal/Douyin_TikTok_Download_API）。
+   *
+   * 定位：给达人/内容/舆情补一条**平台内**的公开信息通道，补 web_search 抓不到的
+   * 作品数据与评论。只做只读子集：达人主页 / 作品列表 / 作品详情 / 评论。
+   *
+   * ⚠️ 分级是 **L3（公开）**，不是 L1。这是红线：
+   *   这条链路与抖音平台之间**不存在授权合同**，拿到的是公开可见的内容。
+   *   标成 L1 等于把"公开采集"洗成"甲方授权实测"，报告会据此把数字标成高置信度——
+   *   而这条数据既不来自甲方后台、也没经过人工核验。L3 源还禁止填 contractRef
+   *   （见 governance 的 assertSourceRegistration），从写入口就堵住这种伪装。
+   *
+   * 未配置 baseUrl 时适配器不注册，douyin_* 工具也不会出现在 Agent 的工具清单里
+   * （与 web_search 同一模式）——宁可没有这项能力，也不要让模型调一个必然失败的工具。
+   */
+  douyin: {
+    enabled: boolean;
+    /** 自托管服务地址，例如 http://127.0.0.1:8000（留空 = 能力缺席） */
+    baseUrl: string;
+    /** DTK v5 需要 API Key；v4 留空即可。非空时带 Authorization: Bearer */
+    apiKey: string;
+    timeoutMs: number;
+    /** 采集类结果变化慢，默认缓存 30 分钟 */
+    cacheTtlSeconds: number;
+    paths: DouyinPaths;
+  };
+
+  /**
+   * 小红书公开内容（自托管**只读**代理）。
+   *
+   * 为什么必须经代理而不是直连：可用的开源采集工具（如 xiaohongshu-cli）是 CLI、
+   * 需要登录态 Cookie、且**同时提供写命令**（发笔记/点赞/评论/关注/删除）。
+   * 整包封装会让模型有机会以甲方账号名义产生副作用。所以这里约定一个
+   * **只暴露只读子命令**的 HTTP 代理作为唯一边界，适配器只认这个契约。
+   *
+   * 分级同为 **L3**：内容本身公开可见，但访问经过登录态、且未经人工核验，
+   * provenance.note 必须如实写明这两点。
+   */
+  xiaohongshu: {
+    enabled: boolean;
+    /** 自托管只读代理地址，例如 http://127.0.0.1:8899（留空 = 能力缺席） */
+    baseUrl: string;
+    /** 代理侧若配了访问令牌则一致填写；留空表示代理无鉴权 */
+    apiKey: string;
+    timeoutMs: number;
+    cacheTtlSeconds: number;
+    paths: XhsPaths;
+  };
+
   tiers: { L1: boolean; L2: boolean; L3: boolean; L4: boolean };
 
+  tools: {
+    /**
+     * 是否允许注册 `mutating` 工具（会改变外部系统状态：发帖/点赞/评论/关注/删除）。
+     *
+     * 默认 **false**。让"引入写能力"成为一次主动决策，而不是封装数据源时的副作用：
+     * 公开采集类工具包（如 xiaohongshu-cli）自带写操作，整包封装后
+     * 模型可以合法地通过白名单、合法地过闸门，然后以甲方名义发出一条笔记。
+     * 打开它之前请确认：工具已挂 authz 检查、且只封装了确实需要的写命令。
+     */
+    allowMutating: boolean;
+  };
+
   job: { maxJobMinutes: number; allowPartial: boolean };
+
+  kb: {
+    /**
+     * 是否允许通过入库通道写入**跨租户共享**的全局语料（KB-3/KB-4，tenant_id=''）。
+     *
+     * 默认 **false**。当前 TenantContext 里还没有角色概念（token 只有
+     * `t.<tenantId>.<userId>` 三段），所以"仅 admin 可写全局"这条约束
+     * 暂时只能落在部署配置上——**宁可暂时用一个开关守住，也不要靠
+     * userId 字符串匹配去猜谁是管理员**。等角色系统落地后，
+     * 这里应改为按角色鉴权，而不是放宽开关。
+     */
+    allowGlobalWrite: boolean;
+  };
 
   observability: {
     traceContent: boolean;
@@ -184,6 +288,7 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
     parser: {
       url: str(get("BM_PARSER_URL")),
       fallback: (str(get("BM_PARSER_FALLBACK"), "textonly") as Config["parser"]["fallback"]) ?? "textonly",
+      timeoutMs: num(get("BM_PARSER_TIMEOUT_MS"), 60_000),
     },
 
     render: { engine: str(get("BM_RENDER_ENGINE"), "markdown") === "presenton" ? "presenton" : "markdown" },
@@ -205,6 +310,36 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
       prefetch: bool(get("BM_WEB_SEARCH_PREFETCH"), true),
     },
 
+    douyin: {
+      enabled: bool(get("BM_DOUYIN_ENABLED"), true),
+      // 去掉结尾斜杠：适配器按 `${baseUrl}${path}` 拼接，双斜杠在某些反代上会 404
+      baseUrl: str(get("BM_DOUYIN_BASE_URL")).replace(/\/+$/, ""),
+      apiKey: str(get("BM_DOUYIN_API_KEY")),
+      timeoutMs: num(get("BM_DOUYIN_TIMEOUT_MS"), 15_000),
+      cacheTtlSeconds: num(get("BM_DOUYIN_CACHE_TTL"), 1_800),
+      paths: {
+        profile: str(get("BM_DOUYIN_PATH_PROFILE"), "/api/douyin/web/fetch_user_profile"),
+        posts: str(get("BM_DOUYIN_PATH_POSTS"), "/api/douyin/web/fetch_user_post_videos"),
+        video: str(get("BM_DOUYIN_PATH_VIDEO"), "/api/douyin/web/fetch_one_video"),
+        comments: str(get("BM_DOUYIN_PATH_COMMENTS"), "/api/douyin/web/fetch_video_comments"),
+      },
+    },
+
+    xiaohongshu: {
+      enabled: bool(get("BM_XHS_ENABLED"), true),
+      baseUrl: str(get("BM_XHS_BASE_URL")).replace(/\/+$/, ""),
+      apiKey: str(get("BM_XHS_API_KEY")),
+      // 小红书代理内部是 spawn CLI + 内置人类化延迟（~1-1.5s/次），超时给得比抖音宽
+      timeoutMs: num(get("BM_XHS_TIMEOUT_MS"), 25_000),
+      cacheTtlSeconds: num(get("BM_XHS_CACHE_TTL"), 1_800),
+      paths: {
+        note: str(get("BM_XHS_PATH_NOTE"), "/xhs/note"),
+        comments: str(get("BM_XHS_PATH_COMMENTS"), "/xhs/comments"),
+        user: str(get("BM_XHS_PATH_USER"), "/xhs/user"),
+        userPosts: str(get("BM_XHS_PATH_USER_POSTS"), "/xhs/user-posts"),
+      },
+    },
+
     tiers: {
       L1: bool(get("BM_L1_ENABLED"), true),
       L2: bool(get("BM_L2_ENABLED"), true),
@@ -212,9 +347,17 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
       L4: bool(get("BM_L4_ENABLED"), false),
     },
 
+    tools: {
+      allowMutating: bool(get("BM_TOOLS_ALLOW_MUTATING"), false),
+    },
+
     job: {
       maxJobMinutes: num(get("BM_MAX_JOB_MINUTES"), 60),
       allowPartial: bool(get("BM_ALLOW_PARTIAL"), true),
+    },
+
+    kb: {
+      allowGlobalWrite: bool(get("BM_KB_ALLOW_GLOBAL_WRITE"), false),
     },
 
     observability: {
@@ -245,6 +388,20 @@ export function assertConfigInvariants(c: Config): string[] {
   }
   if (c.webSearch.enabled && !c.webSearch.apiKey) {
     problems.push("BM_WEB_SEARCH_ENABLED=true 但 BM_WEB_SEARCH_API_KEY 为空：联网检索适配器与 web_search 工具都不会注册");
+  }
+  // 这两个源的注册条件是 baseUrl（自托管地址），不是凭据：
+  // 抖音适配器打的是自建 DTK 服务，小红书打的是只读代理，都是"地址在则能力在"。
+  if (c.douyin.enabled && !c.douyin.baseUrl) {
+    problems.push(
+      "BM_DOUYIN_ENABLED=true 但 BM_DOUYIN_BASE_URL 为空：抖音公开数据适配器与 douyin_* 工具都不会注册。" +
+        "自建 DTK（Evil0ctal/Douyin_TikTok_Download_API）后把地址填进去即可；本地联调可用 npm run datasource:lab",
+    );
+  }
+  if (c.xiaohongshu.enabled && !c.xiaohongshu.baseUrl) {
+    problems.push(
+      "BM_XHS_ENABLED=true 但 BM_XHS_BASE_URL 为空：小红书只读适配器与 xhs_* 工具都不会注册。" +
+        "自建只读代理后填入地址；本地联调可用 npm run datasource:lab",
+    );
   }
   return problems;
 }

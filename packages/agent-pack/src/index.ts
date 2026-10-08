@@ -4,7 +4,7 @@
 
 export { AgentPack, MOCK_BRIEF, extractJsonObject, type AgentRuntimeDeps, type PhaseResult, type PhaseStrategy } from "./agents.ts";
 export { ToolRegistry, policy, TIER_GOVERNANCE, type ToolCallContext, type ToolCallRecord, type ToolDeps, type ToolImpl } from "./tools.ts";
-export { PHASE_TOOL_HINT, TOOL_IMPLEMENTATIONS, registerAllTools, bindDeps } from "./tool-impls.ts";
+export { PHASE_TOOL_HINT, TOOL_IMPLEMENTATIONS, admitTool, registerAllTools, bindDeps } from "./tool-impls.ts";
 export { SYSTEM_PROMPTS, contextBlock } from "./prompts.ts";
 export {
   ALL_SCHEMAS,

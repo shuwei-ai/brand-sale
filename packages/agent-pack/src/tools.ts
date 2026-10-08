@@ -332,6 +332,9 @@ export function policy(partial: Partial<ToolPolicy> & Pick<ToolPolicy, "name" | 
     retry: { attempts: 1, backoff: "exponential", baseMs: 300 },
     parallelism: "parallel",
     replaySafe: true,
+    // 缺省只读。写工具必须显式声明 mutating: true，并因此受装配期的三重约束
+    // （默认不注册 / 必须挂 authz / 必须 replaySafe=false）。见 ToolPolicy.mutating。
+    mutating: false,
     ...partial,
   };
 }

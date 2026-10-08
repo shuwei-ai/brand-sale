@@ -24,6 +24,7 @@ import {
 } from "@brandsale/contracts";
 import type { Config } from "@brandsale/config";
 import type { Repositories } from "@brandsale/storage";
+import { assertSourceRegistration } from "./source-guard.ts";
 
 export interface GovernanceDeps {
   repos: Repositories;
@@ -182,6 +183,11 @@ export class GovernanceGate implements IGovernanceGate {
   /* ── 台账登记与授权 ───────────────────────────────────── */
 
   async registerSource(src: SourceRegistration, ctx: TenantContext): Promise<{ sourceId: string }> {
+    // 组合校验先于写入：非法组合直接拒绝，不在台账里留下"看起来已授权"的源。
+    // 与下面 L4 的"允许登记但标记未批准"不冲突——那条是**访问时**由闸门双开关拦截，
+    // 而这里拦的是字段本身自相矛盾（如 L3 填了合同编号）。
+    assertSourceRegistration(src);
+
     if (src.tier === "L4" && !src.legalApproved) {
       // 允许登记但标记未批准；真到使用时会被 source 检查挡住
       this.deps.repos.audit.add({

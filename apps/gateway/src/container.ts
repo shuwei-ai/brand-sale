@@ -10,9 +10,9 @@
 
 import { loadConfig, assertConfigInvariants, type Config } from "@brandsale/config";
 import { migrate, openDb, Repositories } from "@brandsale/storage";
-import { GovernanceGate, LineageLedger, externalCatalogKeys } from "@brandsale/governance";
+import { GovernanceGate, LineageLedger, createIngestSourceGuard, externalCatalogKeys } from "@brandsale/governance";
 import { ModelGateway } from "@brandsale/model-gateway";
-import { KnowledgeService, PricingStore } from "@brandsale/knowledge";
+import { KnowledgeService, PricingStore, createParser, type DocumentParser } from "@brandsale/knowledge";
 import { createRegistry as createDataSourceRegistry } from "@brandsale/datasource";
 import { AgentPack } from "@brandsale/agent-pack";
 import { RenderService } from "@brandsale/render";
@@ -28,6 +28,8 @@ export interface Container {
   pricing: PricingStore;
   agentPack: AgentPack;
   render: RenderService;
+  /** 文档解析器：KB 入库通道用它把 pdf/docx 转成文本 */
+  parser: DocumentParser;
   bus: EventBus;
   orchestrator: Orchestrator;
   warnings: string[];
@@ -51,10 +53,15 @@ export function createContainer(config: Config = loadConfig()): Container {
   });
   const ledger = new LineageLedger(repos);
   const gateway = new ModelGateway(config, repos);
-  const knowledge = new KnowledgeService(db, config);
+  // 入库来源守卫由这里注入：knowledge 不能依赖 governance（会让依赖矩阵多一条边），
+  // 而"授权是否生效中"的语义只该有一份实现（AuthzRepo.active）。
+  const knowledge = new KnowledgeService(db, config, createIngestSourceGuard(repos));
   const pricing = new PricingStore(db);
   const datasources = createDataSourceRegistry(db, config);
   const render = new RenderService(config);
+  // 文档解析器（P1-5）：BM_PARSER_URL 非空即启用 MinerU，否则仅支持纯文本。
+  // 未配置时 pdf/docx 上传会明确报 415，而不是被当成文本塞进库。
+  const parser = createParser(config);
 
   const agentPack = new AgentPack({
     config,
@@ -78,6 +85,15 @@ export function createContainer(config: Config = loadConfig()): Container {
     );
   }
 
+  /* 启动提示：未配置解析器时 KB 入库只接受纯文本。
+   * 这不是错误——纯文本入库本身就是完整可用的通道（运营把公开情报贴进来即可）；
+   * 但 pdf/docx 上传会被明确拒绝，所以提前告知，避免使用时才发现。 */
+  if (!config.parser.url) {
+    warnings.push(
+      "未配置 BM_PARSER_URL：KB 入库通道目前只接受纯文本（text/plain、text/markdown）。上传 pdf/docx 会返回 415 E-INGEST-002。",
+    );
+  }
+
   const bus = new EventBus(repos);
   const orchestrator = new Orchestrator({ config, repos, agentPack, render, bus });
 
@@ -91,6 +107,7 @@ export function createContainer(config: Config = loadConfig()): Container {
     pricing,
     agentPack,
     render,
+    parser,
     bus,
     orchestrator,
     warnings,

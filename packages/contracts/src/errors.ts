@@ -25,6 +25,23 @@ export const ERROR_CODES = {
   "E-KB-002": { http: 200, domain: "检索", message: "向量库不可用", retryable: true },
   "E-KB-003": { http: 200, domain: "检索", message: "库为空（冷启动）", retryable: false },
 
+  /**
+   * 入库（知识库写入）。
+   *
+   * 为什么单开一个域而不是复用 E-KB-*：E-KB-001/002/003 是**检索**语义
+   * （重排超时 / 向量库不可用 / 库为空），复用会把"来源未登记"误报成"重排超时"，
+   * 排障方向直接反了。
+   *
+   * 为什么这里用 4xx，而本表开头写着"业务错误一律 HTTP 200"：
+   * 那条规则的原因写得很清楚——"长任务里的'某个源失败'不是请求失败，
+   * 前端要继续渲染其余结果"。它约束的是**长任务内的降级**。
+   * 入库是**同步请求**，调用方必须当场知道写没写进去，前提条件错了却回 200
+   * 会让人误以为入库成功。所以这三条是真正的请求级错误。
+   */
+  "E-INGEST-001": { http: 400, domain: "入库", message: "入库前置条件不满足（来源未登记/未授权，或入参不合法）", retryable: false },
+  "E-INGEST-002": { http: 415, domain: "入库", message: "不支持的文档格式（需配置解析器）", retryable: false },
+  "E-INGEST-003": { http: 409, domain: "入库", message: "同一文档正在入库（幂等冲突）", retryable: true },
+
   "E-AGENT-001": { http: 200, domain: "Agent", message: "Schema 校验失败（已重试）", retryable: false },
   "E-AGENT-002": { http: 200, domain: "Agent", message: "Agent 超时", retryable: true },
 

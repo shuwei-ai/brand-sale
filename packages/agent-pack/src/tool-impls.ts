@@ -2,9 +2,15 @@
  * 10 个工具的落地实现（对应 LLD §2.10 的「依赖工具」列）
  *
  * 说明：多为**确定性**工具（检索/取数/计算/校验）。
- * 信息入口一共两条：
+ * 外部信息入口一共四条，全部按 L3 处理、全部由 `boundSourceId` 绑死来源：
  *   ① knowledge —— 四库混合检索，本地语料（KB-2 私域复盘、KB-3 公开情报、KB-4 方法论）；
- *   ② web_search —— 联网检索公开网页，底层是 M4 的 `volc_web_search` 适配器。
+ *   ② web_search —— 联网检索公开网页，底层是 M4 的 `volc_web_search` 适配器；
+ *   ③ douyin_creator / douyin_comments —— 抖音公开内容，底层 `douyin_web_public`（自托管 DTK）；
+ *   ④ xhs_creator / xhs_note —— 小红书公开内容，底层 `xhs_web_public`（自托管只读代理）。
+ *
+ * ②③④ 的共同点：都是**公开但未经人工核验**的第三方内容，只能支撑"关于他人"的公开断言。
+ * 涉及甲方自身经营指标（ROI、店铺 GMV、投放成本）的断言，只能来自 L1/L2 授权数据 ——
+ * 这条边界由 report 阶段的引用分级兜底，而工具描述负责让模型事前就知道不该越界。
  *
  * 原先还有第三个入口「平台适配器取数」（千川/星图/蒲公英/生意参谋/巨量算数）以及对应的
  * query_customer_owned / query_public_index 两个工具，已一并移除：那些适配器从未接入
@@ -22,8 +28,8 @@
  */
 
 import { Type } from "@earendil-works/pi-ai";
-import type { ConfidenceTier, PhaseName } from "@brandsale/contracts";
-import { WEB_SEARCH_SOURCE_ID, type Provenance } from "@brandsale/datasource";
+import type { ConfidenceTier, PhaseName, ToolPolicy } from "@brandsale/contracts";
+import { WEB_SEARCH_SOURCE_ID, DOUYIN_WEB_SOURCE_ID, XHS_WEB_SOURCE_ID, type Provenance } from "@brandsale/datasource";
 import { buildSourceCatalog } from "@brandsale/governance";
 import { type ToolDeps, type ToolImpl, type ToolCallContext, policy } from "./tools.ts";
 
@@ -221,6 +227,241 @@ const webSearch: ToolImpl = {
       result: { query, count: results.length, results },
       provenance: [res.provenance],
       note: `联网检索「${query}」命中 ${results.length} 条（L3 公开，未人工核验）`,
+    };
+  },
+};
+
+/* ── 平台内公开内容：抖音 / 小红书 ───────────────────────
+ *
+ * 这两组工具补的是**平台内**的公开内容（达人主页、作品数据、评论），
+ * 也就是 web_search 抓不到的那一层：搜索引擎一般不索引抖音作品页与小红书笔记详情。
+ *
+ * 三条共同的设计约束：
+ *   ① `boundSourceId` 绑死来源 —— 闸门检查的是绑定值，不是模型自报的 sourceId；
+ *   ② 结果是 L3 且**未经人工核验**，note 里如实写明，报告引用必须带来源；
+ *   ③ `maxCallsPerJob` 有界 —— 自托管服务虽然不按次计费，但它背后是有限的
+ *      账号池与风控额度，无限调用会把甲方账号打到验证码或封 IP。
+ *
+ * 白名单刻意收窄（对比 web_search 的六阶段全开）：
+ *   · `*_creator` 给 CI + CT —— CT 需要给候选人补公开背景；
+ *   · `*_comments` 只给 CI —— 评论属内容舆情，不是人选阶段的输入。
+ * 判断标准是「放开它会不会让某条既有不变量失守」：CT 的不变量是"达人必须可追溯、
+ * 禁止编造"。真实采集来的达人不违反这条（它可追溯），但**报价与成交价仍必须来自
+ * 报价库**，所以工具描述里明确禁止用采集到的粉丝量去推算报价。
+ */
+
+const douyinCreator: ToolImpl = {
+  policy: policy({
+    name: "douyin_creator",
+    allowedAgents: ["CI", "CT"],
+    governance: ["scope", "source", "authz", "tenant"],
+    boundSourceId: DOUYIN_WEB_SOURCE_ID,
+    timeoutMs: 20_000,
+    retry: { attempts: 1, backoff: "fixed", baseMs: 500 },
+    fallback: "none",
+    // 一次调用最多打 2 个上游请求（主页 + 作品），所以上限按调用次数计、留出余量
+    maxCallsPerJob: 15,
+  }),
+  description:
+    "采集抖音达人的公开主页与作品列表（粉丝量、作品数、作品互动数据）。需要 sec_user_id —— 抖音号的稳定 ID，" +
+    "不是昵称。结果属 L3 公开内容、未经人工核验：只可支撑关于该达人的公开断言（如「公开粉丝量 380 万」），" +
+    "不得用来推算报价或成交价（那必须走 pricing_query 的报价库），也不得用于甲方自身经营指标。",
+  producesCitedData: true,
+  parameters: Type.Object({
+    secUserId: Str(),
+    includePosts: Type.Optional(Type.Boolean()),
+    count: Type.Optional(Num()),
+  }),
+  async execute(params, tc) {
+    const secUserId = String(params.secUserId ?? "").trim();
+    if (!secUserId) {
+      /* 刻意不做"用昵称去搜一个 ID"的降级：采集服务的搜索端点没有接线，
+       * 用昵称猜 ID 会拿到另一个人 —— 这比返回空更危险（报告会把陌生人写成候选人）。 */
+      return {
+        result: {
+          secUserId: "",
+          degraded: true,
+          code: "E-DATA-002",
+          note: "缺少 sec_user_id。本项目不做昵称搜索：采集端未接线搜索端点，用昵称猜 ID 可能拿错人，因此宁可不出数据。",
+        },
+        note: "缺少 sec_user_id，未发起采集",
+      };
+    }
+
+    const deps = this_deps(tc);
+    const adapter = deps.datasources.require(DOUYIN_WEB_SOURCE_ID);
+    const base = { tenantId: tc.ctx.tenantId, jobId: tc.jobId };
+
+    const profileRes = await adapter.fetch({ ...base, params: { op: "profile", secUserId } }, deps.config);
+    const creator = profileRes.rows[0] ?? null;
+    const provenance: Provenance[] = [profileRes.provenance];
+
+    let works: Record<string, unknown>[] = [];
+    if (params.includePosts !== false) {
+      const postsRes = await adapter.fetch(
+        { ...base, params: { op: "posts", secUserId, count: params.count === undefined ? 20 : Number(params.count) } },
+        deps.config,
+      );
+      works = postsRes.rows;
+      provenance.push(postsRes.provenance);
+    }
+
+    return {
+      result: { creator, works, workCount: works.length },
+      provenance,
+      note: `抖音公开采集：主页 1 条 + 作品 ${works.length} 条（L3，未人工核验）`,
+    };
+  },
+};
+
+const douyinComments: ToolImpl = {
+  policy: policy({
+    name: "douyin_comments",
+    allowedAgents: ["CI"],
+    governance: ["scope", "source", "authz", "tenant"],
+    boundSourceId: DOUYIN_WEB_SOURCE_ID,
+    timeoutMs: 20_000,
+    retry: { attempts: 1, backoff: "fixed", baseMs: 500 },
+    fallback: "none",
+    maxCallsPerJob: 15,
+  }),
+  description:
+    "采集抖音指定作品的公开评论（内容、点赞数、评论者 IP 属地）。用于舆情口碑与内容反馈分析。" +
+    "⚠️ 评论者的 IP 属地**不是**粉丝地域：它既是有偏样本（只有会评论的人才被统计），口径也完全不同。" +
+    "任何基于它的人群推断都必须在报告中标为有偏代理，不得当作粉丝画像使用。",
+  producesCitedData: true,
+  parameters: Type.Object({ awemeId: Str(), count: Type.Optional(Num()) }),
+  async execute(params, tc) {
+    const awemeId = String(params.awemeId ?? "").trim();
+    if (!awemeId) {
+      return { result: { awemeId: "", comments: [], degraded: true, code: "E-DATA-002", note: "缺少 aweme_id，未发起采集" }, note: "缺少 aweme_id" };
+    }
+    const deps = this_deps(tc);
+    const res = await deps.datasources.require(DOUYIN_WEB_SOURCE_ID).fetch(
+      {
+        tenantId: tc.ctx.tenantId,
+        jobId: tc.jobId,
+        params: { op: "comments", awemeId, count: params.count === undefined ? 20 : Number(params.count) },
+      },
+      deps.config,
+    );
+    return {
+      result: { awemeId, comments: res.rows, count: res.rows.length },
+      provenance: [res.provenance],
+      note: `抖音公开评论 ${res.rows.length} 条（L3，未人工核验；IP 属地非粉丝地域）`,
+    };
+  },
+};
+
+const xhsCreator: ToolImpl = {
+  policy: policy({
+    name: "xhs_creator",
+    allowedAgents: ["CI", "CT"],
+    governance: ["scope", "source", "authz", "tenant"],
+    boundSourceId: XHS_WEB_SOURCE_ID,
+    timeoutMs: 30_000,
+    retry: { attempts: 1, backoff: "fixed", baseMs: 800 },
+    fallback: "none",
+    maxCallsPerJob: 15,
+  }),
+  description:
+    "采集小红书博主公开主页与其笔记列表。需要 user_id（博主主页的稳定 ID）。" +
+    "结果属 L3 公开内容、未经人工核验，同样不得用来推算报价。注意小红书 web 接口不提供关注/粉丝列表，" +
+    "粉丝量在部分页面也取不到 —— 取不到会返回 null，而不是给一个估计值。",
+  producesCitedData: true,
+  parameters: Type.Object({
+    userId: Str(),
+    includeNotes: Type.Optional(Type.Boolean()),
+    count: Type.Optional(Num()),
+  }),
+  async execute(params, tc) {
+    const userId = String(params.userId ?? "").trim();
+    if (!userId) {
+      return {
+        result: { userId: "", degraded: true, code: "E-DATA-002", note: "缺少 user_id，未发起采集。本项目不做昵称搜索（会拿错人）。" },
+        note: "缺少 user_id，未发起采集",
+      };
+    }
+    const deps = this_deps(tc);
+    const adapter = deps.datasources.require(XHS_WEB_SOURCE_ID);
+    const base = { tenantId: tc.ctx.tenantId, jobId: tc.jobId };
+
+    const userRes = await adapter.fetch({ ...base, params: { op: "user", userId } }, deps.config);
+    const user = userRes.rows[0] ?? null;
+    const provenance: Provenance[] = [userRes.provenance];
+
+    let notes: Record<string, unknown>[] = [];
+    if (params.includeNotes !== false) {
+      const notesRes = await adapter.fetch(
+        { ...base, params: { op: "userPosts", userId, count: params.count === undefined ? 20 : Number(params.count) } },
+        deps.config,
+      );
+      notes = notesRes.rows;
+      provenance.push(notesRes.provenance);
+    }
+
+    return {
+      result: { user, notes, noteCount: notes.length },
+      provenance,
+      note: `小红书公开采集：主页 1 条 + 笔记 ${notes.length} 条（L3，未人工核验）`,
+    };
+  },
+};
+
+const xhsNote: ToolImpl = {
+  policy: policy({
+    name: "xhs_note",
+    allowedAgents: ["CI"],
+    governance: ["scope", "source", "authz", "tenant"],
+    boundSourceId: XHS_WEB_SOURCE_ID,
+    timeoutMs: 30_000,
+    retry: { attempts: 1, backoff: "fixed", baseMs: 800 },
+    fallback: "none",
+    maxCallsPerJob: 15,
+  }),
+  description:
+    "读取小红书单篇笔记的公开详情与评论（标题、正文、互动数、标签、评论内容与评论者 IP 属地）。" +
+    "建议直接传笔记 URL —— 带 xsec_token 的完整链接命中率明显更高，只传 note_id 有时读不到。" +
+    "评论者的 IP 属地**不是**粉丝地域（有偏样本），不得当作人群画像使用。",
+  producesCitedData: true,
+  parameters: Type.Object({
+    url: Type.Optional(Str()),
+    noteId: Type.Optional(Str()),
+    includeComments: Type.Optional(Type.Boolean()),
+    count: Type.Optional(Num()),
+  }),
+  async execute(params, tc) {
+    const url = String(params.url ?? "").trim();
+    const noteId = String(params.noteId ?? "").trim();
+    if (!url && !noteId) {
+      return {
+        result: { noteId: "", degraded: true, code: "E-DATA-002", note: "缺少 url 或 note_id，未发起采集" },
+        note: "缺少笔记标识，未发起采集",
+      };
+    }
+    const deps = this_deps(tc);
+    const adapter = deps.datasources.require(XHS_WEB_SOURCE_ID);
+    const base = { tenantId: tc.ctx.tenantId, jobId: tc.jobId };
+    const ident = url ? { url } : { noteId };
+
+    const noteRes = await adapter.fetch({ ...base, params: { op: "note", ...ident } }, deps.config);
+    const note = noteRes.rows[0] ?? null;
+    const provenance: Provenance[] = [noteRes.provenance];
+
+    let comments: Record<string, unknown>[] = [];
+    if (params.includeComments !== false) {
+      const cRes = await adapter.fetch(
+        { ...base, params: { op: "comments", ...ident, count: params.count === undefined ? 20 : Number(params.count) } },
+        deps.config,
+      );
+      comments = cRes.rows;
+      provenance.push(cRes.provenance);
+    }
+
+    return {
+      result: { note, comments, commentCount: comments.length },
+      provenance,
+      note: `小红书笔记详情 + 评论 ${comments.length} 条（L3，未人工核验；IP 属地非粉丝地域）`,
     };
   },
 };
@@ -446,6 +687,10 @@ export const TOOL_IMPLEMENTATIONS: ToolImpl[] = [
   resolveAuthorization,
   kbRetrieve,
   webSearch,
+  douyinCreator,
+  douyinComments,
+  xhsCreator,
+  xhsNote,
   pricingQuery,
   riskScreen,
   calendarPlan,
@@ -454,12 +699,57 @@ export const TOOL_IMPLEMENTATIONS: ToolImpl[] = [
   citeFact,
 ];
 
+/**
+ * 装配期的工具准入判定。
+ *
+ * 抽成独立函数而不是内联在 registerAllTools 里，是为了让它**可单测**：
+ * mutating 的三条约束（默认不注册 / 必须挂 authz / 必须 replaySafe=false）
+ * 是安全不变量，靠"读代码确认"验证是不够的。
+ *
+ * 返回 `{ ok: false }` 表示"能力未就绪或未授权，静默不注册"；
+ * 抛错表示"配置本身自相矛盾"，属于部署错误，必须在启动时炸出来。
+ */
+export function admitTool(
+  policy: ToolPolicy,
+  deps: Pick<ToolDeps, "config" | "datasources">,
+): { ok: boolean; reason?: string } {
+  // 绑定数据源的工具，其能力可能在装配期不存在（例如没配 API Key 的联网检索）。
+  // 此时不注册它：宁可 Agent 的工具清单里没有这一项，也不要让它去调一个必然失败的工具。
+  if (policy.boundSourceId && !deps.datasources.get(policy.boundSourceId)) {
+    return { ok: false, reason: `数据源能力未就绪：${policy.boundSourceId}` };
+  }
+
+  // 写操作工具默认不注册。见 ToolPolicy.mutating 的注释：
+  // 缺省关闭是为了让"引入写能力"成为一次显式决策——公开采集类工具包
+  // 常常同时提供读与写，整包封装会让模型有机会以甲方名义产生副作用。
+  if (policy.mutating) {
+    if (!deps.config.tools.allowMutating) {
+      return { ok: false, reason: "policy.mutating=true 但 BM_TOOLS_ALLOW_MUTATING=false" };
+    }
+    // 即使显式开启，写操作也必须挂授权检查：没有 authz 的写工具是不可接受的默认值。
+    // 放在装配期抛错而不是运行期拒绝，是为了让配置错误在启动时就暴露，
+    // 而不是等到某次任务里模型真的调用了它。
+    if (!policy.governance.includes("authz")) {
+      throw new Error(
+        `工具 ${policy.name} 标记为 mutating 但未挂 "authz" 检查。` +
+          `写操作必须有授权检查，请在 policy.governance 里加上 "authz"。`,
+      );
+    }
+    if (policy.replaySafe) {
+      throw new Error(
+        `工具 ${policy.name} 标记为 mutating 但 replaySafe=true。` +
+          `写操作重放会重复产生副作用，必须设为 replaySafe: false。`,
+      );
+    }
+  }
+
+  return { ok: true };
+}
+
 export function registerAllTools(registry: { register(t: ToolImpl): void }, deps: ToolDeps): void {
   bindDeps(deps);
   for (const t of TOOL_IMPLEMENTATIONS) {
-    // 绑定数据源的工具，其能力可能在装配期不存在（例如没配 API Key 的联网检索）。
-    // 此时不注册它：宁可 Agent 的工具清单里没有这一项，也不要让它去调一个必然失败的工具。
-    if (t.policy.boundSourceId && !deps.datasources.get(t.policy.boundSourceId)) continue;
+    if (!admitTool(t.policy, deps).ok) continue;
     registry.register(t);
   }
 }
@@ -469,11 +759,16 @@ export const PHASE_TOOL_HINT: Record<PhaseName, string> = {
   intel:
     "用 kb_retrieve 分三路取本地情报（竞品格局 / 类目趋势与人群 / 法规与合规口径），" +
     "用 web_search 检索公开网页（行业趋势、竞品动态、平台规则、政策法规）；" +
-    "检索结果属 L3 公开且**未经人工核验**，引用必须带来源站点，不得当作事实基准。" +
+    "若工具清单里有 douyin_creator / douyin_comments / xhs_note，" +
+    "可用它们取竞品与达人在平台内的公开内容与评论口碑（拿到 sec_user_id / note_id / URL 时用）；" +
+    "检索结果属 L3 公开且**未经人工核验**，引用必须带来源站点或账号，不得当作事实基准。" +
     "竞品至少给出 3 家，每家都要有 contentMatrix / sovTrend / differentiation；" +
-    "声量份额与价格带占比取不到就写 null，**不要编造**。",
+    "声量份额与价格带占比取不到就写 null，**不要编造**。" +
+    "评论者的 IP 属地是有偏样本，**不是粉丝地域**，只能标为有偏代理。",
   creator:
     "先用 kb_retrieve 找历史人选与复盘，再用 pricing_query 取报价区间、risk_screen 做风控；" +
+    "已有 sec_user_id / user_id 时，可用 douyin_creator / xhs_creator 补候选人的公开背景（粉丝量、作品互动）；" +
+    "**报价与成交价必须来自报价库**，不得用公开粉丝量去推算；公开采集不到就留 null；" +
     "risk_screen 要对**每一个候选**都跑，并把结论落到该候选的 riskFlags（不要只筛第一个）；" +
     "候选必须覆盖 head / mid / tail 三层，每层至少 1 人，并给出 contentFit 与 historicalPerformance；" +
     "报价库无样本时可用 web_search 补充公开背景，但**不得**据此虚构达人报价或成交价。",

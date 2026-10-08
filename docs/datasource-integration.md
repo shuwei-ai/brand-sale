@@ -1,0 +1,289 @@
+# 外部数据源接入：联网搜索 / 抖音 / 小红书
+
+> 本文对应三个**外部信息入口**的接入状态、契约、合规边界与自检方式。
+> 相关代码：`packages/datasource/src/{web-search,douyin-web,xiaohongshu}.ts`、
+> `packages/agent-pack/src/tool-impls.ts`、`scripts/{datasource-lab,datasource-smoke}.ts`
+
+---
+
+## 0. 一句话现状
+
+| 源 | 代码 | 真实链路 | 说明 |
+|---|---|---|---|
+| 联网搜索 `volc_web_search` | ✅ 就绪 | ✅ **实测连通** | 火山引擎联网搜索 Lite，凭 `.env` 里的 Key 抓公开网页 |
+| 抖音公开内容 `douyin_web_public` | ✅ 就绪 | ⏳ 待接自托管服务 | 填 `BM_DOUYIN_BASE_URL` 即生效；本地联调走 `datasource:lab` |
+| 小红书公开内容 `xhs_web_public` | ✅ 就绪 | ⏳ 待接只读代理 | 填 `BM_XHS_BASE_URL` 即生效；本地联调走 `datasource:lab` |
+
+**「代码就绪」与「数据就绪」是两件事**，本文所有结论都按这个口径写。
+三个源都遵守同一条装配规则：**未配置就不注册**——适配器不存在 → 工具不进 Agent 工具清单 →
+模型不会去调一个必然失败的工具。
+
+工具总数：**14 个**（原 10 + 新增 4）。其中 5 个绑定外部源，未配置时缺席。
+
+| 新工具 | 白名单 | 后端 |
+|---|---|---|
+| `douyin_creator` | CI / CT | 抖音达人主页 + 作品列表 |
+| `douyin_comments` | CI | 抖音作品评论 |
+| `xhs_creator` | CI / CT | 小红书博主主页 + 笔记列表 |
+| `xhs_note` | CI | 小红书笔记详情 + 评论 |
+
+白名单刻意比 `web_search`（六阶段全开）窄。判断标准是「放开它会不会让某条既有不变量失守」：
+CT 的不变量是"达人可追溯、禁止编造"。真实采集来的达人不违反这条（可追溯），
+但**报价与成交价仍必须来自报价库**——所以工具描述里明确禁止用公开粉丝量推算报价。
+
+---
+
+## 1. 为什么三个源都是 L3，而 `fans_data` 才是 L1
+
+这是本次接入最需要说清的一件事。
+
+```
+                与平台的关系              能拿到什么                  分级
+联网搜索         无（抓的是公开网页）      行业趋势/政策/竞品动态        L3
+抖音 DTK 采集    无合同（公开可见内容）    达人主页/作品/评论            L3  ← 本次
+小红书只读代理   无合同（登录态看公开内容）笔记/评论/博主               L3  ← 本次
+抖音开放平台     **有**（企业主体+OAuth）  粉丝性别/年龄/地域分布        L1  ← 未接入
+```
+
+`TIER_LABEL.L3` 写的是「公开指数与人工核验」。这三个源的后半段（人工核验）**不成立**，
+所以每个适配器的 `provenance.note` 都如实写明「未经人工核验、非平台授权实测」，
+报告引用时必须带来源站点或账号。
+
+把采集类源标成 L1 是本项目最不能出的错：它会让报告把"公开采集"显示成"甲方授权实测"，
+数字的置信度被抬高，而实际上它既不来自甲方后台、也没经过人工核验。
+`governance` 的 `assertSourceRegistration()` 从写入口堵住这种伪装：
+
+- **L3 源禁止填 `contractRef`**（`contractRef` 语义是"授权合同"，公开采集没有合同）→ 抛 `E-GOV-005`
+- L1/L2 必须同时有 `authMethod` + `contractRef` + `legalApproved: true`
+
+---
+
+## 2. 配置清单
+
+```bash
+# 联网搜索
+BM_WEB_SEARCH_ENABLED=true
+BM_WEB_SEARCH_API_KEY=            # 空 = 能力缺席
+BM_WEB_SEARCH_COUNT=20
+
+# 抖音（自托管 DTK）
+BM_DOUYIN_ENABLED=true
+BM_DOUYIN_BASE_URL=               # 空 = 能力缺席
+BM_DOUYIN_API_KEY=                # 仅 DTK v5 需要
+BM_DOUYIN_TIMEOUT_MS=15000
+BM_DOUYIN_CACHE_TTL=1800
+BM_DOUYIN_PATH_PROFILE=/api/douyin/web/fetch_user_profile
+BM_DOUYIN_PATH_POSTS=/api/douyin/web/fetch_user_post_videos
+BM_DOUYIN_PATH_VIDEO=/api/douyin/web/fetch_one_video
+BM_DOUYIN_PATH_COMMENTS=/api/douyin/web/fetch_video_comments
+
+# 小红书（自托管只读代理）
+BM_XHS_ENABLED=true
+BM_XHS_BASE_URL=                  # 空 = 能力缺席
+BM_XHS_API_KEY=
+BM_XHS_TIMEOUT_MS=25000           # 代理内部含人类化延迟，给得比抖音宽
+BM_XHS_CACHE_TTL=1800
+BM_XHS_PATH_NOTE=/xhs/note
+BM_XHS_PATH_COMMENTS=/xhs/comments
+BM_XHS_PATH_USER=/xhs/user
+BM_XHS_PATH_USER_POSTS=/xhs/user-posts
+```
+
+**注册条件刻意不同**，因为凭据形态不同：`web_search` 是 `enabled && apiKey`（按 Key 计费），
+抖音/小红书是 `enabled && baseUrl`（打的是自托管服务，地址在则能力在）。
+
+未配置时启动会打一条告警说明能力缺席，**但不报错**——纯文本入库、无平台数据的情报阶段
+依然是完整可用的链路。
+
+---
+
+## 3. 抖音：端点与两代形态差异
+
+对接 `Evil0ctal/Douyin_TikTok_Download_API`（Apache-2.0，自托管）。该项目的 v4 与 v5 差异很大：
+
+| | v4 | v5 |
+|---|---|---|
+| 调用方式 | 同步 `GET` | 默认异步 `202 + task_id`，带 `?wait=` 可归类同步 |
+| 鉴权 | 无 | API Key |
+| 身份 | 手工填 Cookie | 自动维护的身份池 |
+
+适配器共用一份代码兼容两者：请求固定带 `wait=true`（v4 未声明该参数会忽略），
+响应解开时优先取 `router_data`（DTK 自己归一化过的）→ `data` → 顶层；
+若判定为"仍在异步处理中"，明确抛错而**不是**把 `task_id` 当数据返回。
+
+**只做只读四件套**：达人主页 / 作品列表 / 作品详情 / 评论。
+不做搜索、不做热榜（这两个端点在 DTK 里定义了却没进注册表，等于不存在），
+不做关注/粉丝列表（需登录态，作者已明确拒绝）。不去"补上"它们——那意味着自己去补签名与登录态，
+等于绕过平台风控。
+
+### 字段归一化是宽容的，不是猜的
+
+上游字段名不稳定（`follower_count` / `fans_count` / `mplatform_followers_count` 都可能出现），
+所以按**候选名列表**顺序提取，**取不到就留 `null`**。
+宁可下游看到 null（报告里体现为"该项缺失"），也不要编一个看起来合理的数字。
+
+---
+
+## 4. 小红书：只读代理契约
+
+### 为什么必须经代理
+
+可用的开源采集工具（如 `jackwener/xiaohongshu-cli`）三个特点同时成立：
+
+1. 是 **CLI**，不是 HTTP 服务；
+2. 需要**登录态 Cookie**，且内置人类化延迟与风控退避；
+3. **同时提供写命令**：发笔记 / 点赞 / 收藏 / 评论 / 关注 / 删除。
+
+第 3 条是决定性的。整包封装后，模型可以合法地通过白名单、合法地过闸门，
+然后以甲方账号名义发出一条笔记——类型层拦不住，因为"能不能写"取决于**我们封装了哪些子命令**。
+
+所以划一条硬边界：适配器不 spawn 任何东西，只认一个**只暴露只读子命令**的 HTTP 代理。
+`scripts/datasource-lab.ts` 里实现了参考代理：命令白名单写死在路由表上，
+写命令**根本不存在于**它的路由表里。
+
+### 契约
+
+```
+GET {baseUrl}/xhs/note?note_id=<id>        或  ?url=<完整笔记链接>
+GET {baseUrl}/xhs/comments?note_id=<id>&all=true&count=20
+GET {baseUrl}/xhs/user?user_id=<id>
+GET {baseUrl}/xhs/user-posts?user_id=<id>&count=20
+```
+
+成功响应（与 xiaohongshu-cli 自己的 `{ok, data}` 信封一致，代理几乎可透传）：
+
+```json
+{
+  "ok": true,
+  "meta": { "via": "xhs-cli", "fetchedAt": "2026-10-08T07:30:57Z" },
+  "data": {
+    "note": {
+      "note_id": "…", "title": "…", "desc": "…", "type": "normal",
+      "user": { "user_id": "…", "nickname": "…" },
+      "interact_info": { "liked_count": 12400, "collected_count": 8900, "comment_count": 431 },
+      "tags": ["护肤"], "time": "2026-09-26T00:00:00Z"
+    }
+  }
+}
+```
+
+失败响应：
+
+```json
+{ "ok": false, "error": { "code": "not_authenticated", "message": "no a1 cookie" } }
+```
+
+### 风控失败必须被翻译成可执行的处置
+
+单账号、Cookie 约 7 天有效、可能触发验证码、激进使用会封 IP —— 这些是**常态**。
+所以不允许把它们压成一句"接口不可用"：
+
+| 代理错误码 | 适配器给出的处置说明 |
+|---|---|
+| `not_authenticated` | 代理未登录：需在代理侧执行一次登录后重试 |
+| `session_expired` | 登录态已过期（Cookie 约 7 天）：需重新登录 |
+| `verification_required` | 触发验证码：需人工在浏览器完成验证，代理会退避冷却 |
+| `ip_blocked` | 出口 IP 被限流：需切换网络/出口 IP 并降频 |
+| `signature_error` | 请求签名失败：通常是采集工具版本过旧 |
+| `tool_missing` | 本机未安装 CLI（代理自检抛出） |
+
+每条都能回答"我现在该做什么"。只写"小红书不可用"等于把排查成本推给运营。
+
+---
+
+## 5. 本地联调：`npm run datasource:lab`
+
+一个进程同时提供抖音与小红书两个假后端，用于在没有真实后端时跑通全链路。
+
+```bash
+npm run datasource:lab            # 默认 127.0.0.1:8899
+npm run datasource:lab -- --xhs-real   # 小红书侧改调真实 xhs CLI
+
+# 另一个终端
+BM_DOUYIN_BASE_URL=http://127.0.0.1:8899 \
+BM_XHS_BASE_URL=http://127.0.0.1:8899 npm start
+```
+
+**它不是"内置的假数据源"**，区别在这里：假数据源会伪装成真实源，让报告出现
+"看起来像实测值的假数据"（本项目删过一次，不会再犯）。本工具返回的每个响应都带
+`_lab: { mock: true }`，适配器据此把 `provenance.synthetic` 置为 **true**。
+于是报告层的引用分级会把它降级，`datasource:smoke` 也会打一行醒目提示。
+
+**假数据自己声明自己是假的**，这是底线。
+
+故意失败开关（用来验证降级路径，别只在 happy path 上验收）：
+
+```
+?__fail=not_authenticated   → 小红书侧返回该业务错误码
+?__fail=http_500            → 返回 500
+?__delay=8000               → 延迟 8 秒，验证超时归一化
+```
+
+---
+
+## 6. 联通性自检：`npm run datasource:smoke`
+
+单元测试全部打桩 `globalThis.fetch`，验证的是"拿到某种响应之后我们怎么处理"，
+**没有**验证 URL 拼接、query 编码、鉴权头、真实响应结构能否被正确解开——
+而这一层恰恰是"配置看起来没问题但就是不通"的高发区。
+
+```bash
+npm run datasource:smoke
+npm run datasource:smoke -- --douyin-sec-user-id=MS4wLjABAAAA...
+```
+
+对每个**已配置**的源真发一次请求，打印行数、耗时、`tier`、`synthetic`、口径与样例。
+未配置的源只提示、不算失败。退出码：全通 0 / 有源不通 1。
+
+> 它绕过闸门（直接拿适配器）——这是运维诊断工具，不是业务调用，
+> 因此它产出的任何数字都不得进入报告。
+
+---
+
+## 7. 合规边界（四条红线）
+
+1. **L3 不得被当 L1 用**。采集类数据只能支撑关于**他人**的公开断言
+   （"该达人公开粉丝量 380 万"），**不得**支撑关于甲方自身的断言（"我们店铺 ROI"）。
+2. **评论者 IP 属地 ≠ 粉丝地域**。它既是有偏样本（只有会评论的人才被统计），
+   口径也完全不同。任何基于它的人群推断都必须标为有偏代理，不得当作粉丝画像。
+   适配器与工具描述里都写了这条，报告侧由引用分级兜底。
+3. **不接"星图出租 / 品牌过审代办"**。这类服务违反平台条款、有封号风险、
+   来源合法性无法证明——走这条路报告里的 `sourceDeclaration` 就是假的。
+4. **不封装任何写能力**。`ToolPolicy.mutating` 默认关闭；
+   小红书侧的隔离靠"代理路由表里没有写命令"，而不是靠一个布尔开关。
+
+---
+
+## 8. 换成真实后端要做什么
+
+**抖音**：部署 DTK（`docker compose up`）→ 把地址填进 `BM_DOUYIN_BASE_URL`。
+若是 v5，同时填 `BM_DOUYIN_API_KEY`；若端点路径不同，改 `BM_DOUYIN_PATH_*`（无需动代码）。
+重启后 `douyin_creator` 自动出现在 CI/CT 的工具清单里。
+
+**小红书**：在部署机器上 `uv tool install xiaohongshu-cli` 并完成一次登录，
+然后以 `--xhs-real` 模式运行代理（或自行实现同契约的服务），
+把地址填进 `BM_XHS_BASE_URL`。
+
+**验证**：`npm run datasource:smoke` 应显示 `synthetic=false` 且拿到真实行数。
+
+---
+
+## 9. 遗留缺口（主动说明）
+
+1. **粉丝画像（P0-3）本轮未解决，也解不了**。抖音采集回答的是"账号是谁"，
+   不回答"账号的粉丝是谁"；小红书根本不暴露关注/粉丝列表。
+   真正的路径只有抖音开放平台 `fans_data`（L1）：需企业主体 + 「关系数据」权限审核
+   （约 2–3 工作日）+ 达人选 OAuth 授权。**建议商务先行**，代码侧等权限下来再做。
+2. **`candidate` 没有逐字段的来源锚点**。creator 产物的候选人可以填采集来的
+   `followers` / `contentFit`，来源可靠 `CreatorOutput.citations` 声明，
+   但没有"这个数字来自哪一次采集"的字段级指针。想要更细的可追溯性，
+   需要在 `packages/agent-pack/src/schemas.ts` 的 candidate 上加一个可选字段
+   （如 `publicProfile?: { sourceId; capturedAt; note }`）并同步 skeleton 与 validator。
+3. **`TIER_LABEL.L3` 的文案与实际不符**。它写着"公开指数与人工核验"，
+   而采集类数据只有前半段。修文案会影响报告页与前端展示，属于独立议题。
+4. **小红书侧本质上脆弱**。依赖运营账号的登录态，Cookie 约 7 天、可能触发验证码、
+   激进调用会封 IP；`xiaohongshu-cli` 仓库还没有 LICENSE 文件、维护活跃度一般。
+   它的定位应是"补充性公开信息"，不能作为关键路径的唯一来源。
+5. **成本与配额**：联网搜索按次计费（`maxCallsPerJob=30`，同参数命中缓存不重复请求）；
+   抖音/小红书虽是自托管，但背后是有限的账号池与风控额度，
+   所以同样设了 `maxCallsPerJob=15`（一次 `*_creator` 调用最多 2 个上游请求）。
