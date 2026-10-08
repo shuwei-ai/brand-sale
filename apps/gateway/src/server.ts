@@ -18,11 +18,14 @@ import {
   KB_COLLECTIONS,
   PHASE_LABEL,
   PHASE_ORDER,
+  parseBriefUtterance,
+  type Brief,
   type JobSpec,
   type PhaseName,
   type TenantContext,
 } from "@brandsale/contracts";
 import { AppError, isAppError } from "@brandsale/contracts";
+import { completeBriefDraft } from "@brandsale/agent-pack";
 import { createContainer, type Container } from "./container.ts";
 import { consoleHtml } from "./console.ts";
 
@@ -253,6 +256,37 @@ export function createGateway(container: Container) {
       }
 
       /* ── 知识库与审计 ─────────────────────────────────── */
+
+      /* ── 自然语言 Brief 解析（P0-2 / WP-C） ──────────────
+       *
+       * 只产出**草稿**：不落库、不建 job。用户在前端确认草稿后再走 POST /jobs。
+       * 为什么不顺便建个任务：
+       *   - 解析是试错的（用户会反复改措辞），每次建 job 会污染任务列表与用量台账；
+       *   - 结构化字段仍然是唯一的提交契约，自然语言只是录入入口的糖
+       *     （见 docs/requirements-implementation-plan.md §WP-C）。
+       *
+       * 两段式：规则段（纯函数，在本进程内跑）+ 仅当有关键字段缺失时才调一次模型的补全段。
+       * 模型不可用时**不报错**，退回"规则结果 + 让它自己去问用户"。
+       */
+      if (path === `${API_PREFIX}/brief/parse` && method === "POST") {
+        const body = (await readBody(req)) as { utterance?: unknown; defaults?: Partial<Brief> };
+        const utterance = typeof body.utterance === "string" ? body.utterance.trim() : "";
+        if (utterance.length === 0) {
+          throw new AppError({
+            code: "E-BRIEF-001",
+            message: "utterance 不能为空",
+            userMessage: "请用一句话描述你的营销诉求，例如「双11 在小红书投精华，预算 300 万」。",
+            details: { field: "utterance" },
+          });
+        }
+        const draft = parseBriefUtterance(utterance, body.defaults);
+        // jobId 只用于模型调用记账与日志串接，因此给一个带前缀的临时 id 以区别真实任务
+        const out = await completeBriefDraft(utterance, draft, {
+          gateway: container.gateway,
+          jobId: `brief_parse_${randomUUID().slice(0, 12)}`,
+        });
+        return json(res, 200, out);
+      }
 
       if (path === `${API_PREFIX}/kb/stats` && method === "GET") {
         return json(res, 200, { items: await container.knowledge.stats(ctx.tenantId) });

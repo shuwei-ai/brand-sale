@@ -38,18 +38,23 @@ const BUILTIN_SOURCES = [
   // 注意：L3 源**不填 contractRef**。contractRef 的语义是"授权合同"，公开采集没有合同，
   // 填了就是把"公开采集"洗成"已授权实测" —— governance 的 assertSourceRegistration
   // 会在登记期直接抛 E-GOV-005，所以这里连写都不该写。
-  { sourceId: WEB_SEARCH_SOURCE_ID, name: "联网搜索（公开网页）", tier: "L3", authMethod: "火山引擎联网搜索 API Key" },
+  // legalApproved 一律**显式写出**，不依赖默认值（见 resolveLegalApproved）：
+  // 这是合规布尔量，默认值方向错了就会静默放行。L3 是公开数据、不需要法务审批，
+  // 写 true 是明确表态；将来加 L4 条目时必须显式写 false，漏写会直接报错。
+  { sourceId: WEB_SEARCH_SOURCE_ID, name: "联网搜索（公开网页）", tier: "L3", authMethod: "火山引擎联网搜索 API Key", legalApproved: true },
   {
     sourceId: DOUYIN_WEB_SOURCE_ID,
     name: "抖音公开内容（自托管采集）",
     tier: "L3",
     authMethod: "自托管只读采集服务（与平台无授权合同）",
+    legalApproved: true,
   },
   {
     sourceId: XHS_WEB_SOURCE_ID,
     name: "小红书公开内容（自托管只读代理）",
     tier: "L3",
     authMethod: "自托管只读代理（运营账号登录态，仅只读子命令）",
+    legalApproved: true,
   },
   { sourceId: "l4_example_vendor", name: "某第三方数据服务商", tier: "L4", authMethod: "商务合同", contractRef: "合同编号待法务确认", legalApproved: false },
 ] as const;
@@ -71,6 +76,44 @@ const SOURCE_TYPE_BY_TIER: Record<string, string> = {
   L3: "l3_public",
   L4: "l4_purchased",
 };
+
+/**
+ * 解析台账条目的 legalApproved。
+ *
+ * **合规布尔量不设"默认值"，只设"默认拒绝"。** 早先这里写的是
+ * `"legalApproved" in s ? Boolean(s.legalApproved) : true` —— 即"漏写 = 法务已批准"。
+ * 后果：将来往 BUILTIN_SOURCES 加一条 L4 源、忘记写 legalApproved，它就会静默变成
+ * 已批准的采购数据源，而 legalApproved 正是 L4 双重开关（config.tiers.L4 + 本字段）的一半。
+ *
+ * 本项目其余合规开关一律 fail-closed（BM_GATE_FAIL_CLOSED 要求显式开、
+ * BM_TOOLS_ALLOW_MUTATING / BM_KB_ALLOW_GLOBAL_WRITE / BM_L4_ENABLED 默认 false），
+ * 这里必须同向。
+ *
+ * L4 单独**直接报错**而不是取 false：L4 的登记是商务动作，漏写字段说明写错了意图，
+ * 让它在 seed 期炸掉比让它带着 false 悄悄写进台账更容易被发现。
+ * （L1/L2 漏写不必在这里重复拦：registerSource 的 assertSourceRegistration
+ *   会以 E-GOV-005 拒绝"缺 legalApproved 的 L1/L2"，那是更准确的错误码。）
+ *
+ * 参数刻意声明为可选字段的结构类型，而不是 `(typeof BUILTIN_SOURCES)[number]`：
+ * 后者在**所有**条目都写了该字段之后，`!("legalApproved" in s)` 会被收窄成 `never`，
+ * 编译期就把这条防线删掉了。这里的判断要针对"将来某个条目漏写"，
+ * 所以类型必须允许漏写。
+ *
+ * 导出是为了可单测：这条防线只在"将来有人加条目漏写字段"时才起作用，
+ * 靠代码审查守不住（它现在看起来毫无影响），必须用测试钉住。
+ */
+export function resolveLegalApproved(s: { sourceId: string; tier: string; legalApproved?: boolean }): boolean {
+  if (s.legalApproved === undefined) {
+    if (s.tier === "L4") {
+      throw new Error(
+        `L4 来源 ${s.sourceId} 必须显式声明 legalApproved：合规标志不得依赖默认值` +
+          `（漏写会静默变成"法务已批准"）。`,
+      );
+    }
+    return false;
+  }
+  return s.legalApproved;
+}
 
 export async function seed(): Promise<{ chunks: number; talents: number }> {
   const config = loadConfig();
@@ -96,7 +139,7 @@ export async function seed(): Promise<{ chunks: number; talents: number }> {
         owner: "品牌方市场部",
         ...("authMethod" in s && s.authMethod ? { authMethod: s.authMethod } : {}),
         ...("contractRef" in s && s.contractRef ? { contractRef: s.contractRef } : {}),
-        legalApproved: "legalApproved" in s ? Boolean(s.legalApproved) : true,
+        legalApproved: resolveLegalApproved(s),
         registeredBy: ctx.userId,
         registeredAt: new Date().toISOString(),
       },
@@ -242,7 +285,7 @@ export async function ensureBuiltinSources(config: Config = loadConfig()): Promi
             owner: "品牌方市场部",
             ...("authMethod" in s && s.authMethod ? { authMethod: s.authMethod } : {}),
             ...("contractRef" in s && s.contractRef ? { contractRef: s.contractRef } : {}),
-            legalApproved: "legalApproved" in s ? Boolean(s.legalApproved) : true,
+            legalApproved: resolveLegalApproved(s),
             registeredBy: ctx.userId,
             registeredAt: new Date().toISOString(),
           },

@@ -87,12 +87,19 @@ const resolveAuthorization: ToolImpl = {
     const blocked: { sourceId: string; reason: string }[] = [];
     for (const s of sources) {
       const az = this_deps(tc).repos.authz.active(tc.ctx.tenantId, s.sourceId);
-      if (!az) {
-        blocked.push({ sourceId: s.sourceId, reason: "无生效授权" });
-        continue;
-      }
-      if (s.tier === "L4" && !s.legalApproved) {
-        blocked.push({ sourceId: s.sourceId, reason: "L4 源法务未批准" });
+
+      // 一次性收集**所有**未通过的门，而不是命中第一条就返回。
+      //
+      // 早先的写法是"先查授权 → 再查法务"，于是 L4 源在既无授权又未过法务时，
+      // 报告只会显示「无生效授权」—— 读者会以为补个授权就能用，而 L4 实际上
+      // 还差法务批准与 config.tiers.L4 两道门。排除项存在的意义就是告诉读者
+      // "还差什么"，所以必须把门列全，而不是只报第一道。
+      const l4Unapproved = s.tier === "L4" && !s.legalApproved;
+      const reasons: string[] = [];
+      if (!az) reasons.push("无生效授权");
+      if (l4Unapproved) reasons.push("L4 源法务未批准");
+      if (!az || l4Unapproved) {
+        blocked.push({ sourceId: s.sourceId, reason: reasons.join("；") });
         continue;
       }
       usable.push({ sourceId: s.sourceId, tier: s.tier, expiresAt: az.validTo });

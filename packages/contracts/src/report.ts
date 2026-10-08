@@ -59,6 +59,12 @@ export type Block =
       xLabel: string;
       yLabel: string;
       cells: { x: number; y: number; label: string; size?: number }[];
+      /**
+       * 矩阵单元渲染的是**数字坐标**（x/y），因此和 chart/table 一样需要能声明来源 ——
+       * 否则 R6（无来源数字断言）会把整页判为错误，而作者没有任何合规的补救手段，
+       * 只能删掉矩阵。此前只有 matrix 缺这个字段，属于契约缺口而非设计取舍。
+       */
+      sourceRef?: string;
     };
 
 /** 全量块型（防漂移测试与骨架共用同一份清单） */

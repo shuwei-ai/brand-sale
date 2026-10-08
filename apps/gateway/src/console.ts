@@ -270,6 +270,14 @@ export function consoleHtml({ config, mocked }: ConsoleContext): string {
   <div>
     <div class="card">
       <h2>新建任务（Brief）</h2>
+      <div class="field">
+        <label>用一句话描述诉求（自然语言，可选）</label>
+        <textarea id="f-utter" rows="2" placeholder="例：双11 想在小红书和抖音做一波精华投放，预算 300 万，主要要曝光也要销量"></textarea>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin:0 0 10px">
+        <button id="btn-parse">解析并回填表单</button>
+        <span class="hint" id="parse-hint" style="margin:0"></span>
+      </div>
       <div class="sec">基本信息</div>
       <div class="grid-2">
         <div class="field"><label>行业</label><input id="f-industry" type="text" value="美妆"></div>
@@ -819,6 +827,62 @@ export function consoleHtml({ config, mocked }: ConsoleContext): string {
   }
 
   document.getElementById('token').value = localStorage.getItem('bm_token') || CFG.defaultToken;
+
+  /* ── 自然语言录入（P0-2 / WP-C） ─────────────────────────
+   *
+   * 解析结果**回填到下面的表单**，而不是替换表单：
+   * 结构化字段仍是提交契约，自然语言只是录入入口的糖 ——
+   * 用户回填后可以逐个字段改，改了就是他的意思，不存在"AI 悄悄改了我的预算"。
+   */
+  function backfill(draft) {
+    var b = draft.brief || {};
+    function set(id, v) { var el = document.getElementById(id); if (el && v !== undefined && v !== null) el.value = v; }
+
+    if (b.industry) set('f-industry', b.industry);
+    if (b.category) set('f-category', b.category);
+    if (b.brandIds && b.brandIds.length) set('f-brands', b.brandIds.join(','));
+    // 表单里预算是"万元"，接口返回的是元
+    if (b.budget && typeof b.budget.amount === 'number') set('f-budget', String(Math.round(b.budget.amount / 10000)));
+    if (b.objectiveWeights) {
+      set('f-wa', b.objectiveWeights.awareness);
+      set('f-wc', b.objectiveWeights.conversion);
+      set('f-wr', b.objectiveWeights.retention);
+    }
+    if (b.window) { set('f-from', b.window.from); set('f-to', b.window.to); }
+    if (b.platforms) {
+      var want = {};
+      b.platforms.forEach(function (p) { want[p] = true; });
+      var boxes = document.querySelectorAll('#f-platforms input[type=checkbox]');
+      for (var i = 0; i < boxes.length; i++) boxes[i].checked = !!want[boxes[i].value];
+    }
+    if (b.notes) set('f-notes', b.notes);
+  }
+
+  function parseUtterance() {
+    var btn = document.getElementById('btn-parse');
+    var hint = document.getElementById('parse-hint');
+    var text = document.getElementById('f-utter').value.trim();
+    if (!text) { hint.style.color = '#c62828'; hint.textContent = '请先用一句话描述诉求'; return; }
+
+    btn.disabled = true; btn.textContent = '解析中…';
+    req(api + '/brief/parse', { method: 'POST', body: { utterance: text } })
+      .then(function (r) {
+        backfill(r);
+        var filled = (r.filled || []).filter(function (f) { return f !== 'notes'; });
+        var parts = ['解析来源：' + (r.source === 'rule+llm' ? '规则 + 模型补全' : '规则')];
+        parts.push('识别到：' + (filled.length ? filled.join('、') : '无'));
+        if (r.filledByModel && r.filledByModel.length) parts.push('其中模型补的：' + r.filledByModel.join('、'));
+        if (r.missing && r.missing.length) parts.push('仍需补充：' + r.missing.join('、'));
+        if (r.clarifications && r.clarifications.length) parts.push('追问：' + r.clarifications.join('；'));
+        if (r.llmNote) parts.push(r.llmNote);
+        hint.style.color = r.missing && r.missing.length ? '#b26a00' : '#12864a';
+        hint.textContent = parts.join(' ｜ ');
+      })
+      .catch(function (e) { hint.style.color = '#c62828'; hint.textContent = '解析失败：' + e.message; })
+      .then(function () { btn.disabled = false; btn.textContent = '解析并回填表单'; });
+  }
+  document.getElementById('btn-parse').addEventListener('click', parseUtterance);
+
   document.getElementById('btn-save-token').addEventListener('click', function () {
     localStorage.setItem('bm_token', token());
     document.getElementById('submit-hint').textContent = 'Token 已保存，正在刷新…';

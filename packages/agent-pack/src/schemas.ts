@@ -251,6 +251,46 @@ export const BriefSchema: SchemaDef<BriefOutput> = {
 
 /* ── 2. CompetitorIntelSchema（CI 竞品情报） ────────────── */
 
+/**
+ * 品牌自身诊断（P0-1）。
+ *
+ * 为什么放在 `intel` 而不是新增第七阶段 `diagnosis`：诊断的本质是"和谁比、差在哪"，
+ * 离开竞品参照系就没有意义，它天然属于竞争情报的职责范围。新增阶段要动
+ * PHASE_ORDER / PHASE_LABEL / PHASE_AGENT / 进度百分比 / checkpoint / 全部 phase 断言，
+ * 契约面改动很大，而需求要的是"报告里有这一章"而不是"进度条上多一格"。
+ *
+ * ⚠️ **这一章最容易变成"编造自家数据"** —— "我方"看起来像"已知信息"，
+ * 模型会顺手填"品牌认知度 32%"这类没有任何来源的数字。
+ * 所以 `contentAssets` 的每个数字都是 `number | null`，且有一条硬校验：
+ * **只要有一个数字非 null，`citations` 就不能为空**。未授权时只能写 null。
+ */
+export interface BrandSelfOutput {
+  /** 定位与差异点（定性） */
+  positioning: { statement: string; differentiators: string[] };
+  /**
+   * 自有内容资产。数字一律 nullable：未获平台授权时填 null，**不得填占位数字**。
+   * `tier` 说明这一行数据的可得性（如"未获授权"/"甲方提供"/"平台后台导出"）。
+   */
+  contentAssets: {
+    platform: string;
+    accountCount: number | null;
+    postCount: number | null;
+    avgEngagement: number | null;
+    tier: string;
+  }[];
+  /** 口碑：无样本时 sentiment 必须是 "unknown"、themes 为空数组，不得猜 */
+  reputation: {
+    sentiment: "positive" | "neutral" | "negative" | "unknown";
+    themes: { theme: string; polarity: string; sampleSize: number }[];
+  };
+  /** 与竞品基准的差距，≥ MIN_BRAND_GAPS 条。量化不了就在 delta 里写明原因 */
+  gaps: { dimension: string; self: string; benchmark: string; delta: string }[];
+  citations: { claim: string; sourceKey: string; confidence: number }[];
+}
+
+/** 品牌自诊的差距条目下限：少于 3 条撑不起一页"差距矩阵" */
+export const MIN_BRAND_GAPS = 3;
+
 export interface IntelOutput {
   competitors: {
     name: string;
@@ -279,6 +319,8 @@ export interface IntelOutput {
   /** 缺数据的维度，必须显式列出（不编造） */
   dataGaps: string[];
   citations: { claim: string; sourceKey: string; confidence: number }[];
+  /** 品牌自身诊断（P0-1）：与上面竞品同处一个产物，构成"我方 vs 竞品"的可比基线 */
+  brandSelf: BrandSelfOutput;
 }
 
 /** 竞品数下限：一份能支撑「竞品格局对比」页的情报至少要有三家 */
@@ -297,7 +339,18 @@ export const CompetitorIntelSchema: SchemaDef<IntelOutput> = {
                         "pricingBand": [{ "band": string, "share": number | null }],
                         "channelMix": [{ "channel": string, "share": number | null }] },
   "dataGaps": string[],
-  "citations": [{ "claim": string, "sourceKey": string, "confidence": number }]
+  "citations": [{ "claim": string, "sourceKey": string, "confidence": number }],
+  "brandSelf": {
+    // 我方基线。⚠️ 未获平台授权时，contentAssets 的每个数字都必须写 null，
+    // 并且 citations 必须为空——**绝不允许**填"品牌认知度 32%"这类无来源的数字。
+    "positioning": { "statement": string, "differentiators": string[] },
+    "contentAssets": [{ "platform": string, "accountCount": number | null, "postCount": number | null,
+                        "avgEngagement": number | null, "tier": string }],
+    "reputation": { "sentiment": "positive|neutral|negative|unknown",
+                    "themes": [{ "theme": string, "polarity": string, "sampleSize": number }] },
+    "gaps": [{ "dimension": string, "self": string, "benchmark": string, "delta": string }],  // 至少 3 条
+    "citations": [{ "claim": string, "sourceKey": string, "confidence": number }]
+  }
 }`,
   validate(input) {
     const issues: string[] = [];
@@ -354,7 +407,12 @@ export const CompetitorIntelSchema: SchemaDef<IntelOutput> = {
       channelMix,
     };
     const dataGaps = checkStringList(root.dataGaps, issues, "$.dataGaps");
-    const citations = checkArray(root.citations, issues, "$.citations", 1).map((c, i) => {
+    // 引用下限**不设硬性 ≥1**：早先这里是 `checkArray(root.citations, ..., 1)`，于是
+    // "一个数据源都没有"这一最需要兜底的状态反而过不了自己的 schema —— mock 模式下
+    // 合成结果会被 schema.validate 抛错，整个 intel 阶段直接 failed（E-AGENT-002），
+    // 而不是降级成一份如实写明缺口的部分报告。
+    // 真正的约束是「有数字必须有来源」，见下面 hasAnyNumber 那段。
+    const citations = checkArray(root.citations, issues, "$.citations").map((c, i) => {
       const o = checkObject(c, issues, `$.citations[${i}]`);
       return {
         claim: checkString(o.claim, issues, `$.citations[${i}].claim`),
@@ -362,8 +420,109 @@ export const CompetitorIntelSchema: SchemaDef<IntelOutput> = {
         confidence: checkNumber(o.confidence, issues, `$.citations[${i}].confidence`, 0, 1),
       };
     });
+    // 竞品侧同样遵守「有数字必须有来源」：只在**真的出现了数字**时才要求引用。
+    // confidence 不算数据断言（它是模型自评），所以不计入。
+    const hasIntelNumber =
+      competitors.some(
+        (c) =>
+          c.shareOfVoice !== null ||
+          c.contentMatrix.some((m) => m.share !== null) ||
+          c.sovTrend.some((t) => t.value !== null),
+      ) ||
+      pricingBand.some((p) => p.share !== null) ||
+      channelMix.some((c) => c.share !== null);
+    if (hasIntelNumber && citations.length === 0) {
+      issues.push(
+        "$.competitors / $.categoryInsights 出现了具体数字（份额、声量、占比）但 $.citations 为空：" +
+          "竞品数字必须有来源，否则就是编造市场数据",
+      );
+    }
+
+    /* 品牌自身诊断（P0-1）。校验重点不是"字段齐不齐"，而是**有数字必须有来源**。 */
+    const bs = checkObject(root.brandSelf, issues, "$.brandSelf");
+    const bsPos = checkObject(bs.positioning, issues, "$.brandSelf.positioning");
+    const positioning = {
+      statement: checkString(bsPos.statement, issues, "$.brandSelf.positioning.statement"),
+      differentiators: checkStringList(bsPos.differentiators, issues, "$.brandSelf.positioning.differentiators", 1),
+    };
+    const bsAssets = checkArray(bs.contentAssets, issues, "$.brandSelf.contentAssets", 1).map((x, i) => {
+      const o = checkObject(x, issues, `$.brandSelf.contentAssets[${i}]`);
+      const p = `$.brandSelf.contentAssets[${i}]`;
+      return {
+        platform: checkString(o.platform, issues, `${p}.platform`),
+        accountCount: optionalNumber(o.accountCount, issues, `${p}.accountCount`, 0) ?? null,
+        postCount: optionalNumber(o.postCount, issues, `${p}.postCount`, 0) ?? null,
+        avgEngagement: optionalNumber(o.avgEngagement, issues, `${p}.avgEngagement`, 0) ?? null,
+        tier: checkString(o.tier, issues, `${p}.tier`),
+      };
+    });
+    const bsRep = checkObject(bs.reputation, issues, "$.brandSelf.reputation");
+    const sentiment = checkString(bsRep.sentiment, issues, "$.brandSelf.reputation.sentiment");
+    const SENTIMENTS = ["positive", "neutral", "negative", "unknown"] as const;
+    if (!(SENTIMENTS as readonly string[]).includes(sentiment)) {
+      issues.push(`$.brandSelf.reputation.sentiment 必须是 ${SENTIMENTS.join(" / ")} 之一，实际是 ${sentiment}`);
+    }
+    const bsThemes = checkArray(bsRep.themes ?? [], issues, "$.brandSelf.reputation.themes").map((x, i) => {
+      const o = checkObject(x, issues, `$.brandSelf.reputation.themes[${i}]`);
+      return {
+        theme: checkString(o.theme, issues, `$.brandSelf.reputation.themes[${i}].theme`),
+        polarity: checkString(o.polarity, issues, `$.brandSelf.reputation.themes[${i}].polarity`),
+        sampleSize: checkNumber(o.sampleSize, issues, `$.brandSelf.reputation.themes[${i}].sampleSize`, 0),
+      };
+    });
+    const bsGaps = checkArray(bs.gaps, issues, "$.brandSelf.gaps", MIN_BRAND_GAPS).map((x, i) => {
+      const o = checkObject(x, issues, `$.brandSelf.gaps[${i}]`);
+      const p = `$.brandSelf.gaps[${i}]`;
+      return {
+        dimension: checkString(o.dimension, issues, `${p}.dimension`),
+        self: checkString(o.self, issues, `${p}.self`),
+        benchmark: checkString(o.benchmark, issues, `${p}.benchmark`),
+        delta: checkString(o.delta, issues, `${p}.delta`),
+      };
+    });
+    const bsCitations = checkArray(bs.citations ?? [], issues, "$.brandSelf.citations").map((c, i) => {
+      const o = checkObject(c, issues, `$.brandSelf.citations[${i}]`);
+      return {
+        claim: checkString(o.claim, issues, `$.brandSelf.citations[${i}].claim`),
+        sourceKey: checkString(o.sourceKey, issues, `$.brandSelf.citations[${i}].sourceKey`),
+        confidence: checkNumber(o.confidence, issues, `$.brandSelf.citations[${i}].confidence`, 0, 1),
+      };
+    });
+
+    // ── 本章的两条硬防线 ──────────────────────────────────
+    // ① 有数字必须有来源。品牌自诊是全篇最容易编造的一章："我方"看起来像"已知信息"，
+    //    模型会顺手写"品牌认知度 32%"。没有引用就不许出现数字。
+    const hasSelfNumber = bsAssets.some(
+      (a) => a.accountCount !== null || a.postCount !== null || a.avgEngagement !== null,
+    );
+    if (hasSelfNumber && bsCitations.length === 0) {
+      issues.push(
+        "$.brandSelf.contentAssets 出现具体数字但 $.brandSelf.citations 为空：" +
+          "自有资产数字必须逐项说明来源（平台后台 / 甲方提供 / 授权数据），否则就是编造自家数据",
+      );
+    }
+    // ② 无样本不得下情感结论。没有主题样本时 sentiment 只能写 unknown。
+    if (sentiment !== "unknown" && bsThemes.length === 0) {
+      issues.push(
+        "$.brandSelf.reputation.themes 为空时 sentiment 必须是 unknown：" +
+          "没有口碑样本就不能给出正面/中性/负面结论",
+      );
+    }
+
     throwIfAny(issues);
-    return { competitors, categoryInsights, dataGaps, citations };
+    return {
+      competitors,
+      categoryInsights,
+      dataGaps,
+      citations,
+      brandSelf: {
+        positioning,
+        contentAssets: bsAssets,
+        reputation: { sentiment: sentiment as BrandSelfOutput["reputation"]["sentiment"], themes: bsThemes },
+        gaps: bsGaps,
+        citations: bsCitations,
+      },
+    };
   },
   mock: () => ({
     competitors: [
@@ -422,11 +581,45 @@ export const CompetitorIntelSchema: SchemaDef<IntelOutput> = {
         { channel: "货架电商", share: 0.17 },
       ],
     },
-    dataGaps: ["竞品投放消耗（预期不可得，须走 L3 / 人工）", "达人报价（官方无公开接口）"],
+    dataGaps: ["竞品投放消耗（预期不可得，须走 L3 / 人工）", "达人报价（官方无公开接口）", "自有内容资产指标（未获平台授权）"],
     citations: [
       { claim: "竞品X声量份额 31%", sourceKey: "public_intel", confidence: 0.72 },
       { claim: "抗老成分话语迁移", sourceKey: "methodology", confidence: 0.55 },
     ],
+    // 兜底必须演示**正确的**未授权形态：数字全 null、citations 为空、sentiment=unknown。
+    // 如果这里填了占位数字，兜底报告就会开始编造甲方自己的经营数据。
+    brandSelf: {
+      positioning: {
+        statement: "本品定位与差异点须由甲方确认：本轮未获品牌资产数据授权，以下仅为待确认的定性框架",
+        differentiators: ["待甲方确认（未获授权，不做推断）"],
+      },
+      contentAssets: [
+        { platform: "douyin", accountCount: null, postCount: null, avgEngagement: null, tier: "未获授权" },
+        { platform: "xiaohongshu", accountCount: null, postCount: null, avgEngagement: null, tier: "未获授权" },
+      ],
+      reputation: { sentiment: "unknown", themes: [] },
+      gaps: [
+        {
+          dimension: "价格带覆盖",
+          self: "待甲方确认",
+          benchmark: "竞品覆盖 ¥159–699（公开情报）",
+          delta: "无法计算：缺本品价格带与销量结构",
+        },
+        {
+          dimension: "内容声量",
+          self: "待甲方确认",
+          benchmark: "竞品以成分科普短视频为主（公开可见）",
+          delta: "无法计算：未接入本品内容资产与投放数据",
+        },
+        {
+          dimension: "人群重合度",
+          self: "待甲方确认",
+          benchmark: "竞品主攻 25–34 岁一二线成分党",
+          delta: "无法计算：缺本品粉丝画像（需平台授权）",
+        },
+      ],
+      citations: [],
+    },
   }),
 };
 
@@ -604,7 +797,7 @@ export const CreatorCandidatesSchema: SchemaDef<CreatorOutput> = {
       },
     ],
     excluded: [
-      { reason: "无生效授权，无法访问星图达人画像", count: 0 },
+      { reason: "本系统未接入平台官方达人画像接口（需企业主体 + 关系数据权限审核），粉丝画像类指标缺失", count: 0 },
       { reason: "报价样本不足 3 条，仅给区间不给点估计", count: 4 },
     ],
     citations: [

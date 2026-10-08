@@ -23,3 +23,4 @@ export {
   type SchemaDef,
 } from "./schemas.ts";
 export { synthBudget, synthCreators, synthIntel, synthPlaybook, synthReport, type PrefetchedToolData } from "./synthesis.ts";
+export { completeBriefDraft, type BriefParseResult } from "./brief-parse.ts";

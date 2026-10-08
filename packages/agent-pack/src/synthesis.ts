@@ -52,7 +52,7 @@ function weeksBetween(from: string, to: string): { from: string; to: string }[] 
 
 /* ── CI 竞品情报 ────────────────────────────────────────── */
 
-export function synthIntel(brief: { industry: string; category: string; platforms: string[]; window?: { from: string } }, tools: PrefetchedToolData): IntelOutput {
+export function synthIntel(brief: { industry: string; category: string; platforms: string[]; window?: { from: string }; brandIds?: string[] }, tools: PrefetchedToolData): IntelOutput {
   const kb = unwrap(tools["kb_retrieve"]) as { hits?: { text: string; citation: { sourceId: string } }[] };
   const kbHits = kb?.hits ?? [];
   const ws = unwrap(tools["web_search"]) as { results?: { title?: string; siteName?: string; url?: string }[] };
@@ -110,10 +110,80 @@ export function synthIntel(brief: { industry: string; category: string; platform
       "竞品投放消耗（官方无接口，属预期缺失）",
       "竞品声量份额与价格带分布（需可量化指数源，当前不可得）",
       "达人报价与画像（须走 L2 历史库 + 人工核验）",
+      "自有内容资产指标（账号数 / 作品数 / 互动率）：未获平台授权",
       ...(webHits.length === 0 ? ["联网检索未命中（未配置 API Key 或查询无结果）"] : []),
       ...(kbHits.length === 0 ? ["行业情报库（KB-3）无命中"] : []),
     ],
     citations,
+    brandSelf: buildBrandSelf(brief, webHits.length),
+  };
+}
+
+/**
+ * 品牌自身诊断的确定性合成。
+ *
+ * **这里刻意一个数字都不给。** 确定性兜底路径下没有任何品牌资产数据可得
+ * （KB-1 私域经营库为空、平台数据未授权），所以 `contentAssets` 全 null、
+ * `reputation.sentiment` 为 unknown、`citations` 为空数组。
+ *
+ * 为什么不留占位数字：品牌自诊是全篇最容易变成"编造自家数据"的一章——
+ * "我方"读起来像"已知信息"，随手写个"品牌认知度 32%"没人会怀疑。
+ * 而 Schema 里有一条硬校验：**只要出现数字，citations 就不能为空**。
+ * 兜底路径必须首先自己守住这条，否则它会成为绕开校验的后门。
+ */
+function buildBrandSelf(
+  brief: { industry: string; category: string; platforms: string[]; brandIds?: string[] },
+  webHitCount: number,
+): IntelOutput["brandSelf"] {
+  const brandLabel = (brief.brandIds ?? []).filter(Boolean).join("、") || "本品";
+  const unknown = "待甲方确认（未获品牌资产数据授权）";
+
+  return {
+    positioning: {
+      statement:
+        `${brandLabel} 在「${brief.industry} / ${brief.category}」的定位与差异点须由甲方确认：` +
+        `本轮没有品牌资产数据授权，任何"我方认知度/份额"数字都无从核实。`,
+      differentiators: ["待甲方确认（未获授权，不做推断）"],
+    },
+    // 平台列表来自 Brief（已知），数字全部留空（未知）。这是"知道自己不知道什么"的写法。
+    contentAssets: brief.platforms.map((platform) => ({
+      platform,
+      accountCount: null,
+      postCount: null,
+      avgEngagement: null,
+      tier: "未获授权",
+    })),
+    reputation: { sentiment: "unknown", themes: [] },
+    gaps: [
+      {
+        dimension: "价格带覆盖",
+        self: unknown,
+        benchmark: "竞品公开渠道覆盖高 / 中 / 低价位带（3 家，公开页面口径）",
+        delta: "无法计算：缺本品价格带与销量结构，公开页面也给不出竞品价格带占比",
+      },
+      {
+        dimension: "内容声量",
+        self: unknown,
+        benchmark:
+          webHitCount > 0
+            ? `公开检索命中 ${webHitCount} 条站点内容可作为竞品参考（未经人工核验）`
+            : "公开检索未命中，竞品声量参考也缺失",
+        delta: "无法计算：未接入本品内容资产与投放数据",
+      },
+      {
+        dimension: "人群重合度",
+        self: unknown,
+        benchmark: "竞品主攻人群需平台授权才能取到画像，公开口径不可得",
+        delta: "无法计算：本品与竞品粉丝画像均缺失（须走抖音开放平台 fans_data，L1）",
+      },
+      {
+        dimension: "投放效率",
+        self: unknown,
+        benchmark: "竞品投放消耗官方无接口，属预期缺失",
+        delta: "无法计算：双方投放指标均未接入",
+      },
+    ],
+    citations: [],
   };
 }
 
@@ -421,11 +491,17 @@ export function synthReport(
   });
 
   const intel = upstream.intel;
+  /** 品牌自身诊断：与竞品同属 intel 产物，但它说的是"我方"，引用必须单列 */
+  const brandSelf = intel?.brandSelf;
   const creator = upstream.creator;
   const playbook = upstream.playbook;
   const budget = upstream.budget;
 
   const intelCites: Cite[] = (intel?.citations ?? []).map((c) => toCite(c.claim, c.sourceKey, c.confidence));
+  /** 品牌自诊的引用单列：它只该为"我方"数字作证，混进竞品引用里会让读者误以为品牌资产也来自公开检索 */
+  const brandSelfCites: Cite[] = (intel?.brandSelf?.citations ?? []).map((c) =>
+    toCite(c.claim, c.sourceKey, c.confidence),
+  );
   /** 报价库是内部数据仓，估价值来自真实成交记录 → 可溯源 */
   const creatorCites: Cite[] = (creator?.candidates ?? []).map((c) =>
     toCite(`${c.nickname} 成本估计 ${c.estimatedCost.toFixed(0)} 元（${c.tier}）`, "pricing", c.confidence),
@@ -443,6 +519,43 @@ export function synthReport(
   const slides: SlideSpec[] = [];
   const push = (pageRole: SlideSpec["pageRole"], t: string, layoutId: string, blocks: SlideSpec["blocks"], citations: Cite[] = []): void => {
     slides.push({ index: slides.length, pageRole, title: t, layoutId, blocks, citations });
+  };
+
+  /* ── 品牌自诊页用到的小工具 ─────────────────────────────── */
+
+  /**
+   * 未获授权的指标一律渲染成「无数据」，**不写 0**。
+   * 0 会被读者理解成"确实没有账号 / 确实零互动"，那是另一种编造。
+   */
+  const kpiSelf = (label: string, sum: number, hasData: boolean) =>
+    hasData
+      ? { label, value: String(sum), unit: "", tier: "medium" as const }
+      : { label, value: "无数据", unit: "", tier: "low" as const };
+
+  const SENTIMENT_LABEL: Record<string, string> = {
+    positive: "偏正面",
+    neutral: "中性",
+    negative: "偏负面",
+    unknown: "未知（无样本）",
+  };
+
+  /** 公开价格带描述 → 档位序号。识别不出档位返回 0（落在矩阵的"未知"一侧），不猜 */
+  const priceBandRank = (priceBand: string): number => {
+    const p = priceBand ?? "";
+    if (p.includes("低")) return 1;
+    if (p.includes("中")) return 2;
+    if (p.includes("高")) return 3;
+    return 0;
+  };
+
+  /** 品牌自诊页的警示语：只有当真有数字时才说"已授权" */
+  const brandSelfCallout = (bs: IntelOutput["brandSelf"]): string => {
+    const hasAny = bs.contentAssets.some(
+      (a) => a.accountCount !== null || a.postCount !== null || a.avgEngagement !== null,
+    );
+    return hasAny
+      ? "品牌资产数据来自甲方提供 / 平台授权，逐项来源见本页引用；未经人工复核前请勿直接作为投放依据。"
+      : "品牌资产数据未获授权，本页为定性判断：所有指标显示「无数据」，不做任何推断。补齐需甲方提供经营数据或走平台授权（L1）。";
   };
 
   /* 0 封面 */
@@ -531,7 +644,66 @@ export function synthReport(
     intelCites,
   );
 
-  /* 5 类目趋势与人群洞察 */
+  /* 5 品牌自身诊断（P0-1）：我方基线 */
+  push(
+    "data",
+    "品牌自诊概览",
+    "content/kpi+bullets",
+    brandSelf
+      ? [
+          {
+            type: "kpi",
+            items: [
+              kpiSelf("自有账号数", brandSelf.contentAssets.reduce((n, a) => n + (a.accountCount ?? 0), 0), brandSelf.contentAssets.some((a) => a.accountCount !== null)),
+              kpiSelf("自有作品数", brandSelf.contentAssets.reduce((n, a) => n + (a.postCount ?? 0), 0), brandSelf.contentAssets.some((a) => a.postCount !== null)),
+              { label: "口碑情感", value: SENTIMENT_LABEL[brandSelf.reputation.sentiment], unit: "", tier: brandSelf.reputation.sentiment === "unknown" ? "low" : "medium" },
+              { label: "覆盖平台", value: String(brandSelf.contentAssets.length), unit: "个", tier: "medium" },
+            ],
+            sourceRef: "phase:intel",
+          },
+          { type: "text", style: "h3", content: `我方定位：${brandSelf.positioning.statement}`, sourceRef: "phase:intel" },
+          { type: "bullets", items: brandSelf.positioning.differentiators.map((d) => `差异点：${d}`), sourceRef: "phase:intel" },
+          { type: "callout", tone: "warn", text: brandSelfCallout(brandSelf), sourceRef: "phase:intel" },
+        ]
+      : noData("品牌自诊"),
+    brandSelfCites,
+  );
+
+  /* 6 品牌 vs 竞品差距矩阵 */
+  push(
+    "data",
+    "品牌 vs 竞品差距矩阵",
+    "content/matrix+table",
+    brandSelf
+      ? [
+          {
+            type: "table",
+            columns: ["对比维度", "我方", "竞品基准", "差距 / 为什么算不出"],
+            rows: brandSelf.gaps.map((g) => [g.dimension, g.self, g.benchmark, g.delta]),
+            caption: "「我方」列在未获品牌资产授权时一律写「待甲方确认」，不做任何推断",
+            sourceRef: "phase:intel",
+          },
+          {
+            type: "matrix",
+            xLabel: "公开价格带档位（低 1 → 高 3）",
+            yLabel: "公开可见内容形态数量",
+            // 矩阵单元里是数字坐标，必须声明来源，否则被 R6（无来源数字断言）拦下
+            sourceRef: "phase:intel",
+            cells: (intel?.competitors ?? []).map((c) => ({
+              x: priceBandRank(c.priceBand),
+              y: c.contentMatrix.length,
+              label: c.name,
+              size: 1,
+            })),
+          },
+          { type: "bullets", items: brandSelf.gaps.slice(0, 3).map((g) => `${g.dimension}：${g.delta}`), sourceRef: "phase:intel" },
+          { type: "callout", tone: "warn", text: "矩阵仅含竞品坐标：本品的位置未知，声量份额与粉丝画像均无授权数据源，故未绘制本方点位。", sourceRef: "phase:intel" },
+        ]
+      : noData("品牌 vs 竞品差距"),
+    brandSelfCites,
+  );
+
+  /* 7 类目趋势与人群洞察 */
   push(
     "content",
     "类目趋势与人群洞察",

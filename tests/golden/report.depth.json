@@ -1,6 +1,6 @@
 {
-  "slides": 13,
-  "bodySlides": 10,
+  "slides": 15,
+  "bodySlides": 12,
   "blockTypes": [
     "bullets",
     "callout",
@@ -13,7 +13,7 @@
     "timeline"
   ],
   "missingRequiredTypes": [],
-  "visualBlocks": 4,
+  "visualBlocks": 5,
   "traceableRatio": 0.9,
   "declaredSources": 4,
   "sourceKeys": [

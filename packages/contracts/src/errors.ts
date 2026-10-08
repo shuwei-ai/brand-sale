@@ -42,6 +42,17 @@ export const ERROR_CODES = {
   "E-INGEST-002": { http: 415, domain: "入库", message: "不支持的文档格式（需配置解析器）", retryable: false },
   "E-INGEST-003": { http: 409, domain: "入库", message: "同一文档正在入库（幂等冲突）", retryable: true },
 
+  /**
+   * 录入解析（自然语言 → Brief 草稿）。
+   *
+   * 与 E-INGEST-* 同理用 4xx：`POST /brief/parse` 是**同步请求**，
+   * 入参为空却回 200 会让前端以为"解析成功但没有识别到任何字段"。
+   *
+   * 只保留一条：解析本身**不会因"识别不出字段"而失败** —— 抽不到就放进 missing 并追问用户，
+   * 那是正常业务结果而不是错误。这里拦的仅仅是"请求本身没带东西"。
+   */
+  "E-BRIEF-001": { http: 400, domain: "录入解析", message: "utterance 为空或不是字符串", retryable: false },
+
   "E-AGENT-001": { http: 200, domain: "Agent", message: "Schema 校验失败（已重试）", retryable: false },
   "E-AGENT-002": { http: 200, domain: "Agent", message: "Agent 超时", retryable: true },
 
