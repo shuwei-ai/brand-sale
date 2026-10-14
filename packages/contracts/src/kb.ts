@@ -29,6 +29,22 @@ export const KB_COLLECTIONS = ["KB-1", "KB-2", "KB-3", "KB-4"] as const satisfie
 /** 允许写入跨租户共享作用域的库：只有公开情报与方法论，不含客户私有数据 */
 export const GLOBAL_WRITABLE_COLLECTIONS = ["KB-3", "KB-4"] as const satisfies readonly KbCollection[];
 
+/**
+ * 数据的真实性来源。
+ *
+ * 存在的唯一理由：把**内置演示样例**和**真实业务数据**在结构上分开。
+ *
+ *   · `"demo"` —— `scripts/seed.ts` 灌进去的样例（5 位达人及其报价、若干复盘/方法论语料）。
+ *     它是为了让空库能跑通全链路而存在的，**不是任何一家客户的真实数据**。
+ *     读取侧默认把它过滤掉（见 `config.allowDemoData`）：报告里出现的每一个数字
+ *     都必须是真实采集/真实录入的，否则读者会把样例昵称当成真实账号去平台搜索。
+ *   · `"live"` —— 真实数据：客户上传、平台采集、商务录入、API 回传。
+ *
+ * 缺省（`undefined`）按 `"live"` 处理：新增写入路径忘记打标时，宁可把它当真实数据
+ * 被使用，也不该被静默丢弃 —— demo 只有一条写入路径（seed），漏标不可能发生在别处。
+ */
+export type DataProvenance = "demo" | "live";
+
 export interface KbChunk {
   chunkId: string;
   docId: string;
@@ -36,6 +52,8 @@ export interface KbChunk {
   tenantId: string;
   /** 允许为 null 表示跨租户共享的公开情报（L3） */
   text: string;
+  /** 见 `DataProvenance`；省略 = live */
+  provenance?: DataProvenance;
   sourceId: string;
   sourceType: KbSourceTypeValue;
   tier: DataTier;
@@ -125,6 +143,14 @@ export interface IngestDocumentResult {
   sourceId: string;
   /** 本次是否为覆盖既有同名文档 */
   replaced: boolean;
+  /**
+   * 本次成功写入语义向量的块数（P1）。
+   *
+   * 缺省 / 小于 `chunks` **不是错误**：embedding 服务不可用时语义通道被跳过，
+   * 这些块仍可被 BM25 检索到（退化为关键词检索）。暴露这个数字是为了让
+   * 「入库成功但整批没有向量」这种静默劣化在调用方能被看见，而不是无人知晓。
+   */
+  embedded?: number;
 }
 
 /**
@@ -362,6 +388,15 @@ export interface ConfidenceInput {
   humanVerified: boolean;
   /** 多源交叉一致度 0..1 */
   crossSourceAgreement?: number;
+  /**
+   * 该结论是否来自**派生语料**（如系统从历史报告机械抽取的摘要）。
+   *
+   * 派生语料与它的原始来源"说的是同一件事"。若把两者都算作独立来源，
+   * 就会出现「1 个真实来源 + 它自己的摘要 = 2 个来源交叉验证」的假一致，
+   * 置信度虚高，**而且没有任何报错**（集成方案 §5.2）。
+   * 因此 derived=true 时忽略 `crossSourceAgreement` 的加分。
+   */
+  derived?: boolean;
 }
 
 export interface ConfidencePresentation {
@@ -388,6 +423,15 @@ export interface TalentProfile {
   followers: number;
   /** 近 30 天互动率 */
   engagementRate: number;
+  /** 见 `DataProvenance`；省略 = live。演示样例一律标 `"demo"`，读取侧默认不可见。 */
+  provenance?: DataProvenance;
+  /**
+   * 平台账号的**可核验标识**（抖音号/小红书号/主页链接）。
+   *
+   * 报价库里这个字段通常为空 —— 空表示「只知道昵称，不知道对应哪个账号」，
+   * 报告必须如实写「账号未核验」，不能把昵称当成可搜索的账号。
+   */
+  accountRef?: string;
 }
 
 export interface PricingRecord {
@@ -401,6 +445,8 @@ export interface PricingRecord {
   sourceType: KbSourceTypeValue;
   observedAt: string;
   humanVerified: boolean;
+  /** 见 `DataProvenance`；省略 = live */
+  provenance?: DataProvenance;
 }
 
 export interface PricingQuery {

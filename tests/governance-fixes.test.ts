@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "@brandsale/config";
 import type { TenantContext } from "@brandsale/contracts";
+import { MEDIA_CRAWLER_SOURCE_IDS } from "@brandsale/datasource";
 import {
   CreatorCandidatesSchema,
   type ToolCallContext,
@@ -79,12 +80,14 @@ test("E2E-GOV-DEFAULT-2：非 L4 漏写按默认拒绝处理，显式值原样�
   );
 });
 
-test("E2E-GOV-DEFAULT-3：种子台账里三条 L3 源显式批准、L4 源未批准", async () => {
+test("E2E-GOV-DEFAULT-3：种子台账里 L3 源显式批准、L4 源未批准", async () => {
   const { c, dispose } = await freshContainer();
   try {
     const rows = c.repos.sources.list(DEMO_TENANT);
     const byId = new Map(rows.map((r) => [r.sourceId, r]));
-    for (const id of ["volc_web_search", "douyin_web_public", "xhs_web_public"]) {
+    // 联网检索 + 七个平台采集源：都是公开数据，一律显式批准
+    for (const id of ["volc_web_search", ...MEDIA_CRAWLER_SOURCE_IDS]) {
+      assert.equal(byId.get(id)?.tier, "L3", `${id} 应登记为 L3`);
       assert.equal(byId.get(id)?.legalApproved, true, `${id} 是公开源，应显式批准`);
     }
     assert.equal(byId.get("l4_example_vendor")?.legalApproved, false, "L4 源必须保持未批准");
@@ -102,13 +105,26 @@ test("E2E-GOV-REASON-1：L4 源既无授权又未过法务时，两个原因都�
     assert.ok(tool, "resolve_authorization 应已注册");
 
     const out = (await tool.execute({}, toolCtx())) as {
-      result: { usableSources: { sourceId: string; tier: string; expiresAt: string }[]; blockedSources: { sourceId: string; reason: string }[] };
+      result: {
+        usableSources: { sourceId: string; tier: string; expiresAt: string }[];
+        blockedSources: { sourceId: string; reason: string }[];
+        capabilityMissing: { sourceId: string; reason: string }[];
+      };
     };
 
-    // 三条 L3 可用
+    // 唯一的"已装配"外部源是联网检索
     const usableIds = out.result.usableSources.map((s) => s.sourceId).sort();
-    assert.deepEqual(usableIds, ["douyin_web_public", "volc_web_search", "xhs_web_public"]);
+    assert.deepEqual(usableIds, ["volc_web_search"]);
     assert.ok(out.result.usableSources.every((s) => s.tier === "L3"), "可用的必须都是 L3");
+
+    // 七个平台采集源：台账已登记、授权也在，但**适配器未装配**（本测试容器没开 BM_MC_*），
+    // 必须单列而不是混进 usableSources —— 否则报告会声明一个根本取不到数据的来源。
+    const pendingIds = out.result.capabilityMissing.map((s) => s.sourceId).sort();
+    assert.deepEqual(pendingIds, [...MEDIA_CRAWLER_SOURCE_IDS].sort(), "未装配的平台源应进 capabilityMissing");
+    assert.ok(
+      out.result.capabilityMissing.every((s) => /采集能力未装配/.test(s.reason)),
+      "capabilityMissing 的原因要说清'缺的是开关不是授权'",
+    );
 
     // L4 被拦，且原因必须**两条都写出来**
     const blocked = out.result.blockedSources.find((b) => b.sourceId === "l4_example_vendor");

@@ -1,22 +1,34 @@
 /**
- * 10 个工具的落地实现（对应 LLD §2.10 的「依赖工具」列）
+ * 工具的实现（对应 LLD §2.10 的「依赖工具」列）
  *
  * 说明：多为**确定性**工具（检索/取数/计算/校验）。
- * 外部信息入口一共四条，全部按 L3 处理、全部由 `boundSourceId` 绑死来源：
+ * 外部信息入口分三类，全部按 L3 处理、全部由 `boundSourceId(s)` 绑死来源：
  *   ① knowledge —— 四库混合检索，本地语料（KB-2 私域复盘、KB-3 公开情报、KB-4 方法论）；
  *   ② web_search —— 联网检索公开网页，底层是 M4 的 `volc_web_search` 适配器；
- *   ③ douyin_creator / douyin_comments —— 抖音公开内容，底层 `douyin_web_public`（自托管 DTK）；
- *   ④ xhs_creator / xhs_note —— 小红书公开内容，底层 `xhs_web_public`（自托管只读代理）。
+ *   ③ platform_digest —— **跨平台聚合**采集公开内容，底层是七个 `mc_<平台>` 适配器，
+ *      经 apps/collector sidecar 复用 MediaCrawler。
  *
- * ②③④ 的共同点：都是**公开但未经人工核验**的第三方内容，只能支撑"关于他人"的公开断言。
+ * ②③ 的共同点：都是**公开但未经人工核验**的第三方内容，只能支撑"关于他人"的公开断言。
  * 涉及甲方自身经营指标（ROI、店铺 GMV、投放成本）的断言，只能来自 L1/L2 授权数据 ——
  * 这条边界由 report 阶段的引用分级兜底，而工具描述负责让模型事前就知道不该越界。
  *
- * 原先还有第三个入口「平台适配器取数」（千川/星图/蒲公英/生意参谋/巨量算数）以及对应的
- * query_customer_owned / query_public_index 两个工具，已一并移除：那些适配器从未接入
- * 真实平台、只输出合成值，留在工具清单里等于给模型一个「看起来有实测数据」的假入口。
+ * ③ 的形态是**一个聚合工具**而不是七个并列工具：七个平台除了名字、称呼与算子集几乎完全相同，
+ * 而"跨平台怎么合并、哪些指标可比"是确定性计算、不该交给模型（见 platformDigest 的注释）。
+ * 七个 `makePlatformTool` 生成的单平台工具仍然注册、仍然逐源受治理，但标记 `hidden` ——
+ * 它们是**实现原语**，不是模型的入口。
  *
- * 新增联网能力必须同时补：白名单、governance 检查项、provenance 出处（否则报告无法引用）。
+ * ⚠️ ③ 的可用性还多一道**许可证闸**（MediaCrawler 为非商用许可）：
+ * 只有 `BM_MC_LICENSE_ACK=true` 且 collector 地址已配时才会装配。见
+ * packages/datasource/src/media-crawler.ts 的文件头。
+ *
+ * 原先还有两类入口，均已移除：
+ *   · 「平台适配器取数」（千川/星图/蒲公英/生意参谋/巨量算数）与对应的
+ *     query_customer_owned / query_public_index —— 那些适配器从未接入真实平台、只输出合成值，
+ *     留在工具清单里等于给模型一个「看起来有实测数据」的假入口；
+ *   · 早期的 douyin_creator / douyin_comments / xhs_creator / xhs_note
+ *     —— 由本轮的七平台采集能力取代（覆盖面从 2 个平台扩到 7 个）。
+ *
+ * 新增外部能力必须同时补：白名单、governance 检查项、provenance 出处（否则报告无法引用）。
  * `web_search` 就是按这条规则落的：它声明 `boundSourceId = volc_web_search`，
  * 于是闸门会真的按 L3 源检查它的台账登记与授权（见 tools.ts 的绑定覆盖逻辑）；
  * 未配置 API Key 时适配器不注册，registerAllTools 便不注册该工具。
@@ -29,8 +41,21 @@
 
 import { Type } from "@earendil-works/pi-ai";
 import type { ConfidenceTier, PhaseName, ToolPolicy } from "@brandsale/contracts";
-import { WEB_SEARCH_SOURCE_ID, DOUYIN_WEB_SOURCE_ID, XHS_WEB_SOURCE_ID, type Provenance } from "@brandsale/datasource";
+import {
+  BRIEF_PLATFORM_TO_MC,
+  COMMENT_METRIC_KEYS,
+  CONTENT_METRIC_KEYS,
+  MEDIA_CRAWLER_PLATFORM_META,
+  MEDIA_CRAWLER_PLATFORMS,
+  comparableCommentMetrics,
+  comparableContentMetrics,
+  type CollectOp,
+  type MediaCrawlerPlatform,
+  type MediaCrawlerPlatformMeta,
+} from "@brandsale/config";
+import { CREATOR_ROW_TYPE, WEB_SEARCH_SOURCE_ID, type Provenance } from "@brandsale/datasource";
 import { buildSourceCatalog } from "@brandsale/governance";
+import { toEvidenceEntries, type EvidenceRowInput } from "./evidence.ts";
 import { type ToolDeps, type ToolImpl, type ToolCallContext, policy } from "./tools.ts";
 
 const Str = Type.String;
@@ -78,15 +103,20 @@ const validateBrief: ToolImpl = {
 
 const resolveAuthorization: ToolImpl = {
   policy: policy({ name: "resolve_authorization", allowedAgents: ["AO"], governance: ["scope"] }),
-  description: "解析当前租户的数据源授权状态，返回可用源与受阻源（含原因）。这是报告「排除项」的数据来源。",
+  description:
+    "解析当前租户的数据源授权状态，返回可用源、受阻源（含原因）与「已授权但采集能力未装配」的源。这是报告「排除项」的数据来源。",
   producesCitedData: false,
   parameters: Type.Object({}),
   async execute(_p, tc: ToolCallContext) {
-    const sources = this_deps(tc).repos.sources.list(tc.ctx.tenantId);
+    const deps = this_deps(tc);
+    const sources = deps.repos.sources.list(tc.ctx.tenantId);
+    // 已装配的适配器：只有它有数据可取。台账登记 ≠ 能力就绪（见 buildSourceCatalog 的同名说明）
+    const assembled = new Set(deps.datasources.list().map((a) => a.sourceId));
     const usable: { sourceId: string; tier: string; expiresAt: string }[] = [];
     const blocked: { sourceId: string; reason: string }[] = [];
+    const capabilityMissing: { sourceId: string; tier: string; reason: string }[] = [];
     for (const s of sources) {
-      const az = this_deps(tc).repos.authz.active(tc.ctx.tenantId, s.sourceId);
+      const az = deps.repos.authz.active(tc.ctx.tenantId, s.sourceId);
 
       // 一次性收集**所有**未通过的门，而不是命中第一条就返回。
       //
@@ -102,9 +132,20 @@ const resolveAuthorization: ToolImpl = {
         blocked.push({ sourceId: s.sourceId, reason: reasons.join("；") });
         continue;
       }
+      // 授权与法务都过了，但适配器没装配（平台采集源在许可未确认 / collector 未配置时如此）。
+      // 单列一类而不是塞进 blocked：它的"缺什么"完全不同——不是补授权，而是去开开关，
+      // 混在一起读者会按"补授权"去处理，白费功夫。
+      if (!assembled.has(s.sourceId)) {
+        capabilityMissing.push({
+          sourceId: s.sourceId,
+          tier: s.tier,
+          reason: "已授权，但采集能力未装配（平台采集源需开启 BM_MC_ENABLED + BM_MC_LICENSE_ACK 并配置 collector）",
+        });
+        continue;
+      }
       usable.push({ sourceId: s.sourceId, tier: s.tier, expiresAt: az.validTo });
     }
-    return { result: { usableSources: usable, blockedSources: blocked } };
+    return { result: { usableSources: usable, blockedSources: blocked, capabilityMissing } };
   },
 };
 
@@ -234,241 +275,6 @@ const webSearch: ToolImpl = {
       result: { query, count: results.length, results },
       provenance: [res.provenance],
       note: `联网检索「${query}」命中 ${results.length} 条（L3 公开，未人工核验）`,
-    };
-  },
-};
-
-/* ── 平台内公开内容：抖音 / 小红书 ───────────────────────
- *
- * 这两组工具补的是**平台内**的公开内容（达人主页、作品数据、评论），
- * 也就是 web_search 抓不到的那一层：搜索引擎一般不索引抖音作品页与小红书笔记详情。
- *
- * 三条共同的设计约束：
- *   ① `boundSourceId` 绑死来源 —— 闸门检查的是绑定值，不是模型自报的 sourceId；
- *   ② 结果是 L3 且**未经人工核验**，note 里如实写明，报告引用必须带来源；
- *   ③ `maxCallsPerJob` 有界 —— 自托管服务虽然不按次计费，但它背后是有限的
- *      账号池与风控额度，无限调用会把甲方账号打到验证码或封 IP。
- *
- * 白名单刻意收窄（对比 web_search 的六阶段全开）：
- *   · `*_creator` 给 CI + CT —— CT 需要给候选人补公开背景；
- *   · `*_comments` 只给 CI —— 评论属内容舆情，不是人选阶段的输入。
- * 判断标准是「放开它会不会让某条既有不变量失守」：CT 的不变量是"达人必须可追溯、
- * 禁止编造"。真实采集来的达人不违反这条（它可追溯），但**报价与成交价仍必须来自
- * 报价库**，所以工具描述里明确禁止用采集到的粉丝量去推算报价。
- */
-
-const douyinCreator: ToolImpl = {
-  policy: policy({
-    name: "douyin_creator",
-    allowedAgents: ["CI", "CT"],
-    governance: ["scope", "source", "authz", "tenant"],
-    boundSourceId: DOUYIN_WEB_SOURCE_ID,
-    timeoutMs: 20_000,
-    retry: { attempts: 1, backoff: "fixed", baseMs: 500 },
-    fallback: "none",
-    // 一次调用最多打 2 个上游请求（主页 + 作品），所以上限按调用次数计、留出余量
-    maxCallsPerJob: 15,
-  }),
-  description:
-    "采集抖音达人的公开主页与作品列表（粉丝量、作品数、作品互动数据）。需要 sec_user_id —— 抖音号的稳定 ID，" +
-    "不是昵称。结果属 L3 公开内容、未经人工核验：只可支撑关于该达人的公开断言（如「公开粉丝量 380 万」），" +
-    "不得用来推算报价或成交价（那必须走 pricing_query 的报价库），也不得用于甲方自身经营指标。",
-  producesCitedData: true,
-  parameters: Type.Object({
-    secUserId: Str(),
-    includePosts: Type.Optional(Type.Boolean()),
-    count: Type.Optional(Num()),
-  }),
-  async execute(params, tc) {
-    const secUserId = String(params.secUserId ?? "").trim();
-    if (!secUserId) {
-      /* 刻意不做"用昵称去搜一个 ID"的降级：采集服务的搜索端点没有接线，
-       * 用昵称猜 ID 会拿到另一个人 —— 这比返回空更危险（报告会把陌生人写成候选人）。 */
-      return {
-        result: {
-          secUserId: "",
-          degraded: true,
-          code: "E-DATA-002",
-          note: "缺少 sec_user_id。本项目不做昵称搜索：采集端未接线搜索端点，用昵称猜 ID 可能拿错人，因此宁可不出数据。",
-        },
-        note: "缺少 sec_user_id，未发起采集",
-      };
-    }
-
-    const deps = this_deps(tc);
-    const adapter = deps.datasources.require(DOUYIN_WEB_SOURCE_ID);
-    const base = { tenantId: tc.ctx.tenantId, jobId: tc.jobId };
-
-    const profileRes = await adapter.fetch({ ...base, params: { op: "profile", secUserId } }, deps.config);
-    const creator = profileRes.rows[0] ?? null;
-    const provenance: Provenance[] = [profileRes.provenance];
-
-    let works: Record<string, unknown>[] = [];
-    if (params.includePosts !== false) {
-      const postsRes = await adapter.fetch(
-        { ...base, params: { op: "posts", secUserId, count: params.count === undefined ? 20 : Number(params.count) } },
-        deps.config,
-      );
-      works = postsRes.rows;
-      provenance.push(postsRes.provenance);
-    }
-
-    return {
-      result: { creator, works, workCount: works.length },
-      provenance,
-      note: `抖音公开采集：主页 1 条 + 作品 ${works.length} 条（L3，未人工核验）`,
-    };
-  },
-};
-
-const douyinComments: ToolImpl = {
-  policy: policy({
-    name: "douyin_comments",
-    allowedAgents: ["CI"],
-    governance: ["scope", "source", "authz", "tenant"],
-    boundSourceId: DOUYIN_WEB_SOURCE_ID,
-    timeoutMs: 20_000,
-    retry: { attempts: 1, backoff: "fixed", baseMs: 500 },
-    fallback: "none",
-    maxCallsPerJob: 15,
-  }),
-  description:
-    "采集抖音指定作品的公开评论（内容、点赞数、评论者 IP 属地）。用于舆情口碑与内容反馈分析。" +
-    "⚠️ 评论者的 IP 属地**不是**粉丝地域：它既是有偏样本（只有会评论的人才被统计），口径也完全不同。" +
-    "任何基于它的人群推断都必须在报告中标为有偏代理，不得当作粉丝画像使用。",
-  producesCitedData: true,
-  parameters: Type.Object({ awemeId: Str(), count: Type.Optional(Num()) }),
-  async execute(params, tc) {
-    const awemeId = String(params.awemeId ?? "").trim();
-    if (!awemeId) {
-      return { result: { awemeId: "", comments: [], degraded: true, code: "E-DATA-002", note: "缺少 aweme_id，未发起采集" }, note: "缺少 aweme_id" };
-    }
-    const deps = this_deps(tc);
-    const res = await deps.datasources.require(DOUYIN_WEB_SOURCE_ID).fetch(
-      {
-        tenantId: tc.ctx.tenantId,
-        jobId: tc.jobId,
-        params: { op: "comments", awemeId, count: params.count === undefined ? 20 : Number(params.count) },
-      },
-      deps.config,
-    );
-    return {
-      result: { awemeId, comments: res.rows, count: res.rows.length },
-      provenance: [res.provenance],
-      note: `抖音公开评论 ${res.rows.length} 条（L3，未人工核验；IP 属地非粉丝地域）`,
-    };
-  },
-};
-
-const xhsCreator: ToolImpl = {
-  policy: policy({
-    name: "xhs_creator",
-    allowedAgents: ["CI", "CT"],
-    governance: ["scope", "source", "authz", "tenant"],
-    boundSourceId: XHS_WEB_SOURCE_ID,
-    timeoutMs: 30_000,
-    retry: { attempts: 1, backoff: "fixed", baseMs: 800 },
-    fallback: "none",
-    maxCallsPerJob: 15,
-  }),
-  description:
-    "采集小红书博主公开主页与其笔记列表。需要 user_id（博主主页的稳定 ID）。" +
-    "结果属 L3 公开内容、未经人工核验，同样不得用来推算报价。注意小红书 web 接口不提供关注/粉丝列表，" +
-    "粉丝量在部分页面也取不到 —— 取不到会返回 null，而不是给一个估计值。",
-  producesCitedData: true,
-  parameters: Type.Object({
-    userId: Str(),
-    includeNotes: Type.Optional(Type.Boolean()),
-    count: Type.Optional(Num()),
-  }),
-  async execute(params, tc) {
-    const userId = String(params.userId ?? "").trim();
-    if (!userId) {
-      return {
-        result: { userId: "", degraded: true, code: "E-DATA-002", note: "缺少 user_id，未发起采集。本项目不做昵称搜索（会拿错人）。" },
-        note: "缺少 user_id，未发起采集",
-      };
-    }
-    const deps = this_deps(tc);
-    const adapter = deps.datasources.require(XHS_WEB_SOURCE_ID);
-    const base = { tenantId: tc.ctx.tenantId, jobId: tc.jobId };
-
-    const userRes = await adapter.fetch({ ...base, params: { op: "user", userId } }, deps.config);
-    const user = userRes.rows[0] ?? null;
-    const provenance: Provenance[] = [userRes.provenance];
-
-    let notes: Record<string, unknown>[] = [];
-    if (params.includeNotes !== false) {
-      const notesRes = await adapter.fetch(
-        { ...base, params: { op: "userPosts", userId, count: params.count === undefined ? 20 : Number(params.count) } },
-        deps.config,
-      );
-      notes = notesRes.rows;
-      provenance.push(notesRes.provenance);
-    }
-
-    return {
-      result: { user, notes, noteCount: notes.length },
-      provenance,
-      note: `小红书公开采集：主页 1 条 + 笔记 ${notes.length} 条（L3，未人工核验）`,
-    };
-  },
-};
-
-const xhsNote: ToolImpl = {
-  policy: policy({
-    name: "xhs_note",
-    allowedAgents: ["CI"],
-    governance: ["scope", "source", "authz", "tenant"],
-    boundSourceId: XHS_WEB_SOURCE_ID,
-    timeoutMs: 30_000,
-    retry: { attempts: 1, backoff: "fixed", baseMs: 800 },
-    fallback: "none",
-    maxCallsPerJob: 15,
-  }),
-  description:
-    "读取小红书单篇笔记的公开详情与评论（标题、正文、互动数、标签、评论内容与评论者 IP 属地）。" +
-    "建议直接传笔记 URL —— 带 xsec_token 的完整链接命中率明显更高，只传 note_id 有时读不到。" +
-    "评论者的 IP 属地**不是**粉丝地域（有偏样本），不得当作人群画像使用。",
-  producesCitedData: true,
-  parameters: Type.Object({
-    url: Type.Optional(Str()),
-    noteId: Type.Optional(Str()),
-    includeComments: Type.Optional(Type.Boolean()),
-    count: Type.Optional(Num()),
-  }),
-  async execute(params, tc) {
-    const url = String(params.url ?? "").trim();
-    const noteId = String(params.noteId ?? "").trim();
-    if (!url && !noteId) {
-      return {
-        result: { noteId: "", degraded: true, code: "E-DATA-002", note: "缺少 url 或 note_id，未发起采集" },
-        note: "缺少笔记标识，未发起采集",
-      };
-    }
-    const deps = this_deps(tc);
-    const adapter = deps.datasources.require(XHS_WEB_SOURCE_ID);
-    const base = { tenantId: tc.ctx.tenantId, jobId: tc.jobId };
-    const ident = url ? { url } : { noteId };
-
-    const noteRes = await adapter.fetch({ ...base, params: { op: "note", ...ident } }, deps.config);
-    const note = noteRes.rows[0] ?? null;
-    const provenance: Provenance[] = [noteRes.provenance];
-
-    let comments: Record<string, unknown>[] = [];
-    if (params.includeComments !== false) {
-      const cRes = await adapter.fetch(
-        { ...base, params: { op: "comments", ...ident, count: params.count === undefined ? 20 : Number(params.count) } },
-        deps.config,
-      );
-      comments = cRes.rows;
-      provenance.push(cRes.provenance);
-    }
-
-    return {
-      result: { note, comments, commentCount: comments.length },
-      provenance,
-      note: `小红书笔记详情 + 评论 ${comments.length} 条（L3，未人工核验；IP 属地非粉丝地域）`,
     };
   },
 };
@@ -659,6 +465,8 @@ const citeFact: ToolImpl = {
       tenantId: tc.ctx.tenantId,
       knowledgeSourceIds: deps.knowledge.sourceIds(tc.ctx.tenantId).map((x) => x.sourceId),
       chunkIds: deps.knowledge.chunkIds(tc.ctx.tenantId),
+      // 与 AgentPack.sourceCatalog 保持一致：只有装配了适配器的源才算"可引用来源"
+      availableSourceIds: deps.datasources.list().map((a) => a.sourceId),
     });
     const hit = catalog.entries.find((e) => claim.includes(e.displayName) || claim.includes(e.key));
     const tier = (String(params.tier ?? "L3") as ConfidenceTier | string) as never;
@@ -677,6 +485,524 @@ const citeFact: ToolImpl = {
   },
 };
 
+/* ── 七个平台内容工具（MediaCrawler / collector sidecar）──── */
+
+/**
+ * 平台码 → 工具名。刻意在工具层定义（而不是塞进 config 的平台元数据）：
+ * 工具名是"模型看到的东西"，属于工具层的命名自由；台账源 ID 才是需要全局一致的标识，
+ * 那个在 config 的元数据里。两者分开，改名不会牵动台账。
+ */
+export const PLATFORM_TOOL_NAME: Record<MediaCrawlerPlatform, string> = {
+  xhs: "xhs_web",
+  dy: "douyin_web",
+  ks: "kuaishou_web",
+  bili: "bilibili_web",
+  wb: "weibo_web",
+  tieba: "tieba_web",
+  zhihu: "zhihu_web",
+};
+
+/** 正文截断上限：单条内容的正文对判断"讲什么"绰绰有余，全量回灌只会挤爆上下文 */
+const TEXT_MAX = 400;
+const clip = (s: string): string => (s.length > TEXT_MAX ? `${s.slice(0, TEXT_MAX)}…` : s);
+
+/**
+ * 生成一个平台内容工具。
+ *
+ * 白名单取 `["CI", "CT"]` 两种角色：
+ *   · CI（竞品情报）用 search / content_detail / comments 取"关于他人"的公开内容与口碑；
+ *   · CT（人选匹配）用 creator 取该达人**个人主页的公开统计**（粉丝量/关注数），
+ *     也可用来取 TA 名下的公开作品。内核的 `save_creator` 已从"教学版空实现"改为
+ *     真正落盘主页公开统计（实测小红书 `fans: 2373`、抖音 `follower_count` 均可取到）。
+ *     注意两点：① creatorId 必须是平台**原始 UID**（归一化结果里的 authorId 是脱敏哈希，
+ *     喂回去必然失败）；② 若只要主页统计、不要作品，走 collector 的自动补采
+ *     （搜索完成即按作者补一次，`profileOnly`），不必在这里手动调。
+ * 不给 PL/BR/RG：排期、预算、研报阶段的数字必须来自授权数据与报价库，不该从平台公开内容里凑。
+ *
+ * **对模型隐藏**（`hidden: true`）：这七个是**受治理的实现原语**，不是给模型用的入口。
+ * 模型只面对聚合工具 `platform_digest`。理由见 ToolPolicy.hidden 的注释——七个同形工具
+ * 并列时模型既容易选错，也几乎必然自己在上下文里手工合并跨平台结果，而跨平台可比性
+ * 恰恰是 LLM 做不准的部分（拿 B站投币数去比小红书点赞就是这么来的）。
+ * 隐藏不影响治理：它们仍然注册、仍然逐个过闸门，单测也仍然直接调用它们。
+ *
+ * 不走并行（parallelism: "sequential"）：collector 底层是 MediaCrawler 的**单进程串行**执行器，
+ * 并行只会让多个调用一起排队，反而更慢。
+ *
+ * retry 设 0：采集是分钟级的，失败立刻重试也来不及；真正该做的是让它排队、下次再取。
+ * 工具执行本身很快（读 collector 缓存），但首次会触发一次后台采集，所以超时给得比 web_search 宽。
+ */
+function makePlatformTool(meta: MediaCrawlerPlatformMeta): ToolImpl {
+  const toolName = PLATFORM_TOOL_NAME[meta.platform];
+  const opList = meta.ops.join(" / ");
+  return {
+    policy: policy({
+      name: toolName,
+      allowedAgents: ["CI", "CT"],
+      governance: ["scope", "source", "authz", "tenant"],
+      boundSourceId: meta.sourceId,
+      hidden: true,
+      timeoutMs: 15_000,
+      retry: { attempts: 0, backoff: "fixed", baseMs: 0 },
+      fallback: "none",
+      parallelism: "sequential",
+      // 每次调用都可能触发一次后台采集；平台侧有频控，单任务 20 次封顶
+      maxCallsPerJob: 20,
+    }),
+    description:
+      `采集 ${meta.displayName}平台内的**公开内容**（${meta.contentNoun}/${meta.creatorNoun}/评论）。` +
+      `op 取值：${opList}。` +
+      `search 传 keyword 搜${meta.contentNoun}；content_detail / comments 传 contentId（或 url）；` +
+      `creator 传 creatorId 取该${meta.creatorNoun}的个人主页公开统计（粉丝量/关注数）与名下作品。` +
+      `注意 creatorId 必须是平台**原始 UID**：本系统归一化结果里的 authorId 是脱敏哈希，喂回去必然失败。` +
+      `通常不必手动调 —— 搜索采集完成后系统会自动按作者补采一次主页统计（见 collector 的 profileEnrich）。` +
+      `结果属 L3 公开信息、**未经人工核验**，且与平台无授权合同：引用必须注明"公开采集"，` +
+      `只能支撑关于他人的公开断言，**不得**当作甲方自身的实测经营数据。` +
+      `数据来自本机采集缓存：首次调用可能返回 0 条并已在后台排队采集，稍后重试即可拿到；` +
+      `某平台首次需要登录态时，采集子进程会自拉起浏览器窗口等待扫码（登录态存在本机、后续复用），` +
+      `扫码后该次采集仍需数分钟。`,
+    producesCitedData: true,
+    parameters: Type.Object({
+      op: Str(),
+      keyword: Type.Optional(Str()),
+      contentId: Type.Optional(Str()),
+      creatorId: Type.Optional(Str()),
+      url: Type.Optional(Str()),
+      limit: Type.Optional(Num()),
+    }),
+    async execute(params, tc) {
+      const op = String(params.op ?? "").trim();
+      // 非法 op 不抛错，而是回一条**可操作**的说明：模型据此就能自己改正，
+      // 抛错则会被降级链包成 E-DATA-002，模型误以为是基础设施故障、改去重试。
+      if (!(meta.ops as readonly string[]).includes(op)) {
+        return {
+          result: {
+            platform: meta.platform,
+            rows: [],
+            invalidOp: op || "(空)",
+            validOps: meta.ops,
+            note: `${meta.displayName}不支持算子「${op}」。可用：${opList}`,
+          },
+          note: `算子非法：${op || "(空)"}`,
+        };
+      }
+      const collectOp = op as CollectOp;
+      const need = collectOp === "search" ? "keyword" : collectOp === "creator" ? "creatorId" : "contentId（或 url）";
+      const provided =
+        collectOp === "search"
+          ? String(params.keyword ?? "").trim()
+          : collectOp === "creator"
+            ? String(params.creatorId ?? "").trim()
+            : String(params.contentId ?? params.url ?? "").trim();
+      if (!provided) {
+        return {
+          result: {
+            platform: meta.platform,
+            op: collectOp,
+            rows: [],
+            note: `${meta.displayName} ${collectOp} 需要 ${need}`,
+          },
+          note: `缺参数 ${need}`,
+        };
+      }
+
+      const res = await this_deps(tc)
+        .datasources.require(meta.sourceId)
+        .fetch(
+          {
+            tenantId: tc.ctx.tenantId,
+            jobId: tc.jobId,
+            metric: provided,
+            limit: params.limit === undefined ? 20 : Math.max(1, Math.min(100, Number(params.limit))),
+            params: {
+              op: collectOp,
+              keyword: params.keyword === undefined ? undefined : String(params.keyword),
+              contentId: params.contentId === undefined ? undefined : String(params.contentId),
+              creatorId: params.creatorId === undefined ? undefined : String(params.creatorId),
+              url: params.url === undefined ? undefined : String(params.url),
+            },
+          },
+          this_deps(tc).config,
+        );
+
+      const mapped = res.rows.map((r) => ({
+        id: String(r.id ?? ""),
+        title: String(r.title ?? ""),
+        text: clip(String(r.text ?? "")),
+        author: String(r.author ?? ""),
+        authorId: String(r.authorId ?? ""),
+        url: String(r.url ?? ""),
+        publishedAt: String(r.publishedAt ?? ""),
+        metrics: (r.metrics as Record<string, number> | undefined) ?? {},
+        // 资料行（作者主页）与内容行分流：资料行只提供粉丝数/主页链接，
+        // 不能混进"本批内容条数"或跨平台指标对比
+        rowType: r.rowType === CREATOR_ROW_TYPE ? CREATOR_ROW_TYPE : "content",
+      }));
+      const rows = mapped.filter((r) => r.rowType !== CREATOR_ROW_TYPE);
+      const creators = mapped.filter((r) => r.rowType === CREATOR_ROW_TYPE);
+
+      /* 证据登记必须发生在**返回给模型之前**：这样 entryId 是系统生成的，
+       * 模型只能引用、不能发明（见 evidence.ts 的文件头）。 */
+      registerEvidence(tc, rows, {
+        platform: meta.platform,
+        platformName: meta.displayName,
+        op: collectOp,
+        collectedAt: res.provenance?.asOf,
+      });
+      // 资料行按 op=creator 单独登记：报告据此拿到"这个账号的粉丝数"（见 synthesis.ts）
+      registerEvidence(tc, creators, {
+        platform: meta.platform,
+        platformName: meta.displayName,
+        op: "creator",
+        collectedAt: res.provenance?.asOf,
+      });
+
+      return {
+        result: {
+          platform: meta.platform,
+          platformName: meta.displayName,
+          op: collectOp,
+          count: rows.length,
+          rows,
+          ...(creators.length > 0 ? { creators } : {}),
+          note:
+            rows.length === 0
+              ? "本地无采集缓存。已在后台排队采集，请稍后用**不同参数**再试一次本工具（采集受平台频控，通常几十秒到几分钟）；若仍为空，按「本次该平台没有命中数据」如实处理，不要用同一参数反复调用。"
+              : `L3 公开内容、未经人工核验；引用须注明平台与账号。` +
+                (creators.length > 0
+                  ? `另附 ${creators.length} 位作者的个人主页公开统计（粉丝量 followers / 关注 follows / 主页链接）。`
+                  : ""),
+        },
+        provenance: [res.provenance],
+        note: `${meta.displayName} ${collectOp} 命中 ${rows.length} 条（L3 公开，未人工核验）`,
+      };
+    },
+  };
+}
+
+export const PLATFORM_TOOLS: ToolImpl[] = MEDIA_CRAWLER_PLATFORMS.map((p) =>
+  makePlatformTool(MEDIA_CRAWLER_PLATFORM_META[p]),
+);
+
+/* ── 跨平台聚合工具（模型唯一可见的平台入口）─────────────── */
+
+export const PLATFORM_DIGEST_TOOL_NAME = "platform_digest";
+
+/** 采集码 / 业务码 → 采集码。让模型既能传 `xhs` 也能传 `xiaohongshu` */
+function resolvePlatformCode(raw: string): MediaCrawlerPlatform | undefined {
+  const s = raw.trim().toLowerCase();
+  if (!s) return undefined;
+  if ((MEDIA_CRAWLER_PLATFORMS as readonly string[]).includes(s)) return s as MediaCrawlerPlatform;
+  return BRIEF_PLATFORM_TO_MC[s];
+}
+
+/** 算子 → 该算子产出的记录属于内容层还是评论层（决定用哪张指标表算可比集） */
+const SCOPE_BY_OP: Record<CollectOp, "content" | "comment"> = {
+  search: "content",
+  content_detail: "content",
+  creator: "content",
+  comments: "comment",
+};
+
+/**
+ * 跨平台聚合取数：**一次调用覆盖多个平台**，并在结果里直接给出"哪些指标可以横向比"。
+ *
+ * 为什么要有这层（而不是让模型逐个调七个平台工具）：
+ *   1. **可比性判断不该交给模型**。七个平台的指标丰度差得很远（B站有播放/投币、贴吧只有
+ *      正文+评论数、快手没有评论总数），模型在上下文里手工合并时几乎必然把某个平台独有的
+ *      指标拿来横向比。这个函数的返回值里带了 `comparison`，把"本组平台的共有指标"算好给它。
+ *   2. **闸门要逐源过**。绑多个源不代表放开来源：每个平台仍然按它自己的 `sourceId` 单独跑一次
+ *      source/authz/tenant/scope，未通过的平台被**跳过并记名**，而不是让整只工具失败——
+ *      一个未授权的平台不该拖垮另外六个。
+ *   3. **工具面收敛**。模型看到的平台入口只有这一个。
+ *
+ * 与单平台工具的关系：聚合工具**复用**同一个 `mc_<平台>` 适配器与同一套归一化结果，
+ * 只是把"调七次 + 自己合并"固化成一个确定性步骤。
+ */
+const platformDigest: ToolImpl = {
+  policy: policy({
+    name: PLATFORM_DIGEST_TOOL_NAME,
+    allowedAgents: ["CI", "CT"],
+    governance: ["scope", "source", "authz", "tenant"],
+    // 七个源一起绑：任一源已装配即注册，全都没装配才不注册（否则报告会多一条假能力）
+    boundSourceIds: MEDIA_CRAWLER_PLATFORMS.map((p) => MEDIA_CRAWLER_PLATFORM_META[p].sourceId),
+    timeoutMs: 45_000,
+    retry: { attempts: 0, backoff: "fixed", baseMs: 0 },
+    fallback: "none",
+    parallelism: "sequential",
+    // 一次调用可能扇出到 7 个平台（各自触发一次后台采集），所以上限比单平台工具低得多
+    maxCallsPerJob: 8,
+  }),
+  description:
+    "跨平台聚合采集公开内容：一次调用覆盖多个平台，返回合并后的记录，**并给出本组平台的共有指标**。\n" +
+    "op 取值：search（按 keyword 搜内容）/ content_detail（按 contentId 取正文）/ " +
+    "comments（按 contentId 取评论）/ creator（按 creatorId 取该创作者名下作品）。\n" +
+    "platforms 传平台列表（小红书=xhs 或 xiaohongshu、抖音=dy 或 douyin、快手=ks、B站=bili、" +
+    "微博=wb、贴吧=tieba、知乎=zhihu）；省略则覆盖全部已装配平台。\n" +
+    "**返回值 comparison.metrics 是本组平台都真实存在的指标，跨平台横向对比只能落在这些指标上**；" +
+    "comparison.dropped 列出「声明共有但这批数据里全为 0」的指标（那是缺失，不是 0），" +
+    "platformsSkipped 列出被跳过（未授权 / 未装配 / 采集失败）的平台 —— 这两处都必须如实写进报告，" +
+    "不要当成 0 条、也不要凭空补齐。\n" +
+    "结果属 L3 公开信息、**未经人工核验**，与平台无授权合同：只能支撑关于他人的公开断言，" +
+    "**不得**当作甲方自身的实测经营数据。粉丝量 / 性别 / 地域等画像七个平台都拿不到，不要从这里取。\n" +
+    "数据来自本机采集缓存：首次调用可能返回 0 条并已在后台排队采集，稍后重试即可拿到（至多 1–2 次、换参数；仍为空就按「本次无该平台数据」如实处理，勿反复调用）。",
+  producesCitedData: true,
+  parameters: Type.Object({
+    op: Str(),
+    platforms: Type.Optional(Arr(Str())),
+    keyword: Type.Optional(Str()),
+    contentId: Type.Optional(Str()),
+    creatorId: Type.Optional(Str()),
+    url: Type.Optional(Str()),
+    limit: Type.Optional(Num()),
+  }),
+  async execute(params, tc) {
+    const deps = this_deps(tc);
+
+    const op = String(params.op ?? "").trim();
+    if (!(op in SCOPE_BY_OP)) {
+      return {
+        result: {
+          op,
+          rows: [],
+          invalidOp: op || "(空)",
+          validOps: Object.keys(SCOPE_BY_OP),
+          note: `不支持的算子「${op || "(空)"}」。可用：search / content_detail / comments / creator`,
+        },
+        note: `算子非法：${op || "(空)"}`,
+      };
+    }
+    const collectOp = op as CollectOp;
+
+    // 平台列表：显式传入的按传入顺序去重；未传则覆盖全部七个（未装配/未授权的会在下面被跳过并记名）
+    const rawPlatforms = Array.isArray(params.platforms) ? (params.platforms as unknown[]).map((x) => String(x)) : [];
+    const requested: MediaCrawlerPlatform[] = [];
+    const unknownPlatforms: string[] = [];
+    if (rawPlatforms.length === 0) {
+      requested.push(...MEDIA_CRAWLER_PLATFORMS);
+    } else {
+      for (const raw of rawPlatforms) {
+        const code = resolvePlatformCode(raw);
+        if (!code) {
+          unknownPlatforms.push(raw);
+          continue;
+        }
+        if (!requested.includes(code)) requested.push(code);
+      }
+    }
+    if (requested.length === 0) {
+      return {
+        result: {
+          op: collectOp,
+          rows: [],
+          platformsRequested: [],
+          unknownPlatforms,
+          note: `platforms 里没有可识别的平台名${unknownPlatforms.length ? `（未识别：${unknownPlatforms.join("、")}）` : ""}`,
+        },
+        note: "平台参数无法识别",
+      };
+    }
+
+    // 必要的检索词
+    const provided =
+      collectOp === "search"
+        ? String(params.keyword ?? "").trim()
+        : collectOp === "creator"
+          ? String(params.creatorId ?? "").trim()
+          : String(params.contentId ?? params.url ?? "").trim();
+    const need = collectOp === "search" ? "keyword" : collectOp === "creator" ? "creatorId" : "contentId（或 url）";
+    if (!provided) {
+      return {
+        result: { op: collectOp, rows: [], platformsRequested: requested, note: `${collectOp} 需要 ${need}` },
+        note: `缺参数 ${need}`,
+      };
+    }
+
+    const limit = params.limit === undefined ? 20 : Math.max(1, Math.min(100, Number(params.limit)));
+    const rows: Array<Record<string, unknown>> = [];
+    const creators: Array<Record<string, unknown>> = [];
+    const provenance: Provenance[] = [];
+    const used: MediaCrawlerPlatform[] = [];
+    const skipped: Array<{ platform: MediaCrawlerPlatform; platformName: string; reason: string }> = [];
+
+    for (const p of requested) {
+      const meta = MEDIA_CRAWLER_PLATFORM_META[p];
+      const adapter = deps.datasources.get(meta.sourceId);
+      if (!adapter) {
+        skipped.push({ platform: p, platformName: meta.displayName, reason: "能力未装配（该平台未开启采集）" });
+        continue;
+      }
+      /* 逐源过闸门。**不能因为绑定了七个源就对闸门"批发放行"**：
+       * 每个平台是独立的台账源，授权与租户隔离都按源判定；某个源未授权只影响它自己。
+       * agent 从 tc 取（由 ToolRegistry.invoke 注入），保证审计日志里"谁读了哪个源"是准的。 */
+      const verdict = await deps.gate.evaluate(
+        {
+          tenantId: tc.ctx.tenantId,
+          jobId: tc.jobId,
+          agent: tc.agent ?? "CI",
+          tool: PLATFORM_DIGEST_TOOL_NAME,
+          args: { ...params, op: collectOp, sourceId: meta.sourceId },
+          checks: ["scope", "source", "authz", "tenant"],
+        },
+        tc.ctx,
+      );
+      if (!verdict.allow) {
+        skipped.push({
+          platform: p,
+          platformName: meta.displayName,
+          reason: verdict.fatal ? `被拦下（${verdict.code}）：${verdict.reason}` : `未通过闸门（${verdict.code}）：${verdict.reason}`,
+        });
+        continue;
+      }
+
+      try {
+        const res = await adapter.fetch(
+          {
+            tenantId: tc.ctx.tenantId,
+            jobId: tc.jobId,
+            metric: provided,
+            limit,
+            params: {
+              op: collectOp,
+              keyword: params.keyword === undefined ? undefined : String(params.keyword),
+              contentId: params.contentId === undefined ? undefined : String(params.contentId),
+              creatorId: params.creatorId === undefined ? undefined : String(params.creatorId),
+              url: params.url === undefined ? undefined : String(params.url),
+            },
+          },
+          deps.config,
+        );
+        provenance.push(res.provenance);
+        used.push(p);
+        for (const r of res.rows) {
+          // 作者主页资料行单独收集：它们只提供粉丝量/主页链接，
+          // 既不算"本批内容条数"，也不参与跨平台指标对比（见 CREATOR_ROW_TYPE）
+          if (r.rowType === CREATOR_ROW_TYPE) {
+            creators.push({
+              platform: p,
+              platformName: meta.displayName,
+              id: String(r.id ?? ""),
+              author: String(r.author ?? ""),
+              authorId: String(r.authorId ?? ""),
+              url: String(r.url ?? ""),
+              text: clip(String(r.text ?? "")),
+              metrics: (r.metrics as Record<string, number> | undefined) ?? {},
+            });
+            continue;
+          }
+          rows.push({
+            platform: p,
+            platformName: meta.displayName,
+            id: String(r.id ?? ""),
+            title: String(r.title ?? ""),
+            text: clip(String(r.text ?? "")),
+            author: String(r.author ?? ""),
+            authorId: String(r.authorId ?? ""),
+            url: String(r.url ?? ""),
+            publishedAt: String(r.publishedAt ?? ""),
+            metrics: (r.metrics as Record<string, number> | undefined) ?? {},
+          });
+        }
+      } catch (e) {
+        // 单个平台失败不拖垮整批：记名跳过，其余平台的结果照常返回。
+        skipped.push({
+          platform: p,
+          platformName: meta.displayName,
+          reason: `采集失败：${e instanceof Error ? e.message : String(e)}`,
+        });
+      }
+    }
+
+    // ── 可比指标：本组平台的**声明交集**，再剔掉"这批数据里全为 0"的（声明存在 ≠ 本批有值）
+    const scope = SCOPE_BY_OP[collectOp];
+    const declaredCommon: readonly string[] =
+      scope === "comment" ? comparableCommentMetrics(used) : comparableContentMetrics(used);
+    const allMetricKeys: readonly string[] = scope === "comment" ? COMMENT_METRIC_KEYS : CONTENT_METRIC_KEYS;
+    const dropped: string[] = [];
+    const metrics: string[] = [];
+    for (const k of allMetricKeys) {
+      if (!(declaredCommon as readonly string[]).includes(k)) continue;
+      const anyNonZero = rows.some((r) => Number((r.metrics as Record<string, number>)[k] ?? 0) > 0);
+      if (anyNonZero) metrics.push(k);
+      else dropped.push(k);
+    }
+
+    const perPlatform = requested.map((p) => {
+      const meta = MEDIA_CRAWLER_PLATFORM_META[p];
+      const declared = scope === "comment" ? meta.commentMetrics : meta.contentMetrics;
+      const mine = rows.filter((r) => r.platform === p);
+      const absent = declared.filter((k) => !mine.some((r) => Number((r.metrics as Record<string, number>)[k] ?? 0) > 0));
+      return {
+        platform: p,
+        platformName: meta.displayName,
+        count: mine.length,
+        declaredMetrics: declared,
+        // 该平台声明有、但本批数据里一条非零值都没有的指标 —— 别在报告里当 0 用
+        absentMetrics: absent,
+        used: used.includes(p),
+      };
+    });
+
+    const noteParts = [
+      `${collectOp} 覆盖 ${used.length}/${requested.length} 个平台，共 ${rows.length} 条（L3 公开，未人工核验）`,
+    ];
+    if (rows.length === 0 && used.length > 0) {
+      noteParts.push(
+        "本地无采集缓存：已在后台排队采集，请稍后用不同参数再试一次；仍为空就按「本次无平台条目」如实处理，不要用同一参数反复调用本工具",
+      );
+    }
+    if (skipped.length) noteParts.push(`跳过 ${skipped.length} 个平台（见 platformsSkipped，不要当成 0 条）`);
+    if (metrics.length === 0) {
+      noteParts.push("本组平台没有共有的非零指标：**不可做跨平台横向对比**，只能逐平台定性描述");
+    } else {
+      noteParts.push(`可跨平台对比的指标：${metrics.join(" / ")}`);
+    }
+    if (dropped.length) noteParts.push(`声明共有但本批全为 0（不要当 0 用）：${dropped.join(" / ")}`);
+
+    /* 聚合工具一次性把本批全部平台的条目登记进证据表：
+     * rows 里已经带了 platform / platformName，平台名不靠调用方猜。 */
+    const reg = registerEvidence(tc, rows, {
+      op: collectOp,
+      collectedAt: provenance[0]?.asOf,
+    });
+    if (reg.truncated > 0) {
+      noteParts.push(`证据表已达上限，另有 ${reg.truncated} 条未登记（不影响本批分析，但不支持条目级引用）`);
+    }
+    // 作者主页资料（粉丝量等）按 op=creator 单独登记：报告的人选表据此拿到真实粉丝数。
+    // 它们**不参与**上面的声量/指标计算 —— 粉丝数是账号级的，不是内容级的。
+    if (creators.length > 0) {
+      registerEvidence(tc, creators, { op: "creator", collectedAt: provenance[0]?.asOf });
+      noteParts.push(`另附 ${creators.length} 位作者的主页公开统计（粉丝量 / 关注数 / 主页链接）`);
+    }
+
+    return {
+      result: {
+        op: collectOp,
+        platformsRequested: requested,
+        ...(unknownPlatforms.length ? { unknownPlatforms } : {}),
+        platformsSkipped: skipped,
+        platforms: perPlatform,
+        comparison: {
+          scope,
+          /** 跨平台横向对比**只能**用这些指标 */
+          metrics,
+          /** 声明共有但本批数据全为 0：缺失，不是 0 */
+          dropped,
+          note:
+            metrics.length === 0
+              ? "本组平台无共有非零指标，不可横向对比"
+              : `仅这 ${metrics.length} 个指标可跨平台比较（取本组平台交集）`,
+        },
+        totalCount: rows.length,
+        rows,
+        ...(creators.length > 0 ? { creators } : {}),
+        note: noteParts.join("；"),
+      },
+      provenance,
+      note: noteParts[0]!,
+    };
+  },
+};
+
 /* ── 注册全部工具 ───────────────────────────────────────── */
 
 /** 把工具定义与依赖在装配期绑定，避免工具函数到处传 deps */
@@ -689,21 +1015,41 @@ function this_deps(_tc: ToolCallContext): ToolDeps {
   return BOUND_DEPS;
 }
 
+/**
+ * 把这一批返回行登记进 job 证据表（P0 溯源）。
+ *
+ * 调用点是刻意的：**在工具 return 之前**。工具返回什么，证据表里就有什么 ——
+ * 两者同源，所以"模型引用了某条内容"与"报告能给出该内容的 URL"必然一致。
+ * 反过来，如果登记放在调用方（Agent 或编排层），任何一处漏调都会让报告出现
+ * "引用了但查不到出处"的悬空引用。
+ *
+ * deps.evidence 缺省时不登记（不报错）：证据是增强能力，不该因为测试没装配就炸。
+ */
+function registerEvidence(
+  tc: ToolCallContext,
+  rows: readonly EvidenceRowInput[],
+  opts: { platform?: string; platformName?: string; op: string; collectedAt?: string },
+): { added: number; truncated: number; total: number } {
+  const registry = this_deps(tc).evidence;
+  if (!registry) return { added: 0, truncated: 0, total: 0 };
+  return registry.record(tc.jobId, toEvidenceEntries(rows, opts));
+}
+
 export const TOOL_IMPLEMENTATIONS: ToolImpl[] = [
   validateBrief,
   resolveAuthorization,
   kbRetrieve,
   webSearch,
-  douyinCreator,
-  douyinComments,
-  xhsCreator,
-  xhsNote,
   pricingQuery,
   riskScreen,
   calendarPlan,
   scenarioSimulate,
   renderOutline,
   citeFact,
+  // 跨平台聚合：模型唯一可见的平台入口（七个单平台工具已 hidden，仅作受治理原语）
+  platformDigest,
+  // 七个平台内容工具（仅在许可已确认 + collector 已配置时装配，见 admitTool）
+  ...PLATFORM_TOOLS,
 ];
 
 /**
@@ -720,10 +1066,29 @@ export function admitTool(
   policy: ToolPolicy,
   deps: Pick<ToolDeps, "config" | "datasources">,
 ): { ok: boolean; reason?: string } {
+  // boundSourceId 与 boundSourceIds 是互斥的两种声明方式（一个源 vs 一组源）。
+  // 同时写等于"来源声明有歧义"，属配置自相矛盾，启动时就炸出来。
+  if (policy.boundSourceId && policy.boundSourceIds) {
+    throw new Error(
+      `工具 ${policy.name} 同时声明了 boundSourceId 与 boundSourceIds —— 二者互斥，只能选一种。`,
+    );
+  }
+
   // 绑定数据源的工具，其能力可能在装配期不存在（例如没配 API Key 的联网检索）。
   // 此时不注册它：宁可 Agent 的工具清单里没有这一项，也不要让它去调一个必然失败的工具。
   if (policy.boundSourceId && !deps.datasources.get(policy.boundSourceId)) {
     return { ok: false, reason: `数据源能力未就绪：${policy.boundSourceId}` };
+  }
+
+  // 聚合类工具绑**一组**源。判定比单源宽一档：**至少一个**源已装配即注册
+  // （有一个平台的采集通道可用，聚合就是有意义的）。
+  // 反过来"一个都没有"必须不注册 —— 否则工具清单里会出现"平台聚合可用"、
+  // 而实际上每次调用都只能返回 platformsSkipped 全部平台，那是假能力。
+  if (policy.boundSourceIds) {
+    const ready = policy.boundSourceIds.filter((id) => deps.datasources.get(id));
+    if (ready.length === 0) {
+      return { ok: false, reason: `数据源能力全部未就绪：${policy.boundSourceIds.join("、")}` };
+    }
   }
 
   // 写操作工具默认不注册。见 ToolPolicy.mutating 的注释：
@@ -766,16 +1131,21 @@ export const PHASE_TOOL_HINT: Record<PhaseName, string> = {
   intel:
     "用 kb_retrieve 分三路取本地情报（竞品格局 / 类目趋势与人群 / 法规与合规口径），" +
     "用 web_search 检索公开网页（行业趋势、竞品动态、平台规则、政策法规）；" +
-    "若工具清单里有 douyin_creator / douyin_comments / xhs_note，" +
-    "可用它们取竞品与达人在平台内的公开内容与评论口碑（拿到 sec_user_id / note_id / URL 时用）；" +
-    "检索结果属 L3 公开且**未经人工核验**，引用必须带来源站点或账号，不得当作事实基准。" +
+    "工具清单里若有 platform_digest，用它一次覆盖多个平台取平台内公开内容与评论区口碑" +
+    "（op=search / content_detail / comments）；" +
+    "**跨平台横向对比只允许落在它返回的 comparison.metrics 上**，comparison.dropped 与 " +
+    "platformsSkipped 里的东西是缺失而非 0，必须照实写进 dataGaps。" +
+    "检索与采集结果都属 L3 公开且**未经人工核验**，引用必须带来源站点或平台账号，不得当作事实基准。" +
     "竞品至少给出 3 家，每家都要有 contentMatrix / sovTrend / differentiation；" +
     "声量份额与价格带占比取不到就写 null，**不要编造**。" +
-    "评论者的 IP 属地是有偏样本，**不是粉丝地域**，只能标为有偏代理。",
+    "评论者的 IP 属地是有偏样本，**不是粉丝地域**，只能标为有偏代理；" +
+    "**粉丝量与人群画像（性别/年龄/地域）平台侧拿不到**，不要试图从平台内容里推。",
   creator:
     "先用 kb_retrieve 找历史人选与复盘，再用 pricing_query 取报价区间、risk_screen 做风控；" +
-    "已有 sec_user_id / user_id 时，可用 douyin_creator / xhs_creator 补候选人的公开背景（粉丝量、作品互动）；" +
-    "**报价与成交价必须来自报价库**，不得用公开粉丝量去推算；公开采集不到就留 null；" +
+    "候选人的公开作品样本可用 platform_digest 的 creator 算子补（用于判断 contentFit，**不是**补粉丝量）；" +
+    "⚠️ **粉丝量与画像（性别/地域/年龄）七个平台都拿不到**（上游教学版已移除创作者资料落盘），" +
+    "followers 只能来自 pricing_query 或 KB-2，缺失时写 0 + 低 confidence 并在 rationale 说明「无授权来源」；" +
+    "**报价与成交价必须来自报价库**，不得用公开粉丝量或作品互动量去推算；公开采集不到就留 null；" +
     "risk_screen 要对**每一个候选**都跑，并把结论落到该候选的 riskFlags（不要只筛第一个）；" +
     "候选必须覆盖 head / mid / tail 三层，每层至少 1 人，并给出 contentFit 与 historicalPerformance；" +
     "报价库无样本时可用 web_search 补充公开背景，但**不得**据此虚构达人报价或成交价。",

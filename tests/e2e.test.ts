@@ -452,14 +452,12 @@ test("联网检索：来源由代码绑定、六阶段白名单全开、命中�
 
 test("联网检索：未配置 API Key 时适配器与工具都不注册", async () => {
   const dir = mkdtempSync(join(tmpdir(), "brandsale-websearch-off-"));
-  // 三个外部源的 baseUrl/Key 都显式清空：否则本机 .env 里配了任一项，
+  // 唯一外部源的 Key 显式清空：否则本机 .env 里配了它，
   // 工具总数断言就会随环境漂移 —— 测试不该依赖开发者本地配置。
   const config = loadConfig(process.cwd(), {
     BM_DATA_DIR: dir,
     BM_LLM_MODE: "mock",
     BM_WEB_SEARCH_API_KEY: "",
-    BM_DOUYIN_BASE_URL: "",
-    BM_XHS_BASE_URL: "",
   });
   const c = createContainer(config);
   try {
@@ -468,7 +466,7 @@ test("联网检索：未配置 API Key 时适配器与工具都不注册", async
     assert.equal(
       c.agentPack.registry.list().length,
       9,
-      "其余 9 个工具照常注册（工具总数为 14：其中 5 个绑定外部源的工具因能力未就绪而缺席）",
+      "其余 9 个工具照常注册（工具总数为 10：其中唯一的绑定外部源工具因能力未就绪而缺席）",
     );
     assert.ok(
       c.warnings.some((w) => w.includes("BM_WEB_SEARCH_API_KEY")),

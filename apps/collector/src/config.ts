@@ -1,0 +1,150 @@
+/**
+ * collector sidecar 自己的配置。
+ *
+ * 与主程序共用同一份 `.env`（复用 @brandsale/config 的解析器），但读的是
+ * **另一组变量**：collector 关心的是"内嵌采集内核在哪、用哪个 Python、数据落在哪"，
+ * 主程序关心的是"collector 在哪"（`BM_MC_COLLECTOR_URL`）。两者刻意分开命名，
+ * 避免"同一个变量在两边含义不同"这种最难排查的配置事故。
+ */
+
+import { existsSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { parseDotEnv } from "@brandsale/config";
+
+export interface CollectorConfig {
+  host: string;
+  port: number;
+
+  /** 内嵌采集内核目录（`services/collector-core`） */
+  coreDir: string;
+  /** 内核 Python 解释器的可执行路径 */
+  pythonBin: string;
+  /** 解释器从哪来的（排障用：BM_MC_PYTHON / coreDir/.venv / PATH） */
+  pythonSource: string;
+  /** 内核入口脚本 */
+  runPy: string;
+  /** 采集落盘根目录（传给内核 `--save-path`） */
+  dataDir: string;
+  /** 子进程日志目录 */
+  logDir: string;
+  /** 归一化结果的本地缓存目录 */
+  storeDir: string;
+
+  /** 采集时是否无头。本机扫码登录需要可见窗口，默认 false */
+  headless: boolean;
+  /**
+   * 浏览器启动模式，透传给内核 `--cdp`：
+   *   reuse = **常驻复用（默认）**：端口上有该平台的常驻浏览器就直接接上、没有才拉起，
+   *           且退出时不关闭它，留给同平台的下一个任务。端口由
+   *           `MEDIA_CRAWLER_PLATFORM_META[].cdpPort` 固定下发，collector 靠它回收。
+   *   auto  = 本机有 Chrome/Edge 就用它（免下载 chromium），否则用 playwright 自带 chromium
+   *   true  = 强制 CDP
+   *   false = 强制 playwright 自带 chromium（需要先 `playwright install chromium`）
+   *
+   * 默认从上游的 `auto` 改成 `reuse`：collector 每个采集任务都是一个新子进程，
+   * 而 `auto` 下每个子进程都会 launch 一次浏览器 —— 一次报告几十个任务就是几十次窗口闪烁。
+   */
+  cdpMode: CdpMode;
+  defaultMaxItems: number;
+  maxItemsCap: number;
+  /** 单次采集的等待上限（毫秒）。采集是分钟级，默认给 10 分钟（首次含扫码） */
+  crawlTimeoutMs: number;
+  /** 内核自检超时（毫秒）。要 import 全部平台依赖，给得比一般请求宽 */
+  envCheckTimeoutMs: number;
+  /**
+   * 是否让内核把账号昵称打码（`BM_MC_MASK_NICKNAME`）。
+   * 默认 **false** = 完整显示账号昵称（业主明确要求报告里的人选/账号不要 `****`）；
+   * 置 true 才退回上游的中间脱敏。该值会显式透传给内核子进程。
+   */
+  maskNickname: boolean;
+  /**
+   * 搜索完成后自动补采作者**个人主页资料**（粉丝数 / 关注数等）。
+   *
+   * 为什么默认开：平台的内容行里不带作者粉丝数（小红书只在个人主页的 `data-info`、
+   * 抖音只在 `user/profile/other` 接口），报告人选页的"粉丝量"一列此前恒为"未采集"。
+   * 补采是 `op=creator` + profile-only（只打一次主页接口，不抓作品），单次几秒。
+   * `maxAuthors` 限制一次搜索最多补几位作者 —— 一次搜索几十个作者全补会把平台刷爆。
+   * 关掉：`BM_MC_PROFILE_ENRICH=false`。
+   */
+  profileEnrich: { enabled: boolean; maxAuthors: number };
+}
+
+const num = (v: string | undefined, dflt: number): number => {
+  const n = Number(v);
+  return Number.isFinite(n) && v !== undefined && v !== "" ? n : dflt;
+};
+const bool = (v: string | undefined, dflt: boolean): boolean =>
+  v === undefined || v === "" ? dflt : /^(1|true|yes|on)$/i.test(v);
+const str = (v: string | undefined, dflt = ""): string => (v === undefined ? dflt : v);
+/**
+ * 浏览器启动模式。`reuse` 是 brandsale 相对上游的**默认值变更**：上游每次采集都新开
+ * 一个浏览器，而 collector 每个采集任务都是一个独立子进程，一次报告几十个任务
+ * 就是几十次窗口闪烁。reuse 让同平台任务复用同一个常驻窗口（详见 browser-session.ts）。
+ *
+ * 显式写了 `auto` / `true` / `false` 就照旧尊重；写错或没写一律落到 `reuse`。
+ */
+export type CdpMode = "auto" | "true" | "false" | "reuse";
+
+const cdpMode = (v: string | undefined): CdpMode => {
+  const t = (v ?? "").trim().toLowerCase();
+  if (t === "true" || t === "false" || t === "auto" || t === "reuse") return t;
+  return "reuse";
+};
+
+/**
+ * 选定内核解释器。优先级：
+ *   1. `BM_MC_PYTHON`（显式指定，排障或自定义环境时用）
+ *   2. `<coreDir>/.venv/{bin,Scripts}/python`（`npm run collector:setup` 建的那个）
+ *   3. PATH 上的 `python3`（兜底；若依赖没装，内核自检会明确报出来）
+ */
+function resolvePython(coreDir: string, configured: string): { bin: string; source: string } {
+  if (configured) return { bin: configured, source: "BM_MC_PYTHON" };
+  const candidates: [string, string][] = [
+    [join(coreDir, ".venv", "bin", "python"), "coreDir/.venv"],
+    [join(coreDir, ".venv", "Scripts", "python.exe"), "coreDir/.venv"],
+  ];
+  for (const [bin, source] of candidates) {
+    if (existsSync(bin)) return { bin, source };
+  }
+  return { bin: "python3", source: "PATH" };
+}
+
+export function loadCollectorConfig(cwd: string = process.cwd()): CollectorConfig {
+  const fileVars = parseDotEnv(resolve(cwd, ".env"));
+  // 真实环境变量优先于 .env（与主程序的优先级保持一致）
+  const get = (k: string, fallback?: string): string | undefined => process.env[k] ?? fileVars[k] ?? fallback;
+
+  // 内核默认就在本仓库内。找不到时也**不报错**——collector 仍可启动，
+  // /health 会把 coreDir / pythonBin / 自检结果明确报出来，便于定位。
+  const coreDir = resolve(cwd, str(get("BM_MC_CORE_DIR"), "services/collector-core"));
+  const dataDir = resolve(cwd, str(get("BM_MC_DATA_DIR"), join(coreDir, "data")));
+  const python = resolvePython(coreDir, str(get("BM_MC_PYTHON")));
+
+  return {
+    host: str(get("BM_COLLECTOR_HOST"), "127.0.0.1"),
+    port: num(get("BM_COLLECTOR_PORT"), 8890),
+
+    coreDir,
+    pythonBin: python.bin,
+    pythonSource: python.source,
+    runPy: join(coreDir, "run.py"),
+    dataDir,
+    logDir: resolve(cwd, str(get("BM_MC_LOG_DIR"), "./.data-collector/logs")),
+    storeDir: resolve(cwd, str(get("BM_COLLECTOR_DATA"), "./.data-collector")),
+
+    headless: bool(get("BM_MC_HEADLESS"), false),
+    cdpMode: cdpMode(get("BM_MC_CDP")),
+    defaultMaxItems: num(get("BM_MC_MAX_ITEMS"), 50),
+    maxItemsCap: num(get("BM_MC_MAX_ITEMS_CAP"), 200),
+    crawlTimeoutMs: num(get("BM_MC_CRAWL_TIMEOUT_MS"), 600_000),
+    envCheckTimeoutMs: num(get("BM_MC_ENV_CHECK_TIMEOUT_MS"), 60_000),
+
+    maskNickname: bool(get("BM_MC_MASK_NICKNAME"), false),
+    profileEnrich: {
+      enabled: bool(get("BM_MC_PROFILE_ENRICH"), true),
+      maxAuthors: num(get("BM_MC_PROFILE_ENRICH_MAX"), 12),
+    },
+  };
+}
+
+export const dataDirExists = (dir: string): boolean => existsSync(dir);

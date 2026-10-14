@@ -18,20 +18,20 @@
  * ── 用法 ────────────────────────────────────────────────────
  *
  *   npm run datasource:smoke
- *   npm run datasource:smoke -- --douyin-sec-user-id=MS4wLjABAAAA...
- *   npm run datasource:smoke -- --xhs-note-url='https://www.xiaohongshu.com/explore/xxx?xsec_token=yyy'
+ *   npm run datasource:smoke -- --query='美妆 精华 类目趋势 2026'
+ *   npm run datasource:smoke -- --mc-keyword='精华'
  *
  * 退出码：0 = 所有已配置的源都通；1 = 有源不通；未配置的源只提示、不算失败。
  */
 
-import { loadConfig, type Config } from "@brandsale/config";
-import { migrate, openDb } from "@brandsale/storage";
 import {
-  createRegistry,
-  DOUYIN_WEB_SOURCE_ID,
-  WEB_SEARCH_SOURCE_ID,
-  XHS_WEB_SOURCE_ID,
-} from "@brandsale/datasource";
+  loadConfig,
+  MEDIA_CRAWLER_PLATFORM_META,
+  MEDIA_CRAWLER_PLATFORMS,
+  type Config,
+} from "@brandsale/config";
+import { migrate, openDb } from "@brandsale/storage";
+import { createRegistry, WEB_SEARCH_SOURCE_ID } from "@brandsale/datasource";
 
 const argv = process.argv.slice(2);
 const opt = (name: string, dflt = ""): string => {
@@ -58,27 +58,21 @@ const probes: Probe[] = [
     envHint: "BM_WEB_SEARCH_API_KEY",
     params: { query: opt("query", "美妆 精华 类目趋势 2026") },
   },
-  {
-    sourceId: DOUYIN_WEB_SOURCE_ID,
-    label: "抖音公开内容（自托管采集）",
-    envHint: "BM_DOUYIN_BASE_URL",
-    params: { op: "profile", secUserId: opt("douyin-sec-user-id", "MS4wLjABAAAA_demo_1001") },
-    caveat: opt("douyin-sec-user-id") ? undefined : "用的是示例 sec_user_id，真实环境下请传入实际 ID",
-  },
-  {
-    sourceId: XHS_WEB_SOURCE_ID,
-    label: "小红书公开内容（自托管只读代理）",
-    envHint: "BM_XHS_BASE_URL",
-    params: { op: "note", noteId: opt("xhs-note-id", "demo_note_1") },
-    caveat: opt("xhs-note-id") || opt("xhs-note-url") ? undefined : "用的是示例 note_id，真实环境下建议传完整笔记 URL",
-  },
+  /* 七个平台采集源。它们共用 collector，所以"未配置"提示是同一组条件：
+   * 许可确认 + collector 地址 + collector 已在跑。逐个列出是为了让"只登录了
+   * 部分平台"这种情况一眼可见 —— 没登录的平台会在采集阶段报登录态失效。 */
+  ...MEDIA_CRAWLER_PLATFORMS.map((p) => {
+    const meta = MEDIA_CRAWLER_PLATFORM_META[p];
+    return {
+      sourceId: meta.sourceId,
+      label: `平台公开内容·${meta.displayName}（MediaCrawler）`,
+      envHint:
+        "BM_MC_ENABLED / BM_MC_LICENSE_ACK / BM_MC_COLLECTOR_URL（并确保 collector 已在跑；" +
+        "首次先 npm run collector:setup 准备内嵌内核的 Python 环境）",
+      params: { op: "search", keyword: opt("mc-keyword", "美妆 精华") },
+    } satisfies Probe;
+  }),
 ];
-// 传了 URL 就优先用 URL（真实 CLI 从 URL 里提取 xsec_token 命中率更高）
-const xhsNoteUrl = opt("xhs-note-url");
-if (xhsNoteUrl) {
-  const p = probes[2];
-  if (p) p.params = { op: "note", url: xhsNoteUrl };
-}
 
 // 内存库：只是为了满足 withCache 的依赖，不落盘、不污染 ./data
 const db = openDb(":memory:");
@@ -97,7 +91,7 @@ for (const probe of probes) {
   const adapter = registry.get(probe.sourceId);
   if (!adapter) {
     console.log(`○ ${probe.label}`);
-    console.log(`    未配置，跳过 —— 需要设置 ${probe.envHint}（本地联调可先跑 npm run datasource:lab）`);
+    console.log(`    未配置，跳过 —— 需要设置 ${probe.envHint}`);
     console.log("");
     continue;
   }
@@ -117,6 +111,10 @@ for (const probe of probes) {
     if (res.provenance.synthetic) {
       console.log("    ⚠️  synthetic=true 说明这是**联调假数据**，不可用于任何正式结论");
     }
+    if (res.rows.length === 0) {
+      console.log("    说明：本地无采集缓存（这是正常首次状态）。适配器已在后台排队一次采集，");
+      console.log("          等 collector 跑完后重跑本检查即可看到数据。");
+    }
     const sample = res.rows[0];
     if (sample) console.log(`    样例：${JSON.stringify(sample).slice(0, 220)}`);
     console.log("");
@@ -132,7 +130,11 @@ for (const probe of probes) {
 db.close();
 
 if (checked === 0) {
-  console.log("没有任何已配置的外部源 —— 三个源当前都缺席。填好 .env 后重跑本检查。");
+  console.log("没有任何已配置的外部源 —— 联网检索与平台采集当前都缺席。填好 .env 后重跑本检查。");
+  console.log(
+    "提示：平台采集需要三道门同时开：BM_MC_ENABLED=true、BM_MC_LICENSE_ACK=true、BM_MC_COLLECTOR_URL 已配，" +
+      "且 collector 已在跑（首次先 npm run collector:setup，再 npm run collector）。",
+  );
   process.exit(0);
 }
 

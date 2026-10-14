@@ -1,0 +1,11 @@
+{
+  "name": "@brandsale/collector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/main.ts",
+  "description": "MediaCrawler 只读归一化 sidecar：跑采集任务、归一化平台公开内容、供 brandsale 同步查询",
+  "dependencies": {
+    "@brandsale/config": "*"
+  }
+}

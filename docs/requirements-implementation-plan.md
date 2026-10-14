@@ -328,7 +328,26 @@ objectiveWeights / window / platforms / notes`），控制台是表单；`notes`
 
 ---
 
-### WP-E　抖音公开数据只读适配器（DTK）　`M`
+> **⚠️ 状态更新（2026-10-09）：WP-E / WP-F 已实施后又整体回退，随后由"七平台采集"取代。**
+> `douyin_web_public` 与 `xhs_web_public` 两条适配器、四个工具
+> （`douyin_creator` / `douyin_comments` / `xhs_creator` / `xhs_note`）、联调脚本
+> `scripts/datasource-lab.ts` 均已从代码中删除。
+>
+> 回退后产品方决定**改用 MediaCrawler 的采集内核**，覆盖七平台
+> （小红书 / 抖音 / 快手 / B站 / 微博 / 贴吧 / 知乎）。内核已**源码内嵌**进本仓库
+> （`services/collector-core/`，只保留采集必需部分），部署上只有 brandsale 一个系统；
+> 链路为 `services/collector-core` ──spawn──▶ `apps/collector`（归一化 + 缓存）
+> ← 七个 L3 适配器 + 七个平台工具。
+> 新工具名：`xhs_web` / `douyin_web` / `kuaishou_web` / `bilibili_web` / `weibo_web` /
+> `tieba_web` / `zhihu_web`（白名单 `["CI","CT"]`）。
+>
+> ⚠️ 该链路带**非商用许可**约束，必须显式打开 `BM_MC_LICENSE_ACK` 才装配。
+> 现状与运行手册见 [`docs/datasource-integration.md`](./datasource-integration.md)，
+> 选型与许可以及"为什么 WP-E/F 被取代"见
+> [`docs/datasource-platform-collection-analysis.md`](./datasource-platform-collection-analysis.md)。
+> 以下两节保留原始设计记录，**不代表当前代码状态**。
+
+### WP-E　抖音公开数据只读适配器（DTK）　`M`（已回退）
 
 **已核实的能力边界**（`docs/datasource-candidate-evaluation.md`）
 - 仓库：`Evil0ctal/Douyin_TikTok_Download_API`，20.5k star，Apache-2.0，最近提交 2026-10-02（活跃）
@@ -426,8 +445,8 @@ GET https://open.douyin.com/api/douyin/v1/user/fans_data/?open_id=...
 - 新增页由各自工作包负责（WP-B 加 2 页、WP-E/P 加节）
 - 来源声明页**无需改动**：`buildSourceCatalog()` 已自动合并「台账源 ∪ KB 语料源 ∪ 内部仓」，
   新登记的数据源会自动出现在可声明集合里
-- `packages/contracts/src/report.ts` 的 `LOGICAL_REFS` 新增 `tool:douyin_creator`、
-  `tool:douyin_comments`、`source:douyin_open_fans`（保持 `REF_ALIASES` 向后兼容）
+- `packages/contracts/src/report.ts` 的 `LOGICAL_REFS` 新增 `source:douyin_open_fans`（保持 `REF_ALIASES` 向后兼容）
+  - ~~`tool:douyin_creator` / `tool:douyin_comments`~~ —— 两个工具已随 WP-E 回退删除，不再新增
 - 深度策略：`minSlides` 维持 12（实际 15 页），`requiredBlockTypes` 不变
 
 ---

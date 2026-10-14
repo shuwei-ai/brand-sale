@@ -1,5 +1,11 @@
 # 数据源候选评估：DTK / xiaohongshu-cli
 
+> **⚠️ 状态（2026-10-09）：两个候选均未采纳，本文为历史评估记录。**
+> 基于本文的评估，曾接入 `douyin_web_public`（DTK）与 `xhs_web_public`（xhs 只读代理）
+> 两条适配器；随后于 2026-10-09 **整体移除**，理由与替代路径见
+> [`datasource-platform-collection-analysis.md`](./datasource-platform-collection-analysis.md)。
+> 本文对「两者都补不了 P0-3 粉丝画像」的判断仍然成立，并已被七平台评估再次验证。
+
 > 评估日期：2026-10-08 · 评估对象：
 > - `Evil0ctal/Douyin_TikTok_Download_API`（下称 **DTK**）
 > - `jackwener/xiaohongshu-cli`（下称 **xhs**）

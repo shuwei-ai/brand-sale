@@ -64,9 +64,20 @@ export class EventBus {
     };
   }
 
-  /** 回放历史（用于 Last-Event-ID 重连） */
-  replay(jobId: string, sinceSeq: number): JobStreamEvent[] {
-    return this.repos.events.since(jobId, sinceSeq).map((r) => ({ ...(r.payload as object), seq: r.seq, type: r.type }) as JobStreamEvent);
+  /**
+   * 回放历史（用于 Last-Event-ID 重连 / 新开页面全量回放）。
+   *
+   * `excludeTypes` 允许跳过整类事件。**全量回放时调用方必须排掉 `agent.delta`**：
+   * 那不是"状态"，而是已经渲染过的正文碎片 —— 一次任务 1.6 万条，
+   * 回放它们既挤占带宽（实测一个刷新就能灌 2700 帧），又会把真正的状态事件淹没。
+   * 断线续传（有 Last-Event-ID）则不该排，缺口里的正文要补上。
+   */
+  replay(jobId: string, sinceSeq: number, excludeTypes: JobStreamEventType[] = []): JobStreamEvent[] {
+    const skip = excludeTypes.length ? new Set<string>(excludeTypes) : null;
+    return this.repos.events
+      .since(jobId, sinceSeq)
+      .filter((r) => !skip?.has(r.type))
+      .map((r) => ({ ...(r.payload as object), seq: r.seq, type: r.type }) as JobStreamEvent);
   }
 
   /** Last-Event-ID 是否仍可回放 */

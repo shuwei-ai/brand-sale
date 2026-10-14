@@ -1,0 +1,147 @@
+# Milvus Standalone —— brandsale 知识库的向量索引
+#
+# 来源：官方 deployments/docker/standalone/docker-compose.yml，镜像钉死 milvusdb/milvus:v3.0.2。
+# 相对官方模板**只做五处改动**，其余逐行保持原样——目的是将来跟官方升级时能直接 diff：
+#
+#   1. 所有宿主机端口收敛到 127.0.0.1，不监听 0.0.0.0。
+#      Standalone 默认无鉴权，而本库装的是客户私域语料的向量（KB-2 租户私有数据），
+#      裸奔等于把客户数据的语义指纹挂在网上。详见 README「鉴权与暴露面」。
+#   2. MinIO 的宿主机端口映射去掉。Milvus 经容器网络访问 minio:9000，无需暴露；
+#      9001 控制台仅在排障时按需临时开（README 有命令）。
+#   3. 三个常驻服务补 `restart: unless-stopped`。**官方模板没有**，默认是 `no`——
+#      意味着重启 Docker Desktop / 宿主后 Milvus 不会自己起来，而它在本项目里是
+#      长期在线的旁路依赖，静默缺失会表现为「检索悄悄退化成纯 BM25」。一次性 init 容器不适用（保持 no）。
+#   4. standalone 补 `mem_limit: 3g`。两个作用：
+#      ① 它是 Milvus 那条刷屏 WARN（`failed to get container memory limit`）的**根因修复**——
+#         容器不设上限时 cgroup `memory.max` 读出来是 `max`，Milvus 每 0.5s 警告一次，
+#         实测占 standalone 日志的 **22%**，把有用的日志淹了；
+#      ② 顺带护住共用 VM（Docker Desktop 总内存仅 ~7.6GB，上面还跑着嵌入容器与其它项目）。
+#      本项目数据量级很小（几十份报告），实测空闲仅 ~380MB，3g 有近 8 倍余量。
+#      将来真要灌大数据集，先调大这里。
+#   5. 给三个常驻服务加日志轮转（`x-logging`，单容器上限 30MB）。官方模板没配，
+#      json-file 无上限。Milvus 冷启动有一段内部竞态会**在 2 秒内刷 36.8 万行**日志
+#      （见 README「正常长什么样」），百万行级别的突发足以把磁盘吃掉。
+#
+# 用法：
+#   cd infra/milvus && docker compose up -d
+#   curl http://127.0.0.1:9091/healthz     # 预期 OK
+#
+# 数据落在 ./volumes/（已 gitignore，**切勿提交**）。
+# 删掉整个 volumes/ 目录不会丢任何东西——SQLite 才是知识库的唯一真相源，
+# 这里只是可重建的索引。重建命令见 README。
+
+version: '3.5'
+
+x-milvus-image: &milvus-image milvusdb/milvus:v3.0.2
+
+# 改动 5：日志轮转。官方模板没配，默认 json-file 且无上限。
+# 不是理论问题：Milvus 冷启动时会有一段内部竞态（streamingnode 的 assignment discover
+# client 热重试 root coordinator），实测 **2 秒内写入 36.8 万行**、单次启动总量百万行。
+# 长期在线的服务必须封顶，否则容器日志会无限涨。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"      # 单容器最多 3×10m = 30MB
+
+services:
+  # 一次性容器：把 /var/lib/milvus 的属主校正给 milvus 用户。
+  # 官方模板自带，不要删——bind mount 出来的目录属主是宿主用户，
+  # 少了它 standalone 会因为写不了数据目录而反复重启。
+  milvus-volume-init:
+    image: *milvus-image
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        uid="$$(id -u milvus)"
+        gid="$$(id -g milvus)"
+        marker="/var/lib/milvus/.milvus-volume-owner-$${uid}-$${gid}"
+        if [ ! -e "$${marker}" ]; then
+          echo "Preparing /var/lib/milvus for $${uid}:$${gid}"
+          chown -R "$${uid}:$${gid}" /var/lib/milvus
+          touch "$${marker}"
+          chown "$${uid}:$${gid}" "$${marker}"
+        fi
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.25
+    restart: unless-stopped   # 改动 3：官方模板无此键，默认 no
+    logging: *default-logging # 改动 5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    container_name: milvus-minio
+    image: milvusdb/minio:RELEASE.2024-12-18T13-15-44Z
+    restart: unless-stopped   # 改动 3：官方模板无此键，默认 no
+    logging: *default-logging # 改动 5
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  standalone:
+    container_name: milvus-standalone
+    image: *milvus-image
+    restart: unless-stopped   # 改动 3：官方模板无此键，默认 no
+    logging: *default-logging # 改动 5
+    # 改动 4：给 Milvus 一个**可读**的内存上限。不设时 cgroup memory.max 是 `max`，
+    # 它会每 0.5s 打一条 `failed to get container memory limit`（占日志 22%）。
+    # 本项目数据量小、实测空闲 ~380MB，3g 余量充足；灌大数据集前先调大。
+    mem_limit: 3g
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+    - seccomp:unconfined
+    environment:
+      MINIO_REGION: us-east-1
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      # 只绑回环地址，不监听 0.0.0.0（见文件头说明 1）
+      - "127.0.0.1:19530:19530"   # gRPC：Node SDK 连接用
+      - "127.0.0.1:9091:9091"     # RESTful / 健康检查
+    depends_on:
+      milvus-volume-init:
+        condition: service_completed_successfully
+      etcd:
+        condition: service_started
+      minio:
+        condition: service_started
+
+networks:
+  default:
+    name: milvus

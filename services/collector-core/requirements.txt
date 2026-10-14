@@ -1,0 +1,29 @@
+# brandsale 内嵌采集内核（MediaCrawler 派生）运行依赖
+#
+# 这是**裁剪后**的清单，只保留七平台采集与扫码登录真正用到的库。
+# 相比上游 pyproject.toml 移除了：
+#   · 数据库类：sqlalchemy / alembic / aiomysql / asyncmy / asyncpg / motor / redis / aiosqlite
+#     （上游 database/ 存储层整体未引入，store 已裁为 json/jsonl-only）
+#   · 数据分析类：pandas / matplotlib / openpyxl
+#   · 词云类：jieba / wordcloud（词云默认关闭，tools/words.py 改为按需导入）
+#   · 上游 CLI/Web 类：typer / fastapi / uvicorn / python-dotenv（由 run.py 与 collector 取代）
+#
+# 安装：bash services/collector-core/setup.sh
+
+playwright>=1.61.0
+httpx==0.28.1
+tenacity==8.2.2
+aiofiles>=23.2.1
+pydantic>=2.13.4
+parsel==1.9.1
+# pyexecjs 执行抖音 a_bogus / 知乎 x-zse 签名 JS；需要有可用的 JS 运行时（复用本项目的 Node）
+pyexecjs==1.5.1
+pyhumps>=3.8.0
+# 小红书签名算法库
+xhshow>=0.2.0
+pillow>=10.0.0
+# 滑块验证码识别（媒体平台登录时才触发）
+numpy>=1.26.0
+opencv-python>=4.11.0.86
+# 贴吧客户端仍在用 requests
+requests>=2.32.0

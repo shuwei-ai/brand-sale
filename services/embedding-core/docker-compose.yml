@@ -1,0 +1,67 @@
+# brandsale 嵌入服务（EmbeddingGemma 2）—— Docker 本地部署
+#
+#   docker compose -f services/embedding-core/docker-compose.yml up -d --build
+#   docker compose -f services/embedding-core/docker-compose.yml logs -f
+#   docker compose -f services/embedding-core/docker-compose.yml down
+#
+# 或直接用仓库里的 npm 脚本：npm run embedding:up / embedding:logs / embedding:down
+#
+# 对外发布 http://127.0.0.1:8899（OpenAI 兼容 POST /v1/embeddings），
+# 品牌营销智能体侧只需把 BM_EMBED_URL 指过去即可
+# （`packages/knowledge/src/semantic-memory.ts` 的 semanticMemoryFromEnv() 默认值就是这个地址）。
+#
+# 与宿主机原生运行（.venv + MPS）的区别：容器内**只能用 CPU**
+# （Docker Desktop for Mac 不做 GPU 透传）。功能与向量口径完全一致（float32），
+# 只是单批耗时略长——宿主 MPS 约 1.2s 加载、容器 CPU 约数秒。
+#
+# 注意端口冲突：宿主原生的 serve.py 也用 8899。切到容器前先停掉宿主进程，
+# 否则 `docker compose up` 会因端口被占而失败。
+#   pkill -f "embedding-core/serve.py"
+
+services:
+  embedding:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: brandsale/embedding-core:1.0.0
+    container_name: brandsale-embedding
+    restart: unless-stopped
+    ports:
+      # 与 infra/milvus 同样的口径：只绑回环，不监听 0.0.0.0。
+      # 本服务**无鉴权**，暴露到局域网等于把客户语料的语义指纹挂在网上。
+      - "127.0.0.1:8899:8899"
+    environment:
+      # 容器内必须绑 0.0.0.0，否则宿主端口映射进来会被拒（serve.py 默认 127.0.0.1 是给宿主用的）
+      EMBED_HOST: 0.0.0.0
+      EMBED_PORT: "8899"
+      # 容器里没有 MPS
+      EMBED_DEVICE: cpu
+      # 绝不 float16：模型卡警告会静默返回 NaN
+      EMBED_DTYPE: float32
+      EMBED_TEXT_ONLY: "1"
+      EMBED_DIM: "768"
+      EMBED_MODEL_DIR: /app/models/embeddinggemma-2
+      EMBED_MAX_BATCH: "64"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8899/health',timeout=5).status==200 else 1)"
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    # 270M float32 文本塔常驻约 2.0GB（实测 1.99GiB）。给到 3g 留出批量激活的余量，
+    # 同时避免它跑飞把同 VM 上的 Milvus / 其它容器挤爆
+    # （Docker Desktop VM 总内存只有 ~7.6GB，且上面还跑着 Milvus 与别的项目）。
+    mem_limit: 3g
+    # 若将来把 Node 网关也容器化、需要按容器名互访，取消下面两行注释，
+    # 让它接入 Milvus 所在的 compose 网络（需先 `cd infra/milvus && docker compose up -d`）。
+    # networks:
+    #   - milvus
+
+# networks:
+#   milvus:
+#     name: milvus
+#     external: true

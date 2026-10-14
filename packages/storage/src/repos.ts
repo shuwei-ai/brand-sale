@@ -23,6 +23,7 @@ import type {
   TokenUsage,
   UsageSummary,
 } from "@brandsale/contracts";
+import { DELTA_BUFFER_SIZE, EVENT_BUFFER_SIZE } from "@brandsale/contracts";
 import { type Db, newId, nowIso, parseJson, stringify } from "./db.ts";
 
 /* ── 任务 ───────────────────────────────────────────────── */
@@ -119,11 +120,34 @@ export class JobRepo {
     );
   }
 
+  /**
+   * 追加一条降级记录。**同 (reason, sources) 分组内合并 missing，而不是覆盖**。
+   *
+   * 覆盖会静默吞掉同组更早的项：实测一个真机 job 的渲染期有 5 处自动修复，
+   * 上报时只剩最后 1 条（用户看到"降级与缺失（1 项）"，实际 5 项），
+   * 报告的可信度说明被系统性低报。合并后计数如实。
+   */
   addDegraded(jobId: string, degraded: Degraded): void {
     const job = this.get(jobId);
     if (!job) return;
-    const list = [...job.degraded.filter((d) => d.reason !== degraded.reason || d.sources?.join() !== degraded.sources?.join()), degraded];
+    const sameGroup = (d: Degraded): boolean =>
+      d.reason === degraded.reason && d.sources?.join() === degraded.sources?.join();
+    const prev = job.degraded.filter(sameGroup);
+    const merged: Degraded =
+      prev.length === 0
+        ? degraded
+        : {
+            ...prev[0]!,
+            missing: [...new Set([...prev.flatMap((p) => p.missing), ...degraded.missing])],
+            note: [...new Set([...prev.map((p) => p.note), degraded.note].filter((n): n is string => !!n))].join("；"),
+          };
+    const list = [...job.degraded.filter((d) => !sameGroup(d)), merged];
     this.db.run("UPDATE jobs SET degraded_json = ?, updated_at = ? WHERE job_id = ?", stringify(list), nowIso(), jobId);
+  }
+
+  /** 重跑阶段前清空降级记录：原因已修复的旧记录不该跟着重跑一起"复活" */
+  clearDegraded(jobId: string): void {
+    this.db.run("UPDATE jobs SET degraded_json = '[]', updated_at = ? WHERE job_id = ?", nowIso(), jobId);
   }
 
   /** 崩溃恢复：找出所有未终态任务 */
@@ -328,7 +352,15 @@ export class IdempotencyRepo {
 /* ── 事件环形缓冲 ───────────────────────────────────────── */
 
 export class EventRepo {
-  constructor(private db: Db, private capacity = 2000) {}
+  constructor(
+    private db: Db,
+    /**
+     * 状态类事件的保留条数。
+     * `agent.delta` 走另一个更小的桶（见 `deltaCapacity`），理由见 contracts/events.ts。
+     */
+    private capacity = EVENT_BUFFER_SIZE,
+    private deltaCapacity = DELTA_BUFFER_SIZE,
+  ) {}
 
   append(jobId: string, seq: number, type: string, payload: unknown): void {
     this.db.run(
@@ -339,14 +371,19 @@ export class EventRepo {
       stringify(payload),
       nowIso(),
     );
-    // 环形裁剪：只保留最近 capacity 条
+    /* 环形裁剪：**按类型分桶**，只裁自己那一类，避免 delta 洪水把状态事件挤掉。
+     *
+     * 必须按「条数」而不是「MAX(seq) - 容量」来裁：分桶之后同一类的 seq 是**稀疏**的
+     * （中间夹着另一类事件），`MAX(seq) - capacity` 会把窗口算得比实际大得多 ——
+     * 实测 40 条状态事件会被误删 30 条。这里改成"保留最新 N 条"的直白语义。 */
+    const keep = type === "agent.delta" ? this.deltaCapacity : this.capacity;
     this.db.run(
-      `DELETE FROM job_events WHERE job_id = ? AND seq <= (
-         SELECT MAX(seq) - ? FROM job_events WHERE job_id = ?
+      `DELETE FROM job_events WHERE rowid IN (
+         SELECT rowid FROM job_events WHERE job_id = ? AND type = ? ORDER BY seq DESC LIMIT -1 OFFSET ?
        )`,
       jobId,
-      this.capacity,
-      jobId,
+      type,
+      keep,
     );
   }
 

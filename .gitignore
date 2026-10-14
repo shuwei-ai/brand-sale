@@ -4,12 +4,23 @@ dist/
 *.tsbuildinfo
 
 # 环境变量（含 BM_LLM_API_KEY / BM_WEB_SEARCH_API_KEY），只提交 .env.example
+# .env.* 覆盖 .env.bak.* / .env.local 等一切变体——本次差点把含真密钥的
+# .env.bak.20261012-* 推上公开仓库（2026-10-14）。!.env.example 负责放行模板。
 .env
+.env.*
+!.env.example
 
 # 运行时数据库目录（sqlite + WAL/SHM）。注意 .data-*/ 覆盖 .data-live / .data-console / .data-test
 .data/
 .data-*/
 .data-backup-*/
+
+# Milvus 数据卷（向量索引 + etcd + minio）。可重建，且含客户语料的语义指纹，不入库
+infra/milvus/volumes/
+
+# 嵌入服务的 Python 环境与模型权重（约 1.4GB，由 npm run embedding:setup 重建）
+services/embedding-core/.venv/
+services/embedding-core/models/
 
 # 生成的报告产物（HTML / Markdown / DSL JSON）
 out/

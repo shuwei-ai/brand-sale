@@ -5,15 +5,23 @@
  * 适配器的工厂函数不导出给 AgentPack 之外的模块，由 `createGateBoundAdapterRegistry()`
  * 在装配时注入闸门引用，避免任何模块绕过闸门直连数据源。
  *
- * **当前数据现实**：本包有**三个**适配器，全部 `synthetic: false`，全部按 L3 处理：
+ * **当前数据现实**：本包有**两类**适配器，全部 `synthetic: false`，全部按 L3 处理：
  *   1. `volc_web_search` —— 联网检索（web-search.ts），火山引擎联网搜索 API 抓公开网页；
- *   2. `douyin_web_public` —— 抖音公开内容（douyin-web.ts），自托管 DTK，只读子集；
- *   3. `xhs_web_public` —— 小红书公开内容（xiaohongshu.ts），自托管**只读**代理。
+ *   2. `mc_xhs` / `mc_dy` / `mc_ks` / `mc_bili` / `mc_wb` / `mc_tieba` / `mc_zhihu`
+ *      —— 七平台公开内容采集（media-crawler.ts），经 `apps/collector` sidecar
+ *      复用 MediaCrawler。每个平台一个源，按 `config.mediaCrawler.platforms` 逐个装配。
  *
- * 后两个都是"平台内公开内容"，补的是 web_search 抓不到的达人/作品/评论维度。
- * 没有一个是 L1：与平台之间不存在授权合同，标成 L1 等于把公开采集洗成甲方授权实测。
+ * 两类都是"公开但未经人工核验"，分级是 L3、**不是 L1**：与平台之间不存在授权合同，
+ * 标成 L1 等于把公开采集洗成甲方授权实测。L3 源还禁止填 contractRef
+ * （governance 的 assertSourceRegistration 会以 E-GOV-005 从写入口拦下）。
+ *
+ * ⚠️ 七个平台源的装配还多一道**许可证闸**：MediaCrawler 为非商用许可，
+ * 只有 `config.mediaCrawler.licenseAcknowledged === true` 时才会装配（见 media-crawler.ts 文件头）。
+ * 未开启时它们整体缺席，报告如实写"无平台数据"——这比留一条"看起来有平台数据"的
+ * 窄通道、却让人误以为是授权实测更安全。
+ *
  * 真正的 L1（抖音开放平台 fans_data 粉丝画像）需要企业主体 + 权限审批 + 达人 OAuth，
- * 未就绪之前**不注册**——这正是下面这段历史教训的延续：
+ * 未就绪之前**不注册**——这也是下面这段历史教训的延续：
  *
  * 早先随 Phase 0 纵切一起进来的 5 个合成适配器（千川 / 星图 / 蒲公英 / 生意参谋 / 巨量算数）
  * 已整体移除：它们只输出确定性伪随机数（`synthetic: true`），从未接入真实平台，
@@ -28,8 +36,7 @@ import type { Config } from "@brandsale/config";
 import type { Db } from "@brandsale/storage";
 import { parseJson, stringify } from "@brandsale/storage";
 import { WEB_SEARCH_SOURCE_ID, createWebSearchAdapter } from "./web-search.ts";
-import { DOUYIN_WEB_SOURCE_ID, createDouyinWebAdapter } from "./douyin-web.ts";
-import { XHS_WEB_SOURCE_ID, createXhsWebAdapter } from "./xiaohongshu.ts";
+import { createMediaCrawlerAdapters } from "./media-crawler.ts";
 
 /** 确定性哈希：仅用于缓存键，保证同输入同输出，便于回归与复现 */
 export function hashSeed(text: string): number {
@@ -45,12 +52,21 @@ export interface Provenance {
   sourceId: string;
   sourceName: string;
   tier: DataTier;
-  /** 是否为合成值。当前唯一的适配器抓的是真实网页，恒为 false */
+  /** 是否为合成值。当前所有适配器抓的都是真实外部内容，恒为 false */
   synthetic: boolean;
   asOf: string;
   /** 取数口径的人类可读说明，直接写进报告脚注 */
   note: string;
   rowCount: number;
+  /**
+   * 本次取数是**命中本地缓存**还是真打了一次外部源。
+   *
+   * 为什么要有这个结构化字段：下游台账原来靠 `note.includes("缓存")` 判断，
+   * 而采集侧的说明里有一句"本次无本地缓存，已排队采集" —— 于是**未命中被记成命中**
+   * （实测台账 mc_xhs cached=true 却 rowCount=0）。缓存命中率是运营指标，
+   * 靠文案匹配迟早会错，命中与否只有缓存包装层自己知道。
+   */
+  cacheHit?: boolean;
 }
 
 export interface DataResult<T> {
@@ -99,17 +115,27 @@ export function withCache(db: Db, adapter: DataSourceAdapter, ttlSeconds: number
         const parsed = parseJson<{ rows: Record<string, unknown>[]; provenance: Provenance }>(hit.payload, { rows: [], provenance: {} as Provenance });
         return {
           rows: parsed.rows,
-          provenance: { ...parsed.provenance, note: `${parsed.provenance.note}（命中缓存）` },
+          provenance: { ...parsed.provenance, cacheHit: true, note: `${parsed.provenance.note}（命中缓存）` },
         };
       }
       const res = await adapter.fetch(query, config);
+      /* **空结果不进缓存**。
+       *
+       * 采类适配器（媒体采集、联网检索）返回空，最常见的两种原因是
+       * "还没采过 / 还没配好"，都是**临时状态**而不是结论。一旦把空结果按
+       * TTL（30 分钟）缓存下来，"首次调用排队采集 → 稍后重试"这条自愈路径
+       * 就会被自己的缓存堵死：重试仍然命中那条空缓存，永远等不到数据。
+       * 所以只缓存有内容的响应。代价是空结果会让下游多打一次适配器，
+       * 但这个代价远小于"看起来永远没数据"。 */
+      const stamped: DataResult<Record<string, unknown>> = { ...res, provenance: { ...res.provenance, cacheHit: false } };
+      if (res.rows.length === 0) return stamped;
       db.run(
         "INSERT OR REPLACE INTO external_cache (cache_key, payload, expires_at) VALUES (?, ?, ?)",
         key,
         stringify({ rows: res.rows, provenance: res.provenance }),
         new Date(Date.now() + ttlSeconds * 1000).toISOString(),
       );
-      return res;
+      return stamped;
     },
   };
 }
@@ -148,22 +174,19 @@ export class DataSourceRegistry {
 /**
  * 装配注册表。
  *
- * 三条真实外部源，各自**可选**：未配置就整体不注册，下游（M10 工具层）据此判断
- * 「能力是否就绪」，未就绪则不把对应工具暴露给 Agent —— 避免 Agent 反复调用一个
- * 必然失败的工具、把预算烧在重试上。
+ * 两类外部源，各自**按就绪条件**装配，未就绪就整体不注册，下游（M10 工具层）据此
+ * 判断「能力是否就绪」，未就绪则不把对应工具暴露给 Agent —— 避免 Agent 反复调用
+ * 一个必然失败的工具、把预算烧在重试上。
  *
- * 注册条件刻意不同，原因是凭据形态不同：
+ * 就绪条件刻意不同，因为凭据形态不同：
  *   · web_search：`enabled && apiKey`（火山引擎按 Key 计费，没 Key 就是没能力）
- *   · douyin / xiaohongshu：`enabled && baseUrl`（打的是自托管服务，地址在则能力在；
- *     抖音的 apiKey 只在 v5 需要，小红书的令牌是可选的代理鉴权）
+ *   · 平台采集：`enabled && licenseAcknowledged && collectorBaseUrl`，且逐平台看开关
+ *     （自托管 sidecar，地址在则能力在；许可确认是硬门槛，见 media-crawler.ts 文件头）
  */
 export function createRegistry(db: Db, config: Config): DataSourceRegistry {
   const webSearch = config.webSearch.enabled && config.webSearch.apiKey ? [createWebSearchAdapter(config)] : [];
-  const douyin = config.douyin.enabled && config.douyin.baseUrl ? [createDouyinWebAdapter(config)] : [];
-  const xiaohongshu = config.xiaohongshu.enabled && config.xiaohongshu.baseUrl ? [createXhsWebAdapter(config)] : [];
-  const adapters = [...webSearch, ...douyin, ...xiaohongshu].map((a) =>
-    withCache(db, a, a.cacheTtlSeconds ?? 3600),
-  );
+  const mediaCrawler = createMediaCrawlerAdapters(config);
+  const adapters = [...webSearch, ...mediaCrawler].map((a) => withCache(db, a, a.cacheTtlSeconds ?? 3600));
   return new DataSourceRegistry(adapters);
 }
 
@@ -174,13 +197,19 @@ export function mergeProvenance(list: Provenance[]): { sources: Provenance[]; an
 
 export const money = (amount: number): Money => ({ currency: "CNY", amount });
 
-/* ── 三条真实外部源 ─────────────────────────────────────── */
+/* ── 联网检索 ───────────────────────────────────────────── */
 
 export { createWebSearchAdapter, WEB_SEARCH_SOURCE_ID } from "./web-search.ts";
 export type { WebSearchItem } from "./web-search.ts";
 
-export { createDouyinWebAdapter, DOUYIN_WEB_SOURCE_ID } from "./douyin-web.ts";
-export type { DouyinCreator, DouyinWork, DouyinComment, DouyinOp } from "./douyin-web.ts";
+/* ── 七平台公开内容采集（MediaCrawler / collector sidecar）── */
 
-export { createXhsWebAdapter, XHS_WEB_SOURCE_ID } from "./xiaohongshu.ts";
-export type { XhsNote, XhsComment, XhsUser, XhsOp } from "./xiaohongshu.ts";
+export {
+  createMediaCrawlerAdapter,
+  createMediaCrawlerAdapters,
+  mediaCrawlerReady,
+  mediaCrawlerPlatformReady,
+  MEDIA_CRAWLER_SOURCE_IDS,
+  /** rows 里的"作者主页资料行"标记（粉丝量等）：下游据此与内容行分流 */
+  CREATOR_ROW_TYPE,
+} from "./media-crawler.ts";

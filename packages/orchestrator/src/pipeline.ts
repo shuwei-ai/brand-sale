@@ -23,6 +23,7 @@ import {
   type PhaseName,
   type PhaseRunInput,
   type PhaseState,
+  type ReportDsl,
   type StartJobInput,
   type TenantContext,
   type UsageSummary,
@@ -48,6 +49,18 @@ export interface OrchestratorDeps {
   agentPack: AgentPack;
   render: RenderService;
   bus: EventBus;
+  /**
+   * 报告产出后的收尾钩子（可选，**best-effort**）。
+   *
+   * 为什么做成注入的回调、而不是在这里直接调 knowledge：
+   *   依赖矩阵是 `apps → orchestrator → agent-pack → knowledge`，
+   *   orchestrator **不允许**依赖 knowledge。把"报告摘要回灌"这件事放在装配层
+   *   （container，它可以同时看到两边），编排层只负责在正确的时机调用它。
+   *
+   * 契约：**不得抛错**；万一异常由编排层捕获并记 degraded，绝不影响任务成败——
+   * 回灌是"锦上添花"，不是报告产出的一部分。
+   */
+  onReportReady?: (input: { job: JobRecord; dsl: ReportDsl; ctx: TenantContext }) => Promise<void>;
 }
 
 const ARTIFACT_KIND_BY_PHASE: Record<PhaseName, ArtifactKind> = {
@@ -192,6 +205,12 @@ export class Orchestrator implements IOrchestratorPort {
         if (existing && (existing.status === "succeeded" || existing.status === "partial")) {
           // 断点续跑：该阶段已完成，直接复用
           upstream[phase] = existing.output;
+          this.deps.repos.jobs.setStatus(jobId, "running", (i + 1) / PHASE_ORDER.length, phase);
+          this.deps.bus.publish(jobId, {
+            type: "job.status",
+            status: "running",
+            progress: { percent: (i + 1) / PHASE_ORDER.length, currentPhase: phase },
+          });
           this.deps.bus.publish(jobId, {
             type: "phase.complete",
             phase,
@@ -204,6 +223,10 @@ export class Orchestrator implements IOrchestratorPort {
         const attempt = (existing?.attempts ?? 0) + 1;
         this.deps.repos.phases.ensure(jobId, phase);
         this.deps.repos.phases.markStarted(jobId, phase, attempt);
+        /* 进度必须**同时落库**：列表页（5s 轮询）与详情页刷新后都只读 `jobs.progress`。
+         * 只 publish 不写库是曾经的 bug —— 运行期 percent 恒为 0，
+         * 前端刷得再勤也拿不到真实进度（job_phases 早已跑到 report，列表仍显示 0%）。 */
+        this.deps.repos.jobs.setStatus(jobId, "running", i / PHASE_ORDER.length, phase);
         this.deps.bus.publish(jobId, { type: "phase.start", phase, estimatedMs: PHASE_ESTIMATE_MS[phase] });
         this.deps.bus.publish(jobId, {
           type: "job.status",
@@ -276,6 +299,8 @@ export class Orchestrator implements IOrchestratorPort {
           }
         }
 
+        // 阶段收尾：进度同样落库（列表页/刷新后的进度条都读这里）
+        this.deps.repos.jobs.setStatus(jobId, "running", (i + 1) / PHASE_ORDER.length, phase);
         this.deps.bus.publish(jobId, {
           type: "job.status",
           status: "running",
@@ -284,8 +309,16 @@ export class Orchestrator implements IOrchestratorPort {
       }
 
       // 渲染报告
-      await this.renderReport(jobId, ctx, upstream);
+      const rendered = await this.renderReport(jobId, ctx, upstream);
       this.assertAlive();
+
+      /* 报告收尾：把机械抽取的摘要回灌知识库（best-effort，失败只记 degraded）。
+       * 只在**渲染确实成功**时做：渲染被拒说明这份 DSL 没通过不变量校验，
+       * 把它投影成摘要存进知识库，等于让一份不合格产物进入后续检索。 */
+      if (rendered) {
+        await this.runReportHook(jobId, ctx, upstream);
+        this.assertAlive();
+      }
 
       const job = this.deps.repos.jobs.get(jobId)!;
       const degraded = job.degraded.length > 0 || this.deps.repos.phases.list(jobId).some((p) => p.status === "partial" || p.status === "failed");
@@ -307,14 +340,21 @@ export class Orchestrator implements IOrchestratorPort {
     this.deps.repos.artifacts.addIfAbsent(jobId, ARTIFACT_KIND_BY_PHASE[phase], { inline: output });
   }
 
-  private async renderReport(jobId: string, ctx: TenantContext, upstream: Partial<Record<PhaseName, unknown>>): Promise<void> {
+  /**
+   * 报告渲染。返回是否**成功产出**（false = 被校验拒绝或上游缺产物）。
+   *
+   * 返回值不是可有可无的：`renderReport` 内部把失败吞成 degraded（这是对的，
+   * 失败不该让整条任务链崩掉），但调用方需要知道"到底有没有产出报告"，
+   * 才能决定要不要把摘要回灌知识库。
+   */
+  private async renderReport(jobId: string, ctx: TenantContext, upstream: Partial<Record<PhaseName, unknown>>): Promise<boolean> {
     const dsl = upstream.report;
-    if (!dsl) return;
+    if (!dsl) return false;
     try {
       /* 来源目录由 agent-pack（内部走 governance）组装后**以纯数据传入** render ——
        * render 包只允许依赖 contracts/config，不允许在渲染期查库。
        * 少了这一步，渲染期兜底校验就无法识别「未登记来源」，收紧后的 R1~R4 会全部静默跳过。 */
-      const catalog = this.deps.agentPack.sourceCatalog(ctx);
+      const catalog = this.deps.agentPack.sourceCatalog(ctx, jobId);
       const compiled = await this.deps.render.compile(dsl as never, {
         catalog,
         minTraceableRatio: DEFAULT_DEPTH_POLICY.minTraceableRatio,
@@ -322,19 +362,47 @@ export class Orchestrator implements IOrchestratorPort {
       this.assertAlive();
       this.deps.repos.artifacts.addIfAbsent(jobId, compiled.kind === "html" ? "report_html" : "report_markdown", { inline: compiled.ref.inline });
       this.deps.repos.artifacts.addIfAbsent(jobId, "report_markdown", {
-        inline: this.deps.render.toMarkdown(dsl as never),
+        // 目录一起传：条目级引用的 URL/发布时间靠它反查（否则 Markdown 里只剩 entryId）
+        inline: this.deps.render.toMarkdown(dsl as never, { catalog }),
       });
       this.deps.bus.publish(jobId, { type: "artifact.ready", kind: "report_html" });
       for (const r of compiled.repairs) {
+        // cosmetic = 结构页/免责页上的装饰性引用修复，内容语义零损伤，
+        // 不计入 degraded（否则"免责页引用写法不规范"会把完好报告标成「产出不完整」）。
+        if (r.severity === "cosmetic") continue;
         this.deps.repos.jobs.addDegraded(jobId, { missing: [r.action], reason: "partial_output", note: "渲染期自动修复" });
       }
       for (const d of compiled.dropped) {
         this.deps.repos.jobs.addDegraded(jobId, { missing: [d.content], reason: "partial_output", note: `渲染期丢弃：${d.reason}` });
       }
+      return true;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.deps.repos.jobs.addDegraded(jobId, { missing: [msg], reason: "partial_output", note: "报告渲染被拒（DSL 校验失败）" });
       this.deps.bus.publish(jobId, { type: "job.error", code: "E-RENDER-001", retryable: false, traceId: ctx.traceId });
+      return false;
+    }
+  }
+
+  /**
+   * 调用注入的报告收尾钩子。
+   *
+   * **必须吞掉一切异常**：回灌知识库是可选增强，它失败不该把一份已经渲染成功的
+   * 报告标成 failed。失败记 degraded（"产出完整性"里会如实列出），任务照常收尾。
+   */
+  private async runReportHook(jobId: string, ctx: TenantContext, upstream: Partial<Record<PhaseName, unknown>>): Promise<void> {
+    const hook = this.deps.onReportReady;
+    if (!hook) return;
+    const dsl = upstream.report as ReportDsl | undefined;
+    if (!dsl) return;
+    const job = this.deps.repos.jobs.get(jobId);
+    if (!job) return;
+    try {
+      await hook({ job, dsl, ctx });
+    } catch (e) {
+      if (e instanceof JobAbortedError || this.shuttingDown) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      this.deps.repos.jobs.addDegraded(jobId, { missing: [msg], reason: "unavailable", note: "报告摘要回灌失败（不影响报告本身）" });
     }
   }
 
@@ -381,12 +449,17 @@ export class Orchestrator implements IOrchestratorPort {
    *     必须从头回放，否则前端拿不到已发生的事件、进度条永远停在 0。
    *   - `-1`：显式要求从头回放。
    *   - `>= 0`：断线重连，从该 seq 之后续传；若事件缓冲已过期则退化为一次视图快照。
+   *
+   * 全量回放（`from < 0`）会跳过 `agent.delta`：回放要解决的是"界面状态重建"，
+   * 而不是重放几十万字符的正文碎片（那只会把状态事件挤出带宽与注意力）。
+   * 因此前端在刷新后应当把流式正文视为"从当前时刻重新开始"。
    */
   subscribe(jobId: string, sinceSeq: number | null, listener: (e: JobStreamEvent) => void): () => void {
     const from = sinceSeq ?? -1; // 不带 = 从头回放
+    const fullReplay = from < 0;
 
     if (this.deps.bus.canReplay(jobId, from)) {
-      for (const e of this.deps.bus.replay(jobId, from)) listener(e);
+      for (const e of this.deps.bus.replay(jobId, from, fullReplay ? ["agent.delta"] : [])) listener(e);
     } else {
       // 缓冲区已过期 → 推一次视图快照，客户端据此重建界面
       const job = this.deps.repos.jobs.get(jobId);
@@ -420,6 +493,8 @@ export class Orchestrator implements IOrchestratorPort {
     if (!job) throw new AppError({ code: "E-AUTH-002", message: "任务不存在或不属于该租户" });
     const idx = PHASE_ORDER.indexOf(phase);
     const downstream = PHASE_ORDER.slice(idx);
+    // 清历史降级记录：否则"已被修掉的降级"会跟着重跑活下来，重跑后仍显示「产出不完整」
+    this.deps.repos.jobs.clearDegraded(jobId);
     this.deps.repos.phases.resetForRerun(jobId, downstream);
     // 清理下游产物，避免新旧混杂
     for (const p of downstream) {

@@ -1,0 +1,34 @@
+# brandsale 嵌入服务（EmbeddingGemma 2）依赖
+#
+# 版本约束说明（来自模型仓库的 config_sentence_transformers.json，勿随意放宽）：
+#   sentence-transformers >=6.1.0
+#       上游 requirements 明确要求。理由写在模型卡里：
+#       「Older versions ignore the order of multimodal dict inputs and cannot put
+#         several images or texts into a single embedding.」
+#       我们只做文本，但仍按官方要求卡住下限——低版本的 encode 语义与现在不同。
+#   transformers >=5.19.0
+#       EmbeddingGemma 2 的模型卡由 transformers 5.18.0.dev0 产出，
+#       model_type = embedding_gemma2 需要 5.18+ 才有对应实现。
+#       5.19.0 是当前 PyPI 上的正式版，已实测可装。
+#
+# torch 不锁小版本：macOS arm64 需要 MPS 支持，跟随官方 wheel 更稳。
+sentence-transformers>=6.1.0
+transformers>=5.19.0
+torch>=2.2
+numpy>=1.24
+
+# HTTP 服务
+fastapi>=0.115
+uvicorn>=0.30
+
+# 多模态 processor 的硬依赖。
+# **即使我们只做文本嵌入也必须装**：EmbeddingGemma2Processor 在 __init__ 里就 import PIL，
+# 不装会在加载模型时直接抛 ImportError（提示信息里那句 "requires the PIL library"）。
+# 这跟"用不用图像"无关，是模型类的构造依赖。
+pillow>=10.0
+
+# 同样是"文本也用得上"的依赖：processor 的 import 链是
+#   EmbeddingGemma2Processor → gemma4/image_processing_gemma4 → torchvision.transforms.v2
+# 少了它加载会失败，报错却是 "Could not import module 'EmbeddingGemma2Processor'"
+# （真正的根因被 transformers 的报错包装吞掉了，需要开 DEBUG 才看得到 No module named 'torchvision'）。
+torchvision>=0.20

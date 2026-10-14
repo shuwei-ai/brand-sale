@@ -7,9 +7,10 @@
 
 ```bash
 npm install
-npm test          # 12 个 E2E 用例，全离线，不依赖任何外部服务
+npm test          # 213 个用例，全离线，不依赖任何外部服务
 npm run demo:mock # 离线桩模式跑通全链路（确定性输出）
-npm start         # 启动 HTTP 网关（dev 模式空库自动灌种子）
+npm run web:build # 构建前端控制台（可选；不构建则返回内置引导页）
+npm start         # 启动 HTTP 网关（dev 模式空库自动灌种子），打开 http://127.0.0.1:8787/
 ```
 
 接真实模型（OpenAI 兼容端点，如自建 vLLM）：
@@ -26,7 +27,9 @@ npm run demo           # 真实模型端到端
 ## 架构（分层单向依赖）
 
 ```
-apps/gateway          HTTP + SSE 接入层（鉴权/幂等/协议转换，唯一入口）
+apps/gateway          HTTP + SSE 接入层（鉴权/幂等/协议转换 + 静态托管，唯一入口）
+apps/web              控制台前端（React 18 + Ant Design 5，Vite 构建，产物由网关托管）
+apps/collector        采集 sidecar（只读归一化 + 缓存，经子进程驱动内嵌采集内核）
 packages/
   contracts           纯类型 + 错误码 + 报告DSL（零依赖叶子）
   config              环境变量装配 + 不变量断言
@@ -41,6 +44,8 @@ packages/
 ```
 
 依赖白名单由 `npm run check:boundaries` 强制（越界/反向/环一律构建失败）。
+`apps/*` 属于应用层，允许依赖任意包；前端只依赖 `packages/contracts`（纯类型与常量，
+零 node 依赖），因此后端加阶段/库位时前端不会悄悄漏渲染——要么编译报错，要么自动跟上。
 
 ## 关键设计
 
@@ -67,9 +72,70 @@ packages/
 需要平台私有数据时，正确做法是等客户授权后**新增**一个真实适配器并走完整的登记流程。
 届时在 `scripts/seed.ts` 的 `BUILTIN_SOURCES` 加回条目，并收紧 `web_search` 的白名单。
 
-## 联网检索（`web_search`，唯一的真实外部源）
+## 平台内公开内容采集（七个平台，L3，内嵌 MediaCrawler 内核）
 
-`volc_web_search` 是**唯一**会真正发起外部 HTTP 请求的数据源
+七个平台的内容层采集已接入：小红书 / 抖音 / 快手 / B站 / 微博 / 贴吧 / 知乎。
+每个平台一个台账源（`mc_xhs` / `mc_dy` / `mc_ks` / `mc_bili` / `mc_wb` / `mc_tieba` / `mc_zhihu`），
+全部 **L3**（公开、未经人工核验、与平台无授权合同），只读、只给 CI/CT 两个角色的白名单。
+
+**模型侧只有一个入口：`platform_digest`（跨平台聚合）。** 它一次覆盖多个平台，
+并直接返回 `comparison.metrics` —— 本组平台指标的**交集**，跨平台横向对比只允许落在这上面。
+七个单平台工具（`xhs_web` / `douyin_web` / …）仍然注册、仍然逐源过闸门，但标记为对模型隐藏：
+它们是受治理的实现原语。把"七平台怎么合并、哪些指标可比"交给模型做，是最容易出错的地方
+（七平台全量放在一起时，内容层其实**没有任何共有指标** —— 贴吧无点赞、快手无评论数）。
+完整能力矩阵与集成方案见 `docs/platform-capability-integration-plan.md`。
+
+**采集内核已内嵌进本仓库**（`services/collector-core/`），部署上只有 brandsale 一个系统。
+链路是三段：
+
+```
+services/collector-core（内嵌采集内核 = MediaCrawler 的采集部分）
+   │  Python + Playwright：起浏览器、扫码登录、七平台签名与采集，结果落 jsonl
+   ▼
+apps/collector（只读归一化 sidecar，npm run collector）
+   │  以子进程驱动内核、把各平台 jsonl 归一化成统一行、本地缓存，对外只暴露 4 个只读算子
+   ▼
+packages/datasource 的七个适配器 → 七个工具（同步、按查询、带 provenance）
+```
+
+> **唯一的额外前置**是一个 Python 运行时：`npm run collector:setup` 一次装好
+> （建 venv + 装依赖 + 下载 chromium）。内核的来源、许可与相对上游的裁剪清单见
+> [`services/collector-core/README.md`](./services/collector-core/README.md)。
+
+> ⚠️ **许可证红线**：内嵌的采集内核来自 MediaCrawler，其许可证是
+> `NON-COMMERCIAL LEARNING LICENSE 1.1`，
+> 条件第 3 条禁止未经版权方书面同意的**任何商业用途**。因此整条链路有三道门，
+> 缺一不可：`BM_MC_ENABLED` + **`BM_MC_LICENSE_ACK`（必须显式确认）** + `BM_MC_COLLECTOR_URL`。
+> 未确认时七个适配器与七个工具**一律不装配**——把"引入一个非商用组件"固化成一个
+> 必须显式做的决定，而不是顺手配个地址就悄悄生效。
+
+**能力边界（重要）**：七平台在**内容层**（搜索/详情/评论/创作者）全部可用；
+**粉丝画像**（年龄/性别/地域）在公开 Web 接口层**一个平台都拿不到**——这不是解析问题，
+是接口层根本没有这个数据，正道只有 L1 官方通道（抖音开放平台 `fans_data`，需企业主体+审批+达人 OAuth）。
+B站 的粉丝/关注列表在 MediaCrawler 源码里是**注释掉的**、入口不可达，因此没有做成算子。
+
+上手步骤（`npm run collector:setup` → 起 collector → 扫码登录 → 开三道门 → 自检）见
+[`docs/datasource-integration.md`](./docs/datasource-integration.md) §6；
+选型与许可评估见
+[`docs/datasource-platform-collection-analysis.md`](./docs/datasource-platform-collection-analysis.md)。
+
+## 报告数据溯源（条目级）
+
+报告里的平台数据可以追溯到**具体某条内容**，且这条链路是机械保证的、不依赖模型自觉：
+
+- 采集工具在返回结果的同时把条目**登记进本任务的证据表**（`intel_evidence` 产物，
+  含平台 / 标题 / 摘录 / 原文链接 / 发布时间 / 采集时点）；
+- 模型只能引用系统生成的 `entryId`（`pf_<平台>_<id>`），**不产生 URL** ——
+  报告里的原文链接、发布时间由渲染层拿 entryId 反查证据表拼接，编造的引用会被
+  渲染校验（R13）自动降级为来源级引用；
+- 报告末尾有机械生成的「**数据来源与溯源**」附录页：来源声明、按平台 × 算子的采集概览、
+  被引用条目清单（每条都能点回原帖），以及「L3 公开采集 / 跨平台不可数值对比」的固定口径。
+
+设计与取舍见 [`docs/data-provenance-design.md`](./docs/data-provenance-design.md)。
+
+## 联网检索（`web_search`）
+
+`volc_web_search` 是**按次计费**的联网检索数据源
 （火山引擎「联网搜索 Lite」，抓公开网页）。它不是"给工具开个后门"，而是按既有规则走完整条链：
 
 - **是适配器**：实现 `packages/datasource/src/web-search.ts`，返回标准 `Provenance`；
@@ -96,30 +162,55 @@ CACHE_TTL / PREFETCH`。相同查询按 TTL 命中缓存（默认 15 分钟）�
 
 ## 可视化控制台
 
-启动网关后直接打开 **http://127.0.0.1:8787/**（或 `/console`）即可，无需构建、无需额外进程：
+React + Ant Design 单页应用，由网关托管构建产物，**同一个端口**（网关 8787）：
 
-- **新建任务**：左侧表单填 Brief（权重之和必须为 1，前端会拦），提交后自动建立 SSE 连接；
-- **实时进度**：六阶段卡片（状态/尝试次数/成本）、进度条、模型正文与工具调用的流式回显；
-- **事件流**：`phase.*` / `cost.update` / `data.degraded` / `governance.block` 逐条可读，
-  绿/黄/红三色区分正常、降级、拦截；
-- **报告预览**：内嵌 iframe（先带 token 取回 HTML 再喂 blob URL），可新标签打开；
-- **产物**：8 类产物按类型预览/下载，走 `GET /jobs/:id/artifacts/:kind`；
-- **运维动作**：重跑 report 阶段、取消任务、崩溃恢复扫描。
+- 源码在 `apps/web`（React 18 + Ant Design 5 + Vite），访问 `/`、`/console`；
+- 启动网关后打开 **http://127.0.0.1:8787/** 即可；
+- 若产物未构建，`/` 会返回构建指引页而不是旧界面（旧的内联 HTML 控制台已移除）。
 
-实现要点（`apps/gateway/src/console.ts`）：页面本身无需鉴权（只是静态表单），
-但页内所有 API 调用都带 `Authorization: Bearer ...`；SSE 用 **fetch + ReadableStream**
-手写解析而非 `EventSource`（后者不能带请求头，用它会逼着把 token 塞进 URL）；
-报告预览同理用 blob URL，避免给 `/report` 开匿名口子。
+构建与开发态热更：
+
+```bash
+npm run web:build        # 产物输出 apps/web/dist，由网关托管（改前端后需重跑）
+npm run web:dev          # Vite 开发服务器 5173，/api 与 /health 代理到 8787（改前端即时生效）
+```
+
+四个入口：
+
+- **新建任务** — Brief 结构化表单 + 一句话自然语言录入（解析结果**回填表单**而非直接提交，
+  结构化字段仍是唯一提交契约；目标权重实时求和，≠1 时提交按钮禁用）；
+- **任务列表** — 状态/进度/降级/预算一览，5 秒自动刷新（可关），入口处提供崩溃恢复扫描；
+- **任务详情** — 六阶段看板（状态/尝试次数/成本/降级原因）、模型正文与工具调用的
+  流式回显、终端风事件流（正常/降级/拦截三色）、报告内嵌预览、8 类产物预览下载、
+  治理台账（每次数据访问的来源与行数）、重跑任意阶段/取消任务；
+- **知识库 / 数据源与审计** — KB 入库（来源必须在台账登记且授权有效，否则 E-INGEST-001）、
+  检索测试、库况统计；数据源登记、授权授予、审计明细与汇总。
+
+实现要点（详见 `docs/frontend-console.md`）：
+
+- **页面本身无需鉴权**（只是静态表单），但页内所有 API 调用都带 `Authorization: Bearer ...`；
+  SSE 与报告预览用 **fetch + ReadableStream/blob** 而非 `EventSource`/`iframe src`
+  ——后两者带不了请求头，用它们就得把 token 塞进 URL（会进访问日志与 Referer）；
+- 断线重连带 `Last-Event-ID`，服务端只补缺口；缓冲过期时改拉全量详情；
+- 流式增量写入 ref 并用 `requestAnimationFrame` 合帧——一次真实任务有 1.6 万条
+  `agent.delta`，逐条 setState 会卡死；
+- 静态托管带路径穿越守卫与「哈希资源长缓存 / 入口 HTML 不缓存」策略，
+  并有专门用例把关（`tests/web-console.test.ts`）；
+- `/health` 返回 `web.built / web.dist / web.builtAt`，用于自证"现在跑的是哪一版前端"
+  （部署到一半只更新了后端、忘了构建前端时能一眼看出来）。
 
 ## 常用命令
 
 | 命令 | 说明 |
 | --- | --- |
-| `npm test` | E2E 回归（mock 模式） |
+| `npm test` | 全量回归（mock 模式，含前端托管契约） |
+| `npm run typecheck` | 后端 + 前端两套 tsconfig 一起查 |
 | `npm run check:boundaries` | 架构边界检查 |
 | `npm run demo` / `demo:mock` | 端到端演示（真实/离线） |
 | `npm run migrate` / `seed` | 建表 / 灌种子 |
 | `npm run dev` / `start` | 开发热载 / 启动网关 |
+| `npm run web:build` | 构建前端控制台（`apps/web/dist`） |
+| `npm run web:dev` | 前端开发服务器（5173，代理到 8787） |
 
 ## HTTP API（`/api/v1`）
 

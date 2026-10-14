@@ -1,5 +1,11 @@
 # P0-3「粉丝画像」数据供给评估：采集 + 检索组合方案
 
+> **⚠️ 状态（2026-10-09）：方案 ③（DTK / xhs 采集）已移除，结论不变。**
+> 本文的 ③ 依赖的自托管采集通道已从代码中删除；后续对 MediaCrawler 七平台的评估
+> 再次确认：**粉丝画像在公开 Web 接口层不存在**，与本文结论一致。
+> 见 [`datasource-platform-collection-analysis.md`](./datasource-platform-collection-analysis.md)。
+> 本文对 ①②④⑤ 四条路径的分析仍然成立，其中 ④（`fans_data`）仍是正道。
+
 > 评估日期：2026-10-08
 > 前置：[`docs/requirements-coverage-analysis.md`](./requirements-coverage-analysis.md)（缺口认定）、
 > [`docs/datasource-candidate-evaluation.md`](./datasource-candidate-evaluation.md)（DTK / xhs 单项评估）

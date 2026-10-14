@@ -14,6 +14,7 @@
  */
 
 import { PAGE_ROLES, type Block, type ReportDsl, type SlideSpec } from "@brandsale/contracts";
+import { EVIDENCE_QUOTE_MAX } from "./evidence.ts";
 
 export interface SchemaDef<T> {
   name: string;
@@ -319,6 +320,16 @@ export interface IntelOutput {
   /** 缺数据的维度，必须显式列出（不编造） */
   dataGaps: string[];
   citations: { claim: string; sourceKey: string; confidence: number }[];
+  /**
+   * 平台采集条目引用（P0 溯源），可选。
+   *
+   * `entryId` 必须**逐字抄**工具返回值（`platform_digest` 的 rows：`pf_<平台码>_<原始内容 id>`），
+   * **模型不得自造** —— 也没必要造，URL/作者/发布时间由渲染层拿 entryId 反查证据表。
+   * `quote` 是给读者看的摘录（≤200 字），不是原文留存。
+   * 本次 rows 为空时**留空即可**（系统会按真实取回的条目机械补齐）；编造的 entryId 会被
+   * 逐条比对后摘除，并把报告标成"产出不完整"。
+   */
+  evidences?: { entryId: string; quote: string; useFor?: string }[];
   /** 品牌自身诊断（P0-1）：与上面竞品同处一个产物，构成"我方 vs 竞品"的可比基线 */
   brandSelf: BrandSelfOutput;
 }
@@ -340,6 +351,11 @@ export const CompetitorIntelSchema: SchemaDef<IntelOutput> = {
                         "channelMix": [{ "channel": string, "share": number | null }] },
   "dataGaps": string[],
   "citations": [{ "claim": string, "sourceKey": string, "confidence": number }],
+  "evidences": [{ "entryId": string, "quote": string, "useFor": string }],
+  // ↑ 条目级溯源（可选，但**强烈建议**填）：entryId 只能逐字抄 platform_digest 返回的
+  //   rows 里的 id（system 生成，形如 pf_xhs_<原始内容 id>），quote 是 ≤200 字摘录。
+  //   禁止自己拼 URL 或作者 —— 报告里的链接由渲染层按 entryId 反查，写别的没用。
+  //   本次 rows 为空就留空：编出来的 entryId 会被摘除，并把报告标成"产出不完整"。
   "brandSelf": {
     // 我方基线。⚠️ 未获平台授权时，contentAssets 的每个数字都必须写 null，
     // 并且 citations 必须为空——**绝不允许**填"品牌认知度 32%"这类无来源的数字。
@@ -438,6 +454,22 @@ export const CompetitorIntelSchema: SchemaDef<IntelOutput> = {
       );
     }
 
+    /* 条目级溯源（P0）。这里只做**结构**校验：entryId 是否存在、quote 是否超长。
+     * 真实性校验必须放在阶段后处理里做 —— schema 层拿不到"本 job 登记了哪些条目"，
+     * 没有证据集就没法判定一个 entryId 是真引用还是编的（见 agents.ts enforceEvidence）。 */
+    const evidences = checkArray(root.evidences ?? [], issues, "$.evidences").map((e, i) => {
+      const o = checkObject(e, issues, `$.evidences[${i}]`);
+      const quote = checkString(o.quote, issues, `$.evidences[${i}].quote`);
+      if (quote.length > EVIDENCE_QUOTE_MAX) {
+        issues.push(`$.evidences[${i}].quote 超过 ${EVIDENCE_QUOTE_MAX} 字（摘录不是原文留存，请截断）`);
+      }
+      return {
+        entryId: checkString(o.entryId, issues, `$.evidences[${i}].entryId`),
+        quote,
+        ...(typeof o.useFor === "string" && o.useFor.trim() ? { useFor: o.useFor } : {}),
+      };
+    });
+
     /* 品牌自身诊断（P0-1）。校验重点不是"字段齐不齐"，而是**有数字必须有来源**。 */
     const bs = checkObject(root.brandSelf, issues, "$.brandSelf");
     const bsPos = checkObject(bs.positioning, issues, "$.brandSelf.positioning");
@@ -515,6 +547,7 @@ export const CompetitorIntelSchema: SchemaDef<IntelOutput> = {
       categoryInsights,
       dataGaps,
       citations,
+      ...(evidences.length > 0 ? { evidences } : {}),
       brandSelf: {
         positioning,
         contentAssets: bsAssets,

@@ -10,65 +10,253 @@ import { resolve } from "node:path";
 export type Env = "dev" | "staging" | "prod";
 
 /**
- * 抖音自托管采集服务的端点路径。
+ * MediaCrawler 支持的七个平台。取值用的是 MediaCrawler 自己的平台码
+ * （`xhs`/`dy`/`ks`/`bili`/`wb`/`tieba`/`zhihu`），因为它就是被复用的那个采集内核，
+ * 保持同码可以少一层翻译、也便于直接对照它的 `POST /api/crawler/start`。
  *
- * 为什么路径要可覆盖：DTK 有两代形态，端点前缀完全不同。默认值随
- * `BM_DOUYIN_STYLE` 走（见 `DOUYIN_DEFAULT_PATHS`），显式设了 `BM_DOUYIN_PATH_*` 就以它为准。
+ * ⚠️ 这与业务侧的 `Platform`（`douyin`/`xiaohongshu`/`bilibili`/`weibo`，见
+ * packages/contracts）**不是一回事**：业务侧是"这个 brief 投哪几个平台"，
+ * 这里说的是"哪几个平台的公开内容采集通道可用"。两者只是部分重叠。
  */
-export interface DouyinPaths {
-  profile: string;
-  posts: string;
-  video: string;
-  comments: string;
+export const MEDIA_CRAWLER_PLATFORMS = ["xhs", "dy", "ks", "bili", "wb", "tieba", "zhihu"] as const;
+export type MediaCrawlerPlatform = (typeof MEDIA_CRAWLER_PLATFORMS)[number];
+
+/**
+ * 采集算子。**七平台统一这四个**——因为 MediaCrawler 对七个平台都只实现了
+ * `search` / `detail` / `creator` 三种 `crawler_type`（已核对各平台 core.py）。
+ *
+ * 曾经考虑把 B站 的「粉丝列表 / 关注列表」也作为算子暴露，**放弃**：
+ * 客户端里虽然有 `get_creator_fans` / `get_creator_followings`，但 core.py 里
+ * 对应的调用是**注释掉的**，且 CLI 与 FastAPI 都没有开关可以触发它。
+ * 走现有黑盒入口根本拿不到——把不可达的能力写进工具描述，只会让模型反复去调一个必然空手的算子。
+ */
+export type CollectOp = "search" | "content_detail" | "comments" | "creator";
+
+/**
+ * 归一化后的**统一指标名**。与 `apps/collector/src/normalize.ts` 里的 metrics 键一一对应：
+ * 那边的候选表负责"把各平台千奇百怪的原始字段名映射到这几个键"，这边负责声明
+ * "某平台**真的有**哪些键"。
+ *
+ * 为什么要单独声明而不能从候选表推：候选表是**并集**（为了容错，基类候选表对七个平台
+ * 是同一份），它回答"怎么解析"；而能力矩阵回答"存不存在"。快手的内容记录里根本没有
+ * 评论数字段，从候选表看不出来，只能靠真机核对后显式写下（见
+ * docs/platform-capability-integration-plan.md §1）。
+ */
+export type ContentMetricKey = "likes" | "comments" | "collects" | "shares" | "views";
+export type CommentMetricKey = "likes" | "subComments";
+
+export const CONTENT_METRIC_LABEL: Record<ContentMetricKey, string> = {
+  likes: "点赞",
+  comments: "评论数",
+  collects: "收藏",
+  shares: "转发/分享",
+  views: "播放/阅读",
+};
+
+export const COMMENT_METRIC_LABEL: Record<CommentMetricKey, string> = {
+  likes: "评论点赞",
+  subComments: "子评论数",
+};
+
+/**
+ * 指标键的**有序全集**。存在的意义是"遍历"：`platform_digest` 要按固定顺序
+ * 逐个指标判定"本批数据里是否真有非零值"，顺序不定会让同一批数据的输出不稳定。
+ * 与 label 表保持一致，新增指标时两处一起改（放在相邻位置就是为了让人看见）。
+ */
+export const CONTENT_METRIC_KEYS: readonly ContentMetricKey[] = ["likes", "comments", "collects", "shares", "views"];
+export const COMMENT_METRIC_KEYS: readonly CommentMetricKey[] = ["likes", "subComments"];
+
+export interface MediaCrawlerPlatformMeta {
+  platform: MediaCrawlerPlatform;
+  /** 台账源 ID（seed 登记与工具 boundSourceId 共用，避免两处字符串漂移） */
+  sourceId: string;
+  displayName: string;
+  /**
+   * MediaCrawler 落盘目录名。**与 API 平台码不是同一套**：
+   * FastAPI 的 `PlatformEnum` 收 `xhs`/`dy`/`ks`/`bili`/`wb`/`tieba`/`zhihu`，
+   * 而它写文件写的是 `data/{douyin,kuaishou,bilibili,weibo,...}/`。
+   * 两套码混起来会得到"任务成功但永远读不到文件"这种最难查的故障，所以显式列出来。
+   */
+  dataDirName: string;
+  /** 内容对象的称呼，写进工具描述帮模型选词（笔记 / 视频 / 微博 / 帖子 / 回答） */
+  contentNoun: string;
+  /** 创作者的称呼（博主 / 达人 / UP 主 / 用户） */
+  creatorNoun: string;
+  /**
+   * 常驻采集浏览器的调试端口（`--cdp reuse` 模式下由 collector 下发给内核的 `--cdp-port`）。
+   *
+   * 为什么每个平台一个**固定**端口：
+   *   · 常驻浏览器是**按平台**隔离的（各有一份登录态 profile，内核侧是
+   *     `USER_DATA_DIR = "%s_user_data_dir"`）。端口若共用，后启动的平台会连上前一个
+   *     平台的会话，直接串掉登录态。
+   *   · 端口是 collector 回收浏览器时**唯一的身份标识**（`lsof -t -i tcp:<port>`），
+   *     所以必须固定，不能让内核 `find_available_port` 自己向上找空闲端口。
+   *
+   * 段位取 9333 起：避开 9222（Chrome 手工远程调试与各类 devtools 桥的常用位）。
+   */
+  cdpPort: number;
+  ops: CollectOp[];
+  /**
+   * 该平台**内容行里真实存在**的互动指标（真机核对，非推断）。
+   *
+   * 这张表是"跨平台能不能比"的唯一依据：`platform_digest` 会按它算
+   * 「本组平台的**共有**指标」，报告里只允许在这些指标上做横向对比。
+   * 拿 B站投币数比小红书点赞那种错，根因就是这里没被显式声明过。
+   */
+  contentMetrics: ContentMetricKey[];
+  /** 该平台**评论行里真实存在**的指标。快手与贴吧的评论模型没有点赞字段 */
+  commentMetrics: CommentMetricKey[];
 }
 
 /**
- * 自托管 DTK 的**形态**。两代的差异大到必须显式区分，不能共用一套默认值：
- *
- * | | v4 | v5 |
- * |---|---|---|
- * | 端点前缀 | `/api/douyin/web/fetch_*` | `/api/v1/douyin/{user,user/posts,video,video/comments}` |
- * | 同步方式 | `?wait=true` | `?wait=<秒数>`（传 `true` 会被 FastAPI 判 422） |
- * | 鉴权 | 无 | `X-API-Key` / `Authorization: Bearer`，默认强制 |
- * | 响应信封 | `{code, router_data?}` | `{success, data, error, meta}` |
- * | 异步 | 无 | 默认 `202 + data.{task_id,state}` |
- *
- * 默认取 **v5**：当前仓库 `docker compose up` 装出来的就是 v5（dtk 5.1.x），
- * 而 v4 的四个路径在 v5 上**一个都不存在**——照 v4 默认值配过去，全是 404。
- * 对接老的 v4 部署时把 `BM_DOUYIN_STYLE=v4` 显式设回来。
+ * 七平台的展示名与台账源 ID。放在 config 而不是 datasource，是为了让
+ * **collector（app）与 datasource（包）共用同一份常量**：两边各自写一遍，
+ * 迟早会出现「seed 登记的是 mc_xhs、工具绑的是 xhs_public」这类静默错配。
  */
-export type DouyinStyle = "v4" | "v5";
-
-/** 两代的默认端点。显式 `BM_DOUYIN_PATH_*` 仍然优先。 */
-export const DOUYIN_DEFAULT_PATHS: Record<DouyinStyle, DouyinPaths> = {
-  v4: {
-    profile: "/api/douyin/web/fetch_user_profile",
-    posts: "/api/douyin/web/fetch_user_post_videos",
-    video: "/api/douyin/web/fetch_one_video",
-    comments: "/api/douyin/web/fetch_video_comments",
+export const MEDIA_CRAWLER_PLATFORM_META: Record<MediaCrawlerPlatform, MediaCrawlerPlatformMeta> = {
+  xhs: {
+    platform: "xhs",
+    cdpPort: 9333,
+    sourceId: "mc_xhs",
+    displayName: "小红书",
+    dataDirName: "xhs",
+    contentNoun: "笔记",
+    creatorNoun: "博主",
+    ops: ["search", "content_detail", "comments", "creator"],
+    // 内核 store/xhs/__init__.py：liked_count / comment_count / collected_count / share_count
+    contentMetrics: ["likes", "comments", "collects", "shares"],
+    commentMetrics: ["likes", "subComments"],
   },
-  v5: {
-    profile: "/api/v1/douyin/user",
-    posts: "/api/v1/douyin/user/posts",
-    video: "/api/v1/douyin/video",
-    comments: "/api/v1/douyin/video/comments",
+  dy: {
+    platform: "dy",
+    cdpPort: 9334,
+    sourceId: "mc_dy",
+    displayName: "抖音",
+    dataDirName: "douyin",
+    contentNoun: "视频",
+    creatorNoun: "达人",
+    ops: ["search", "content_detail", "comments", "creator"],
+    // digg_count / comment_count / collect_count / share_count（**没有**播放量）
+    contentMetrics: ["likes", "comments", "collects", "shares"],
+    commentMetrics: ["likes", "subComments"],
+  },
+  ks: {
+    platform: "ks",
+    cdpPort: 9335,
+    sourceId: "mc_ks",
+    displayName: "快手",
+    dataDirName: "kuaishou",
+    contentNoun: "视频",
+    creatorNoun: "博主",
+    ops: ["search", "content_detail", "comments", "creator"],
+    /* ⚠️ 只有 realLikeCount + viewCount：**内容记录里没有评论总数**（这是唯一缺评论数的平台），
+     * 也**没有**收藏/转发。需要评论热度只能用 comments 算子的采样条数近似，且必须写明口径。 */
+    contentMetrics: ["likes", "views"],
+    commentMetrics: ["subComments"],
+  },
+  bili: {
+    platform: "bili",
+    cdpPort: 9336,
+    sourceId: "mc_bili",
+    displayName: "B站",
+    dataDirName: "bili",
+    contentNoun: "视频",
+    creatorNoun: "UP 主",
+    ops: ["search", "content_detail", "comments", "creator"],
+    /* 指标最全：like / reply / favorite / share / view 全有（另有弹幕/投币，未归一化）。
+     * 落盘主键是 `video_id`（= aid），不是 bvid —— 见 store/bilibili/__init__.py。 */
+    contentMetrics: ["likes", "comments", "collects", "shares", "views"],
+    commentMetrics: ["likes", "subComments"],
+  },
+  wb: {
+    platform: "wb",
+    cdpPort: 9337,
+    sourceId: "mc_wb",
+    displayName: "微博",
+    dataDirName: "weibo",
+    contentNoun: "微博",
+    creatorNoun: "博主",
+    ops: ["search", "content_detail", "comments", "creator"],
+    // attitudes_count / comments_count / shared_count（注意是 shared_ 不是 share_）；无收藏、无阅读
+    contentMetrics: ["likes", "comments", "shares"],
+    commentMetrics: ["likes", "subComments"],
+  },
+  tieba: {
+    platform: "tieba",
+    cdpPort: 9338,
+    sourceId: "mc_tieba",
+    displayName: "贴吧",
+    dataDirName: "tieba",
+    contentNoun: "帖子",
+    creatorNoun: "用户",
+    ops: ["search", "content_detail", "comments", "creator"],
+    /* 指标最贫：只有正文与评论数（`total_replay_num`，**repl a y**，上游拼写如此）。
+     * 没有点赞/收藏/转发/播放 —— 所以贴吧帖只能做"正文 + 评论数"分析。 */
+    contentMetrics: ["comments"],
+    commentMetrics: ["subComments"],
+  },
+  zhihu: {
+    platform: "zhihu",
+    cdpPort: 9339,
+    sourceId: "mc_zhihu",
+    displayName: "知乎",
+    dataDirName: "zhihu",
+    contentNoun: "回答",
+    creatorNoun: "答主",
+    ops: ["search", "content_detail", "comments", "creator"],
+    // voteup_count / comment_count；无收藏、无转发、无阅读（回答另带 question_id 与问题标题）
+    contentMetrics: ["likes", "comments"],
+    commentMetrics: ["likes", "subComments"],
   },
 };
 
 /**
- * `wait` 的默认值。两代语义不同，这是最容易踩的一脚：
- *   v4：布尔开关，`true` = "在服务端等结果"。
- *   v5：**秒数**，且超过 `api.max_wait_seconds`（DTK 默认 30）会被 400 拒掉；
- *       传 `true` 连类型都过不了，直接 422。
+ * 业务平台码 → 采集平台码。
+ *
+ * 两套编码**不通用**，混用会出现"任务提交成功但一个平台都没采"这种静默故障：
+ *   · 业务码在 `packages/contracts`（`POPULAR_PLATFORMS`：douyin/xiaohongshu/bilibili/weibo），
+ *     表示"这个 brief 要投哪几个平台"，直接来自客户 Brief；
+ *   · 采集码是本文件的 `MediaCrawlerPlatform`，表示"哪几个平台的公开内容通道可用"。
+ *
+ * 只映射**业务侧真会出现的那四个**。快手/贴吧/知乎刻意不在这里：`Brief.platforms`
+ * 的候选集（`POPULAR_PLATFORMS`）里没有它们，凭空映射等于替客户造主张。它们只能由
+ * 智能体在工具循环里按需指定（`platform_digest` 的 `platforms` 参数接受全部七个采集码）。
+ *
+ * 放在 config 而不是 agent-pack：`tool-impls.ts` 需要它做参数别名归一，
+ * 而 `agents.ts` 需要它做预采集——分别写一份，迟早两边对不上。
  */
-export const DOUYIN_DEFAULT_WAIT: Record<DouyinStyle, string> = { v4: "true", v5: "20" };
+export const BRIEF_PLATFORM_TO_MC: Record<string, MediaCrawlerPlatform> = {
+  xiaohongshu: "xhs",
+  douyin: "dy",
+  bilibili: "bili",
+  weibo: "wb",
+};
 
-/** 小红书自托管**只读**代理的端点路径。契约定义见 docs/datasource-integration.md */
-export interface XhsPaths {
-  note: string;
-  comments: string;
-  user: string;
-  userPosts: string;
+/**
+ * 一组平台的**共有内容指标**（交集）。
+ *
+ * 这是聚合层"哪些指标可以横向比"的权威答案：报告里做跨平台声量对比时，
+ * 只允许落在交集上。空集是合法结果（例如「贴吧 + 快手」只剩 0 个共有指标），
+ * 此时调用方必须如实写"不可跨平台对比"，而不是挑一个指标硬比。
+ */
+export function comparableContentMetrics(platforms: readonly MediaCrawlerPlatform[]): ContentMetricKey[] {
+  return intersectMetricKeys(platforms, (m) => m.contentMetrics);
+}
+
+/** 一组平台的**共有评论指标**（交集） */
+export function comparableCommentMetrics(platforms: readonly MediaCrawlerPlatform[]): CommentMetricKey[] {
+  return intersectMetricKeys(platforms, (m) => m.commentMetrics);
+}
+
+/** 交集计算：按第一个平台的顺序输出，保证同输入同输出（便于回归与快照） */
+function intersectMetricKeys<K extends string>(
+  platforms: readonly MediaCrawlerPlatform[],
+  pick: (m: MediaCrawlerPlatformMeta) => readonly K[],
+): K[] {
+  const known = platforms.filter((p) => MEDIA_CRAWLER_PLATFORM_META[p]);
+  if (known.length === 0) return [];
+  const first = pick(MEDIA_CRAWLER_PLATFORM_META[known[0]!]);
+  return first.filter((k) => known.every((p) => pick(MEDIA_CRAWLER_PLATFORM_META[p]).includes(k)));
 }
 
 export interface Config {
@@ -77,6 +265,18 @@ export interface Config {
   dataDir: string;
 
   storage: { driver: "sqlite"; sqlitePath: string };
+
+  /**
+   * 是否允许把**内置演示样例数据**当作可用数据（达人报价库 + 已灌入的 KB 语料）。
+   *
+   * 默认 **false**：报告里出现的每一个达人与每一句结论，都必须能追溯到真实来源
+   * （客户录入 / 平台采集 / 联网检索）。演示样例只在开发与自动化测试里打开
+   * （`BM_ALLOW_DEMO_DATA=true`），它存在的意义是让空库能跑通全链路，不是数据。
+   *
+   * 实现在读取侧（`PricingStore` / KB 检索）而不是写入侧：写入侧堵住只是"罐子里没毒"，
+   * 万一有人手工灌了样例，读取侧过滤才是真正保证"报告不会引用样例"的那道闸。
+   */
+  allowDemoData: boolean;
 
   llm: {
     mode: "live" | "mock";
@@ -97,9 +297,33 @@ export interface Config {
   };
 
   retrieval: {
-    vectorDriver: "memory" | "qdrant";
+    /**
+     * 语义向量的存储驱动。
+     *   `"memory"` —— 向量落在 SQLite（`kb_chunks.vec` BLOB）+ 应用层暴力余弦。
+     *     万级 chunk 下是毫秒级，且与 chunk 同事务读写，**默认且推荐**。
+     *   `"milvus"` —— 向量额外写入 Milvus（可重建的索引，非真相源）。
+     *     仅在语料量/多实例等触发条件满足时启用，见
+     *     `docs/report-summary-vectordb-integration-plan.md` §6。
+     * 注意：SQLite 永远是唯一真相源；Milvus 挂了必须能退回纯 BM25 而不是让检索失败。
+     */
+    vectorDriver: "memory" | "milvus";
+    /** 嵌入服务地址（OpenAI 兼容 /v1/embeddings）。为空 → 退回本地哈希向量 */
     embedUrl: string;
     embedModel: string;
+    /** 向量维度。**决定落盘向量能参与比较的范围**；改变它需要重建已有向量 */
+    embedDim: number;
+    /** 单次嵌入请求的最大条数（分批） */
+    embedBatchSize: number;
+    embedTimeoutMs: number;
+    /* Milvus（仅 vectorDriver === "milvus" 时使用；它永远只是可重建的索引，不是真相源） */
+    milvusUri: string;
+    milvusToken: string;
+    milvusCollection: string;
+    /**
+     * Milvus 超时。默认 3s 而不是 30s：它是旁路，挂了就该立刻退回 SQLite + BM25，
+     * 而不是把一次 `kb_retrieve` 拖到工具超时（20s）。宁可降级，不要等待。
+     */
+    milvusTimeoutMs: number;
     rerankUrl: string;
     rerankModel: string;
     rerankPoolSize: number;
@@ -107,9 +331,27 @@ export interface Config {
     rerankCooldownMs: number;
   };
 
+  knowledge: {
+    /**
+     * 报告生成后是否把「机械抽取的摘要」回灌知识库（KB-2）。
+     * 失败不影响报告本身（best-effort），只记 degraded。
+     */
+    summaryIngest: boolean;
+  };
+
   parser: {
+    /**
+     * MinerU 文档解析服务地址。**空 = 只支持纯文本**：二进制（pdf/docx/xlsx/pptx/图片）
+     * 会在入库前被 415 `E-INGEST-002` 拦下（见 `packages/knowledge/src/parser.ts` 文件头）。
+     *
+     * ⚠️ 这里**刻意没有** `fallback` 字段。原先定义过一个
+     * `fallback: "mineru" | "textonly" | "none"`（读 `BM_PARSER_FALLBACK`），但它
+     * **全仓零消费** —— `createParser()` 只看 `url`。更关键的是"解析器挂了就退回纯文本"
+     * 这件事本来就**不该做**：那等于把二进制当文本塞进库，产出一批能检索、能被引用、
+     * 但毫无意义的乱码 chunk（`parser.ts` 文件头记录的正是这个教训）。所以删掉字段，
+     * 而不是把它接活。
+     */
     url: string;
-    fallback: "mineru" | "textonly" | "none";
     /**
      * 文档解析超时（毫秒）。默认 60s——远高于普通接口，
      * 因为 pdf/扫描件解析本身就慢，用 8s 这种默认值会必然超时。
@@ -156,59 +398,40 @@ export interface Config {
   };
 
   /**
-   * 抖音公开数据（自托管 DTK：Evil0ctal/Douyin_TikTok_Download_API）。
+   * M4 平台内公开内容采集（复用 MediaCrawler，经独立 collector sidecar）。
    *
-   * 定位：给达人/内容/舆情补一条**平台内**的公开信息通道，补 web_search 抓不到的
-   * 作品数据与评论。只做只读子集：达人主页 / 作品列表 / 作品详情 / 评论。
+   * 架构：MediaCrawler 是一个**任务控制面**（POST /api/crawler/start → 子进程跑
+   * Playwright → 结果落盘 data/），不是查询面。所以中间加了 `apps/collector`
+   * 这层只读归一化 sidecar：它负责跑采集任务、把各平台的原始 jsonl 归一化成
+   * 统一行、缓存到本地，再对 brandsale 暴露同步的只读 `/query`。
+   * 适配器只认 collector，**不直接打 MediaCrawler**，也不碰它的源码。
    *
-   * ⚠️ 分级是 **L3（公开）**，不是 L1。这是红线：
-   *   这条链路与抖音平台之间**不存在授权合同**，拿到的是公开可见的内容。
-   *   标成 L1 等于把"公开采集"洗成"甲方授权实测"，报告会据此把数字标成高置信度——
-   *   而这条数据既不来自甲方后台、也没经过人工核验。L3 源还禁止填 contractRef
-   *   （见 governance 的 assertSourceRegistration），从写入口就堵住这种伪装。
+   * ⚠️ **许可证红线（务必先读）**：MediaCrawler 的许可证是
+   * `NON-COMMERCIAL LEARNING LICENSE 1.1`，条件第 3 条明确：
+   * 「未经版权所有者书面同意，不得将本软件用于任何商业用途」。
+   * brandsale 是商业交付系统（报告直接指导甲方真实投放预算），所以这条链路
+   * 只有在**取得版权方书面同意**或**你已在合规上明确接受该风险**之后才允许打开。
+   * `licenseAcknowledged` 就是这道闸：默认 false，为 false 时七个适配器与
+   * 七个工具**一律不注册**——把"引入一个非商用组件"固化成一个必须显式做的决定，
+   * 而不是顺手配个地址就悄悄生效。
    *
-   * 未配置 baseUrl 时适配器不注册，douyin_* 工具也不会出现在 Agent 的工具清单里
-   * （与 web_search 同一模式）——宁可没有这项能力，也不要让模型调一个必然失败的工具。
+   * 分级：全部 **L3**（公开、未经人工核验）。与平台之间**不存在授权合同**，
+   * 因此绝不填 contractRef（governance 的 assertSourceRegistration 会以
+   * E-GOV-005 在登记期拦下），报告里也只能支撑"关于他人"的公开断言。
    */
-  douyin: {
+  mediaCrawler: {
     enabled: boolean;
-    /** 自托管服务地址，例如 http://127.0.0.1:8000（留空 = 能力缺席） */
-    baseUrl: string;
-    /** DTK v5 需要 API Key；v4 留空即可。非空时带 Authorization: Bearer */
-    apiKey: string;
-    /** DTK 形态（决定端点默认值与 `wait` 语义），默认 v5 */
-    style: DouyinStyle;
+    /** collector sidecar 地址，例如 http://127.0.0.1:8890（留空 = 能力缺席） */
+    collectorBaseUrl: string;
+    timeoutMs: number;
+    cacheTtlSeconds: number;
     /**
-     * 同步等待参数。v4 用 `true`，v5 用**秒数**。默认随 style 走，
-     * 单独可覆盖（v5 身份池繁忙时可以调大，上限是 DTK 的 `api.max_wait_seconds`）。
+     * 是否已确认接受 MediaCrawler 的非商用许可约束（或已获版权方书面同意）。
+     * **必须显式打开**，否则整条链路的适配器与工具都不注册。
      */
-    wait: string;
-    timeoutMs: number;
-    /** 采集类结果变化慢，默认缓存 30 分钟 */
-    cacheTtlSeconds: number;
-    paths: DouyinPaths;
-  };
-
-  /**
-   * 小红书公开内容（自托管**只读**代理）。
-   *
-   * 为什么必须经代理而不是直连：可用的开源采集工具（如 xiaohongshu-cli）是 CLI、
-   * 需要登录态 Cookie、且**同时提供写命令**（发笔记/点赞/评论/关注/删除）。
-   * 整包封装会让模型有机会以甲方账号名义产生副作用。所以这里约定一个
-   * **只暴露只读子命令**的 HTTP 代理作为唯一边界，适配器只认这个契约。
-   *
-   * 分级同为 **L3**：内容本身公开可见，但访问经过登录态、且未经人工核验，
-   * provenance.note 必须如实写明这两点。
-   */
-  xiaohongshu: {
-    enabled: boolean;
-    /** 自托管只读代理地址，例如 http://127.0.0.1:8899（留空 = 能力缺席） */
-    baseUrl: string;
-    /** 代理侧若配了访问令牌则一致填写；留空表示代理无鉴权 */
-    apiKey: string;
-    timeoutMs: number;
-    cacheTtlSeconds: number;
-    paths: XhsPaths;
+    licenseAcknowledged: boolean;
+    /** 各平台开关。默认七平台全开；只登录了部分平台时可在这里收窄 */
+    platforms: Record<MediaCrawlerPlatform, boolean>;
   };
 
   tiers: { L1: boolean; L2: boolean; L3: boolean; L4: boolean };
@@ -218,9 +441,9 @@ export interface Config {
      * 是否允许注册 `mutating` 工具（会改变外部系统状态：发帖/点赞/评论/关注/删除）。
      *
      * 默认 **false**。让"引入写能力"成为一次主动决策，而不是封装数据源时的副作用：
-     * 公开采集类工具包（如 xiaohongshu-cli）自带写操作，整包封装后
-     * 模型可以合法地通过白名单、合法地过闸门，然后以甲方名义发出一条笔记。
-     * 打开它之前请确认：工具已挂 authz 检查、且只封装了确实需要的写命令。
+     * 公开采集类工具包普遍**读写同包**（如 xiaohongshu-cli 一类项目，发笔记/点赞/评论/关注
+     * 与只读命令出自同一 CLI），整包封装后模型可以合法地通过白名单、合法地过闸门，
+     * 然后以甲方名义发出一条笔记。打开它之前请确认：工具已挂 authz 检查、且只封装了确实需要的写命令。
      */
     allowMutating: boolean;
   };
@@ -251,7 +474,11 @@ export interface Config {
   gateFailClosed: boolean;
 }
 
-function parseDotEnv(path: string): Record<string, string> {
+/**
+ * 导出给同仓的 collector 用：sidecar 与主程序读**同一份 .env**，
+ * 避免两处各写一个解析器导致「.env 改了但只有一边生效」。
+ */
+export function parseDotEnv(path: string): Record<string, string> {
   if (!existsSync(path)) return {};
   const out: Record<string, string> = {};
   for (const rawLine of readFileSync(path, "utf8").split(/\r?\n/)) {
@@ -282,26 +509,37 @@ const num = (v: string | undefined, dflt: number): number => {
 
 const str = (v: string | undefined, dflt = ""): string => (v === undefined ? dflt : v);
 
+/**
+ * 解析平台开关列表。
+ *
+ * 用**列表**而不是七个布尔变量：收窄平台是常见操作（例如只登录了抖音+小红书），
+ * 写成 `BM_MC_PLATFORMS=dy,xhs` 比在七个 `BM_MC_PLATFORM_*=true/false` 里翻找清楚得多。
+ * 认不出的平台码**直接抛错**而不是静默忽略——写错 `BM_MC_PLATFORMS=dy,xhss` 却以为
+ * 小红书开着，是最难排查的一类配置事故。
+ */
+function parsePlatformList(raw: string): Record<MediaCrawlerPlatform, boolean> {
+  const out = {} as Record<MediaCrawlerPlatform, boolean>;
+  for (const p of MEDIA_CRAWLER_PLATFORMS) out[p] = false;
+  const items = raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  for (const item of items) {
+    if (!(MEDIA_CRAWLER_PLATFORMS as readonly string[]).includes(item)) {
+      throw new Error(
+        `BM_MC_PLATFORMS 含未知平台码「${item}」。可选：${MEDIA_CRAWLER_PLATFORMS.join(", ")}`,
+      );
+    }
+    out[item as MediaCrawlerPlatform] = true;
+  }
+  return out;
+}
+
 export function loadConfig(cwd: string = process.cwd(), overrides: Record<string, string> = {}): Config {
   const fileVars = parseDotEnv(resolve(cwd, ".env"));
   const env: Record<string, string> = { ...fileVars, ...overrides };
   const get = (k: string, fallback?: string): string | undefined =>
     overrides[k] ?? process.env[k] ?? env[k] ?? fallback;
-
-  /**
-   * DTK 形态。认不出的值**不静默退回默认**——写错 `BM_DOUYIN_STYLE=v6` 却按 v5
-   * 的路径去请求，得到的是四个 404，排查成本远高于现在直接报错。
-   */
-  const douyinStyle = (): DouyinStyle => {
-    const raw = str(get("BM_DOUYIN_STYLE"), "v5").toLowerCase();
-    if (raw !== "v4" && raw !== "v5") {
-      throw new Error(
-        `BM_DOUYIN_STYLE 只能是 v4 或 v5，收到「${raw}」。` +
-          `当前仓库 docker compose 装出来的 DTK 是 v5；若你自建的是老版本，显式设成 v4。`,
-      );
-    }
-    return raw;
-  };
 
   const dataDir = resolve(cwd, str(get("BM_DATA_DIR"), "./.data"));
   const envName = str(get("BM_ENV"), "dev") as Env;
@@ -316,6 +554,9 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
       sqlitePath: resolve(dataDir, "brandsale.sqlite"),
     },
 
+    // 默认**不参考**本地演示样例；只有显式打开才允许它进入检索与报告
+    allowDemoData: bool(get("BM_ALLOW_DEMO_DATA"), false),
+
     llm: {
       mode: str(get("BM_LLM_MODE"), "live") === "mock" ? "mock" : "live",
       baseUrl: str(get("BM_LLM_BASE_URL"), "http://127.0.0.1:8000/v1").replace(/\/+$/, ""),
@@ -326,7 +567,9 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
         light: str(get("BM_MODEL_LIGHT"), "qwen3.8-flash-next"),
       },
       concurrency: num(get("BM_LLM_CONCURRENCY"), 4),
-      timeoutMs: num(get("BM_LLM_TIMEOUT_MS"), 180_000),
+      /* 单次请求超时（流式语义=空闲超时）。自建端点有冷启动：未驻留时可能"连上但
+       * 数分钟不吐 token"，故默认给到 5 分钟，且阶段预算会在此基础上再加余量。 */
+      timeoutMs: num(get("BM_LLM_TIMEOUT_MS"), 300_000),
       maxRetries: num(get("BM_LLM_MAX_RETRIES"), 2),
       maxOutputTokens: num(get("BM_LLM_MAX_OUTPUT_TOKENS"), 4096),
       disableThinking: bool(get("BM_LLM_DISABLE_THINKING"), true),
@@ -337,9 +580,17 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
     },
 
     retrieval: {
-      vectorDriver: str(get("BM_VECTOR_DRIVER"), "memory") === "qdrant" ? "qdrant" : "memory",
+      vectorDriver: str(get("BM_VECTOR_DRIVER"), "memory") === "milvus" ? "milvus" : "memory",
       embedUrl: str(get("BM_EMBED_URL")),
       embedModel: str(get("BM_EMBED_MODEL")),
+      // 默认 768：EmbeddingGemma 2 的原生维度。用哈希兜底时该值不参与（哈希固定 256）。
+      embedDim: num(get("BM_EMBED_DIM"), 768),
+      embedBatchSize: num(get("BM_EMBED_BATCH_SIZE"), 32),
+      embedTimeoutMs: num(get("BM_EMBED_TIMEOUT_MS"), 60_000),
+      milvusUri: str(get("BM_MILVUS_URI"), "http://127.0.0.1:19530"),
+      milvusToken: str(get("BM_MILVUS_TOKEN")),
+      milvusCollection: str(get("BM_MILVUS_COLLECTION"), "brandsale_kb"),
+      milvusTimeoutMs: num(get("BM_MILVUS_TIMEOUT_MS"), 3_000),
       rerankUrl: str(get("BM_RERANK_URL")),
       rerankModel: str(get("BM_RERANK_MODEL")),
       rerankPoolSize: num(get("BM_RERANK_POOL_SIZE"), 50),
@@ -347,9 +598,12 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
       rerankCooldownMs: num(get("BM_RERANK_COOLDOWN_MS"), 30_000),
     },
 
+    knowledge: {
+      summaryIngest: bool(get("BM_SUMMARY_INGEST"), true),
+    },
+
     parser: {
       url: str(get("BM_PARSER_URL")),
-      fallback: (str(get("BM_PARSER_FALLBACK"), "textonly") as Config["parser"]["fallback"]) ?? "textonly",
       timeoutMs: num(get("BM_PARSER_TIMEOUT_MS"), 60_000),
     },
 
@@ -372,36 +626,14 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
       prefetch: bool(get("BM_WEB_SEARCH_PREFETCH"), true),
     },
 
-    douyin: {
-      enabled: bool(get("BM_DOUYIN_ENABLED"), true),
+    mediaCrawler: {
+      enabled: bool(get("BM_MC_ENABLED"), false),
       // 去掉结尾斜杠：适配器按 `${baseUrl}${path}` 拼接，双斜杠在某些反代上会 404
-      baseUrl: str(get("BM_DOUYIN_BASE_URL")).replace(/\/+$/, ""),
-      apiKey: str(get("BM_DOUYIN_API_KEY")),
-      style: douyinStyle(),
-      wait: str(get("BM_DOUYIN_WAIT")) || DOUYIN_DEFAULT_WAIT[douyinStyle()],
-      timeoutMs: num(get("BM_DOUYIN_TIMEOUT_MS"), 15_000),
-      cacheTtlSeconds: num(get("BM_DOUYIN_CACHE_TTL"), 1_800),
-      paths: {
-        profile: str(get("BM_DOUYIN_PATH_PROFILE")) || DOUYIN_DEFAULT_PATHS[douyinStyle()].profile,
-        posts: str(get("BM_DOUYIN_PATH_POSTS")) || DOUYIN_DEFAULT_PATHS[douyinStyle()].posts,
-        video: str(get("BM_DOUYIN_PATH_VIDEO")) || DOUYIN_DEFAULT_PATHS[douyinStyle()].video,
-        comments: str(get("BM_DOUYIN_PATH_COMMENTS")) || DOUYIN_DEFAULT_PATHS[douyinStyle()].comments,
-      },
-    },
-
-    xiaohongshu: {
-      enabled: bool(get("BM_XHS_ENABLED"), true),
-      baseUrl: str(get("BM_XHS_BASE_URL")).replace(/\/+$/, ""),
-      apiKey: str(get("BM_XHS_API_KEY")),
-      // 小红书代理内部是 spawn CLI + 内置人类化延迟（~1-1.5s/次），超时给得比抖音宽
-      timeoutMs: num(get("BM_XHS_TIMEOUT_MS"), 25_000),
-      cacheTtlSeconds: num(get("BM_XHS_CACHE_TTL"), 1_800),
-      paths: {
-        note: str(get("BM_XHS_PATH_NOTE"), "/xhs/note"),
-        comments: str(get("BM_XHS_PATH_COMMENTS"), "/xhs/comments"),
-        user: str(get("BM_XHS_PATH_USER"), "/xhs/user"),
-        userPosts: str(get("BM_XHS_PATH_USER_POSTS"), "/xhs/user-posts"),
-      },
+      collectorBaseUrl: str(get("BM_MC_COLLECTOR_URL")).replace(/\/+$/, ""),
+      timeoutMs: num(get("BM_MC_TIMEOUT_MS"), 15_000),
+      cacheTtlSeconds: num(get("BM_MC_CACHE_TTL"), 1_800),
+      licenseAcknowledged: bool(get("BM_MC_LICENSE_ACK"), false),
+      platforms: parsePlatformList(str(get("BM_MC_PLATFORMS"), MEDIA_CRAWLER_PLATFORMS.join(","))),
     },
 
     tiers: {
@@ -453,27 +685,25 @@ export function assertConfigInvariants(c: Config): string[] {
   if (c.webSearch.enabled && !c.webSearch.apiKey) {
     problems.push("BM_WEB_SEARCH_ENABLED=true 但 BM_WEB_SEARCH_API_KEY 为空：联网检索适配器与 web_search 工具都不会注册");
   }
-  // 这两个源的注册条件是 baseUrl（自托管地址），不是凭据：
-  // 抖音适配器打的是自建 DTK 服务，小红书打的是只读代理，都是"地址在则能力在"。
-  if (c.douyin.enabled && !c.douyin.baseUrl) {
+
+  /* 平台采集链路的三道门。这里只**提示**、不阻断——collector 可能稍后才起，
+   * 但三道门缺任何一道，七个适配器与七个工具都不会注册，必须让人看见为什么。 */
+  if (c.mediaCrawler.enabled && !c.mediaCrawler.licenseAcknowledged) {
     problems.push(
-      "BM_DOUYIN_ENABLED=true 但 BM_DOUYIN_BASE_URL 为空：抖音公开数据适配器与 douyin_* 工具都不会注册。" +
-        "自建 DTK（Evil0ctal/Douyin_TikTok_Download_API）后把地址填进去即可；本地联调可用 npm run datasource:lab",
+      "BM_MC_ENABLED=true 但 BM_MC_LICENSE_ACK 未开启：MediaCrawler 为非商用许可" +
+        "（NON-COMMERCIAL LEARNING LICENSE 1.1，条件第 3 条禁止未经书面同意的商业用途），" +
+        "在取得版权方书面同意或明确接受该风险之前，七个平台的采集适配器与工具都不会注册",
     );
   }
-  // v5 默认强制鉴权（dtk 5.1 起每个端点都要 API Key 或有 `api.public_endpoints` 显式放开），
-  // 而 v4 完全不校验。这里只提醒，不阻断——运维可能确实放开了公开端点。
-  if (c.douyin.enabled && c.douyin.baseUrl && c.douyin.style === "v5" && !c.douyin.apiKey) {
+  if (c.mediaCrawler.enabled && !c.mediaCrawler.collectorBaseUrl) {
     problems.push(
-      "BM_DOUYIN_STYLE=v5 但 BM_DOUYIN_API_KEY 为空：DTK v5 默认要求鉴权，" +
-        "四个端点会返回 401/403。请在 DTK 控制台建一个 Key，或把对应端点加入 api.public_endpoints",
+      "BM_MC_ENABLED=true 但 BM_MC_COLLECTOR_URL 为空：采集适配器与平台工具都不会注册。" +
+        "先起 collector sidecar（npm run collector），再填入其地址",
     );
   }
-  if (c.xiaohongshu.enabled && !c.xiaohongshu.baseUrl) {
-    problems.push(
-      "BM_XHS_ENABLED=true 但 BM_XHS_BASE_URL 为空：小红书只读适配器与 xhs_* 工具都不会注册。" +
-        "自建只读代理后填入地址；本地联调可用 npm run datasource:lab",
-    );
+  const enabledPlatforms = MEDIA_CRAWLER_PLATFORMS.filter((p) => c.mediaCrawler.platforms[p]);
+  if (c.mediaCrawler.enabled && enabledPlatforms.length === 0) {
+    problems.push("BM_MC_ENABLED=true 但 BM_MC_PLATFORMS 为空：没有任何平台被启用");
   }
   return problems;
 }

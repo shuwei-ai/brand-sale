@@ -239,6 +239,70 @@ export const MIGRATIONS: { id: number; name: string; sql: string }[] = [
     );
     `,
   },
+  {
+    /**
+     * 数据真实性标记（见 `DataProvenance`）。
+     *
+     * 起因（业主反馈）：报告里的人选昵称是 seed 灌入的演示样例，在平台上搜不到，
+     * 于是整份报告的可信度都成了疑问。根因不是"写了人名"，而是**样例数据与真实数据
+     * 在库里长得一模一样**，谁都分不出来。这里给三张会被人读到的表加上来源标记，
+     * 读取侧（PricingStore / KB 检索）默认把 `demo` 过滤掉。
+     *
+     * 存量数据只标**确定来自 seed 的行**（id 白名单），不猜、不连坐：
+     * 之后真实录入的达人/报价/语料都是 `unknown`（按 live 处理），不会被误伤。
+     */
+    id: 3,
+    name: "data-provenance",
+    sql: `
+    ALTER TABLE talents   ADD COLUMN provenance TEXT NOT NULL DEFAULT 'unknown';
+    ALTER TABLE pricing   ADD COLUMN provenance TEXT NOT NULL DEFAULT 'unknown';
+    ALTER TABLE kb_chunks ADD COLUMN provenance TEXT NOT NULL DEFAULT 'unknown';
+    -- 平台账号的可核验标识（抖音号 / 小红书号 / 主页链接）。空 = 只知道昵称、不知道账号。
+    ALTER TABLE talents   ADD COLUMN account_ref TEXT;
+
+    -- 存量：seed.ts 的 5 位样例达人及其 10 条报价
+    UPDATE talents SET provenance = 'demo'
+      WHERE talent_id IN ('t_1001','t_1002','t_1003','t_1004','t_1005');
+    UPDATE pricing SET provenance = 'demo'
+      WHERE record_id LIKE 'prc_t_10%';
+
+    -- 存量：seed.ts 的演示语料（KB-2 复盘 / KB-3 情报 / KB-4 方法论），按 chunk_id 精确匹配
+    UPDATE kb_chunks SET provenance = 'demo'
+      WHERE chunk_id IN ('KB-3_1','KB-3_2','KB-3_3','KB-3_4','KB-3_5',
+                         'KB-2_1','KB-2_2','KB-2_3','KB-2_4','KB-2_5',
+                         'KB-4_1','KB-4_2','KB-4_3');
+
+    CREATE INDEX IF NOT EXISTS idx_chunks_provenance ON kb_chunks(provenance);
+    CREATE INDEX IF NOT EXISTS idx_talents_provenance ON talents(provenance);
+    `,
+  },
+  {
+    /**
+     * 向量落盘（P1：报告摘要 → 向量库回灌的第一步）。
+     *
+     * 起因：检索的"语义通道"至今是 `hashEmbed()`（256 维字符 n-gram）**现算**——
+     * 换成真模型（如 EmbeddingGemma 2，768 维）后，一次 `retrieve()` 要对候选池里
+     * 每一行做一次前向，冷启动会退化到秒级。落盘把成本从"每次查询"压到"写入一次"。
+     *
+     * 为什么以 BLOB 存在 kb_chunks 而不是另开一张向量表：
+     *   向量必须和它所属的 chunk **同生共死**。放在同一行，`purgeChunks()` /
+     *   `writeChunks()` 的单事务语义天然覆盖向量——不会出现"chunk 删了、向量还在"
+     *   （那会让已撤回的内容仍被语义召回）。另开表就要自己写补偿删除。
+     *
+     * `embed_model` / `embed_dim` 不是冗余字段，是**混用守卫**：
+     *   256 维哈希向量与 768 维模型向量不在同一空间，`cosine()` 会算出无意义的分数
+     *   而**不报错**。只有 `embed_model` + `embed_dim` 都与当前 provider 一致的行，
+     *   才允许参与 cosine；不一致的一律视为"该行无语义向量"，退回纯 BM25。
+     */
+    id: 4,
+    name: "kb-vectors",
+    sql: `
+    ALTER TABLE kb_chunks ADD COLUMN vec         BLOB;
+    ALTER TABLE kb_chunks ADD COLUMN embed_model TEXT;
+    ALTER TABLE kb_chunks ADD COLUMN embed_dim   INTEGER;
+    CREATE INDEX IF NOT EXISTS idx_chunks_embed_model ON kb_chunks(embed_model);
+    `,
+  },
 ];
 
 export function openDb(sqlitePath: string): Db {

@@ -15,8 +15,9 @@
  *   · 二进制（pdf/docx/xlsx/pptx/图片）→ 交给 MinerU（BM_PARSER_URL）
  *     MinerU 可自部署（Apache-2.0），对外只暴露一个 POST /file_parse
  *
- * 这个文件同时把 `config.parser`（BM_PARSER_URL / BM_PARSER_FALLBACK）
- * 从**死配置**接活——此前全代码库零引用。
+ * 这个文件把 `config.parser.url`（BM_PARSER_URL）从**死配置**接活——此前全代码库零引用。
+ * 同组的 `BM_PARSER_FALLBACK` 则被**删掉**而不是接活：它同样是死配置，但"解析器挂了就
+ * 退回纯文本"恰恰是上面那条原则要防的事，接活它等于给自己留了一个静默产垃圾的口子。
  */
 
 import { AppError } from "@brandsale/contracts";

@@ -27,7 +27,8 @@ import {
 import { AppError, isAppError } from "@brandsale/contracts";
 import { completeBriefDraft } from "@brandsale/agent-pack";
 import { createContainer, type Container } from "./container.ts";
-import { consoleHtml } from "./console.ts";
+import { bootstrapHtml } from "./bootstrap.ts";
+import { resolveWebDist, serveStatic, webDistBuiltAt, type StaticMount } from "./static.ts";
 
 const json = (res: ServerResponse, status: number, body: unknown): void => {
   const payload = JSON.stringify(body);
@@ -69,7 +70,10 @@ function authenticate(req: IncomingMessage): TenantContext {
   };
 }
 
-export function createGateway(container: Container) {
+/** 前端 SPA 的入口路径别名。这些路径一律吐 index.html（hash 路由只占用 #） */
+const SPA_ENTRY = new Set(["/", "/console", "/console/", "/index.html"]);
+
+export function createGateway(container: Container, web: StaticMount = resolveWebDist()) {
   const { orchestrator, repos, config } = container;
 
   const server = createServer(async (req, res) => {
@@ -86,17 +90,27 @@ export function createGateway(container: Container) {
         tiers: config.tiers,
         gateFailClosed: config.gateFailClosed,
         warnings: container.warnings,
+        // 前端形态自证：部署到一半（只更新了后端、忘了构建前端）时能一眼看出来
+        web: { built: web.ready, dist: web.root, builtAt: webDistBuiltAt(web) },
       });
     }
 
     /**
-     * 控制台页面：公开可访问（只是张静态表单，本身不含任何业务数据）。
-     * 页内所有 API 调用仍带 Bearer token —— 不为了"页面能打开"而放宽接口鉴权。
+     * 前端页面（在鉴权之前处理）。
+     *
+     * 产物不存在（例如只 clone 了源码没跑前端构建）时，`/` 吐引导页，
+     * 告诉用户跑一次 `npm run web:build` —— `npm start` 依然开箱可用，
+     * 不会变成一个裸 404。引导页只含构建指引，不含任何业务数据与 API 调用。
+     * 页面本身公开可访问；页内所有 API 调用都带 Bearer token，
+     * 不为了"页面能打开"而放宽接口鉴权。
      */
-    if (path === "/" || path === "/console" || path === "/console/" || path === "/index.html") {
-      const html = consoleHtml({ config, mocked: container.gateway.mocked });
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html) });
-      return res.end(html);
+    if (method === "GET" && path !== "/health" && !path.startsWith(API_PREFIX)) {
+      if (serveStatic(web, SPA_ENTRY.has(path) ? "/" : path, res)) return;
+      if (SPA_ENTRY.has(path)) {
+        const html = bootstrapHtml();
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html), "Cache-Control": "no-cache" });
+        return res.end(html);
+      }
     }
 
     let ctx: TenantContext;

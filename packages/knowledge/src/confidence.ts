@@ -33,7 +33,12 @@ export class ConfidencePolicy implements IConfidencePolicy {
 
     if (input.humanVerified) s += 0.15;
 
-    if (input.crossSourceAgreement !== undefined) {
+    /* 多源交叉一致度的加分**对派生语料一律不适用**。
+     *
+     * 一份历史报告摘要与它引用的原始来源说的是同一件事；若两者都被当成
+     * "独立来源"，就会算出"两个来源相互印证"的假一致，置信度虚高。
+     * 这个错误不会报错、只会悄悄抬高分数，所以把判断放在这里而不是交给调用方自觉。 */
+    if (input.crossSourceAgreement !== undefined && !input.derived) {
       s += (clamp01(input.crossSourceAgreement) - 0.5) * 0.2;
     }
 

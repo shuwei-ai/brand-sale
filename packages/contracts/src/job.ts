@@ -96,6 +96,11 @@ export interface PhaseState {
 export type ArtifactKind =
   | "brief"
   | "intel"
+  /**
+   * 平台采集证据集（P0 溯源）：intel 阶段真实取回的逐条平台内容白名单快照。
+   * 报告里的条目级引用（ReportCitation.kind=platform_entry）只能指向它。
+   */
+  | "intel_evidence"
   | "creator_candidates"
   | "playbook"
   | "budget"

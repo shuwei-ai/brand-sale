@@ -12,7 +12,7 @@ import { loadConfig, assertConfigInvariants, type Config } from "@brandsale/conf
 import { migrate, openDb, Repositories } from "@brandsale/storage";
 import { GovernanceGate, LineageLedger, createIngestSourceGuard, externalCatalogKeys } from "@brandsale/governance";
 import { ModelGateway } from "@brandsale/model-gateway";
-import { KnowledgeService, PricingStore, createParser, type DocumentParser } from "@brandsale/knowledge";
+import { KnowledgeService, PricingStore, createParser, buildReportSummary, renderSummaryText, SUMMARY_SOURCE_ID, type DocumentParser } from "@brandsale/knowledge";
 import { createRegistry as createDataSourceRegistry } from "@brandsale/datasource";
 import { AgentPack } from "@brandsale/agent-pack";
 import { RenderService } from "@brandsale/render";
@@ -56,7 +56,7 @@ export function createContainer(config: Config = loadConfig()): Container {
   // 入库来源守卫由这里注入：knowledge 不能依赖 governance（会让依赖矩阵多一条边），
   // 而"授权是否生效中"的语义只该有一份实现（AuthzRepo.active）。
   const knowledge = new KnowledgeService(db, config, createIngestSourceGuard(repos));
-  const pricing = new PricingStore(db);
+  const pricing = new PricingStore(db, { allowDemo: config.allowDemoData });
   const datasources = createDataSourceRegistry(db, config);
   const render = new RenderService(config);
   // 文档解析器（P1-5）：BM_PARSER_URL 非空即启用 MinerU，否则仅支持纯文本。
@@ -94,8 +94,65 @@ export function createContainer(config: Config = loadConfig()): Container {
     );
   }
 
+  /* 启动提示：向量索引配置自相矛盾时提前说清，别等检索时静默降级。
+   * Milvus 里存的必须是模型向量；没有嵌入服务就没有"语义"，配了也只是白跑。 */
+  if (config.retrieval.vectorDriver === "milvus" && !config.retrieval.embedUrl) {
+    warnings.push(
+      "BM_VECTOR_DRIVER=milvus 但 BM_EMBED_URL 为空：外部向量索引不会启用（语义通道退回本地哈希向量）。Milvus 必须配合嵌入服务使用，先 `npm run embedding:up` 并配置 BM_EMBED_URL。",
+    );
+  }
+  if (!config.retrieval.embedUrl) {
+    warnings.push(
+      "未配置 BM_EMBED_URL：检索的语义通道仍使用 256 维字符哈希占位实现（本质是词袋，不是语义向量）。要启用真语义检索，起嵌入服务后设置 BM_EMBED_URL，并 `npm run embedding:backfill` 补算存量向量。",
+    );
+  }
+
   const bus = new EventBus(repos);
-  const orchestrator = new Orchestrator({ config, repos, agentPack, render, bus });
+  const orchestrator = new Orchestrator({
+    config,
+    repos,
+    agentPack,
+    render,
+    bus,
+    /**
+     * 报告产出后把「机械抽取的摘要」回灌 KB-2（P1）。
+     *
+     * 为什么放在装配层：orchestrator 不允许依赖 knowledge（依赖矩阵），
+     * 而这件事需要同时用到两者——回灌要写知识库，时机由编排层给。
+     *
+     * 为什么用**机械抽取**而不是让模型总结：摘要会被后续任务当既往资料检索到。
+     * 一旦它是模型生成的，就形成「模型产物→存库→被当事实引用→再生成模型产物」的回环，
+     * 报告里每个数字仍"挂着引用"，但引用指向的是另一个模型的猜测（集成方案 §5.1）。
+     *
+     * 幂等：title 与 publishedAt 都由 jobId / job.createdAt 决定 → 同一任务的
+     * rerun 覆盖同一份文档，而不是在库里堆出多份几乎相同的摘要。
+     */
+    onReportReady: async ({ job, dsl, ctx }) => {
+      if (!config.knowledge.summaryIngest) return;
+      const summary = buildReportSummary(dsl, job);
+      await knowledge.ingestGeneratedDocument(
+        {
+          title: `报告摘要 ${job.jobId}`,
+          collection: "KB-2",
+          sourceId: SUMMARY_SOURCE_ID,
+          mime: "text/markdown",
+          content: renderSummaryText(summary),
+          publishedAt: job.createdAt,
+          sampleSize: summary.keyNumbers.length,
+          meta: {
+            jobId: job.jobId,
+            // derived=true：下游算"多源交叉一致度"时必须把它排除（否则自证自话）
+            derived: true,
+            kind: SUMMARY_SOURCE_ID,
+            reportTitle: summary.title,
+            sections: summary.sections.length,
+            keyNumbers: summary.keyNumbers.length,
+          },
+        },
+        { tenantId: ctx.tenantId, jobId: job.jobId, traceId: ctx.traceId },
+      );
+    },
+  });
 
   return {
     config,

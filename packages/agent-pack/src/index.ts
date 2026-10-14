@@ -2,9 +2,9 @@
  * @brandsale/agent-pack —— M9 AgentPack + M10 ToolRegistry
  */
 
-export { AgentPack, MOCK_BRIEF, extractJsonObject, type AgentRuntimeDeps, type PhaseResult, type PhaseStrategy } from "./agents.ts";
+export { AgentPack, BRIEF_PLATFORM_TO_MC, DeltaPump, MOCK_BRIEF, createToolCallGuard, extractJsonObject, platformPrefetchArgs, type AgentRuntimeDeps, type PhaseResult, type PhaseStrategy, type ToolCallGuardDecision } from "./agents.ts";
 export { ToolRegistry, policy, TIER_GOVERNANCE, type ToolCallContext, type ToolCallRecord, type ToolDeps, type ToolImpl } from "./tools.ts";
-export { PHASE_TOOL_HINT, TOOL_IMPLEMENTATIONS, admitTool, registerAllTools, bindDeps } from "./tool-impls.ts";
+export { PHASE_TOOL_HINT, TOOL_IMPLEMENTATIONS, PLATFORM_TOOLS, PLATFORM_TOOL_NAME, PLATFORM_DIGEST_TOOL_NAME, admitTool, registerAllTools, bindDeps } from "./tool-impls.ts";
 export { SYSTEM_PROMPTS, contextBlock } from "./prompts.ts";
 export {
   ALL_SCHEMAS,
@@ -22,5 +22,53 @@ export {
   type PlaybookOutput,
   type SchemaDef,
 } from "./schemas.ts";
-export { synthBudget, synthCreators, synthIntel, synthPlaybook, synthReport, type PrefetchedToolData } from "./synthesis.ts";
+export {
+  APPENDIX_ENTRY_LIMIT,
+  CREATOR_ROSTER_MARK,
+  PLACEHOLDER_CREATOR_PREFIX,
+  PLATFORM_ACCOUNT_LIMIT,
+  PLATFORM_ACCOUNT_MARK,
+  PLATFORM_CREATOR_INJECT_LIMIT,
+  PLATFORM_CREATOR_KEY,
+  PLATFORM_CREATOR_LIMIT,
+  PLATFORM_CREATOR_PREFIX,
+  TIER_LABEL,
+  aggregatePlatformAccounts,
+  creatorAccountRows,
+  creatorEvidenceCount,
+  creatorEvidenceUrl,
+  creatorProvenanceBlocks,
+  creatorRosterBlocks,
+  creatorSourceOf,
+  enrichReportProvenance,
+  ensurePlatformCreators,
+  fillCreatorTiers,
+  mergePlatformEvidences,
+  platformAccountBlocks,
+  platformAccountRows,
+  platformCandidateId,
+  platformCreatorCandidates,
+  platformEvidencesFrom,
+  pruneUnverifiableCreators,
+  summarizeEvidence,
+  synthBudget,
+  synthCreators,
+  synthIntel,
+  synthPlaybook,
+  synthReport,
+  unwrap,
+  type PlatformAccountAgg,
+  type PrefetchedToolData,
+} from "./synthesis.ts";
+export {
+  EVIDENCE_EXCERPT_MAX,
+  EVIDENCE_MAX_PER_JOB,
+  EVIDENCE_QUOTE_MAX,
+  EvidenceRegistry,
+  evidenceIdOf,
+  evidenceKindOfOp,
+  toEvidenceEntries,
+  type EvidenceRecordResult,
+  type EvidenceRowInput,
+} from "./evidence.ts";
 export { completeBriefDraft, type BriefParseResult } from "./brief-parse.ts";

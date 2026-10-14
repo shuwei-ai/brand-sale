@@ -17,9 +17,11 @@ import {
   autoRepair,
   type Block,
   type DslIssue,
+  type ReportCitation,
   type ReportDsl,
   type ReportValidationOptions,
   type SlideSpec,
+  type SourceCatalog,
 } from "@brandsale/contracts";
 import { validateReportDsl } from "@brandsale/contracts";
 import type { Config } from "@brandsale/config";
@@ -34,7 +36,7 @@ export interface CompileResult {
   kind: "markdown" | "html";
   ref: { path?: string; inline: string };
   slideCount: number;
-  repairs: { slideIndex: number; issue: string; action: string }[];
+  repairs: { slideIndex: number; issue: string; action: string; severity: "data" | "cosmetic" }[];
   dropped: { slideIndex: number; content: string; reason: string }[];
 }
 
@@ -96,8 +98,9 @@ export class RenderService implements IRenderService {
     const repairs: CompileResult["repairs"] = [];
 
     // 自动修复可修复项（warn 级 + 来源降级），先修再判，避免"能修的问题"变成硬失败
-    const { dsl: fixed, actions } = autoRepair(dsl, opts);
-    actions.forEach((a) => repairs.push({ slideIndex: -1, issue: "invariant", action: a }));
+    const { dsl: fixed, actions, cosmeticActions } = autoRepair(dsl, opts);
+    actions.forEach((a) => repairs.push({ slideIndex: -1, issue: "invariant", action: a, severity: "data" }));
+    cosmeticActions.forEach((a) => repairs.push({ slideIndex: -1, issue: "invariant", action: a, severity: "cosmetic" }));
 
     const post = validateReportDsl(fixed, opts);
     if (!post.ok) {
@@ -108,10 +111,11 @@ export class RenderService implements IRenderService {
 
     // 图片协议白名单：非法地址在这里被摘掉，而不是让前端去加载
     const { dsl: safe, dropped } = this.sanitizeImages(fixed);
-    dropped.forEach((d) => repairs.push({ slideIndex: d.slideIndex, issue: "image.ref", action: `丢弃非法图片地址 ${d.reason}` }));
+    dropped.forEach((d) => repairs.push({ slideIndex: d.slideIndex, issue: "image.ref", action: `丢弃非法图片地址 ${d.reason}`, severity: "data" }));
 
-    const markdown = this.toMarkdown(safe);
-    const html = this.toHtml(safe);
+    // 目录要一路带到渲染：条目级引用（platform_entry）的 URL/作者/时间全靠它反查
+    const markdown = this.toMarkdown(safe, opts);
+    const html = this.toHtml(safe, opts);
     const isHtml = this.config.render.engine !== "presenton";
     return {
       kind: isHtml ? "html" : "markdown",
@@ -141,7 +145,31 @@ export class RenderService implements IRenderService {
 
   /* ── Markdown ─────────────────────────────────────────── */
 
-  toMarkdown(dsl: ReportDsl): string {
+  /**
+   * 引用行的展示信息。
+   *
+   * 条目级引用（platform_entry）**只存 entryId** —— 平台名、标题、URL、发布时间都不在 DSL 里，
+   * 而是拿 entryId 去证据表反查。这条设计直接消灭了一类问题：模型写不出假链接，
+   * 因为它根本不提供链接。反查不到就如实显示"未登记"，而不是编一个出来。
+   */
+  private citeDetail(
+    c: ReportCitation,
+    catalog?: SourceCatalog,
+  ): { platform?: string; label: string; url?: string; meta?: string } {
+    if (c.kind !== "platform_entry") {
+      return { label: c.ref.sourceKey ?? c.ref.chunkId ?? "模型推断" };
+    }
+    const entry = catalog?.evidenceEntries?.find((e) => e.entryId === c.ref.entryId);
+    if (!entry) return { label: c.ref.entryId ?? "（缺 entryId）", meta: "未在本次证据表中找到" };
+    const meta = [
+      entry.publishedAt ? `发布 ${entry.publishedAt.slice(0, 10)}` : "发布时间未知",
+      entry.collectedAt ? `采集 ${entry.collectedAt.slice(0, 10)}` : "",
+      "L3 公开采集",
+    ].filter(Boolean);
+    return { platform: entry.platformName, label: entry.title || entry.entryId, url: entry.url || undefined, meta: meta.join(" · ") };
+  }
+
+  toMarkdown(dsl: ReportDsl, opts: ReportValidationOptions = {}): string {
     const lines: string[] = [];
     lines.push(`# ${dsl.meta.title}`);
     lines.push("");
@@ -163,10 +191,14 @@ export class RenderService implements IRenderService {
       if (slide.citations.length > 0) {
         lines.push("<sub>引用：</sub>");
         for (const c of slide.citations) {
+          const d = this.citeDetail(c, opts.catalog);
+          const where = [d.platform, d.label].filter(Boolean).join(" · ");
+          const link = d.url ? `（[原文](${d.url})）` : "";
+          const meta = d.meta ? `${d.meta} · ` : "";
           lines.push(
-            `<sub>- ${c.claim} — ${c.ref.sourceKey ?? c.ref.chunkId ?? "模型推断"}（置信度 ${c.confidence.toFixed(2)}，${c.tier}，${
+            `<sub>- ${c.claim} — ${where}${link} · ${meta}置信度 ${c.confidence.toFixed(2)}，${c.tier}，${
               c.verifiedBy === "human" ? "人工核验" : "自动"
-            }）</sub>`,
+            }</sub>`,
           );
         }
         lines.push("");
@@ -236,7 +268,7 @@ export class RenderService implements IRenderService {
 
   /* ── HTML（自包含，可直接预览/打印） ─────────────────── */
 
-  toHtml(dsl: ReportDsl): string {
+  toHtml(dsl: ReportDsl, opts: ReportValidationOptions = {}): string {
     const total = dsl.slides.length;
     const toc = this.buildToc(dsl);
     const pages = dsl.slides
@@ -257,12 +289,18 @@ export class RenderService implements IRenderService {
         ${
           slide.citations.length > 0
             ? `<div class="cites"><b>引用</b><ul>${slide.citations
-                .map(
-                  (c) =>
-                    `<li>${esc(c.claim)} — <code>${esc(c.ref.sourceKey ?? c.ref.chunkId ?? "model")}</code> · 置信度 ${c.confidence.toFixed(2)} · ${c.tier} · ${
-                      c.verifiedBy === "human" ? "人工核验" : "自动"
-                    }</li>`,
-                )
+                .map((c) => {
+                  const d = this.citeDetail(c, opts.catalog);
+                  // 有 URL 才给链接：反查不到出处时显示纯文本，绝不生成猜测性链接
+                  const where = d.url
+                    ? `<a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${esc(d.label)}</a>`
+                    : `<code>${esc(d.label)}</code>`;
+                  const badge = d.platform ? `<span class="badge">${esc(d.platform)}</span> ` : "";
+                  const meta = d.meta ? ` · <span class="citemeta">${esc(d.meta)}</span>` : "";
+                  return `<li>${badge}${esc(c.claim)} — ${where}${meta} · 置信度 ${c.confidence.toFixed(2)} · ${c.tier} · ${
+                    c.verifiedBy === "human" ? "人工核验" : "自动"
+                  }</li>`;
+                })
                 .join("")}</ul></div>`
             : ""
         }
@@ -316,6 +354,11 @@ export class RenderService implements IRenderService {
   .callout.risk{background:#fef2f2;border:1px solid #fecaca;color:var(--risk)}
   .cites{margin-top:16px;border-top:1px dashed var(--line);padding-top:10px;font-size:12.5px;color:var(--muted)}
   .cites ul{margin:6px 0 0}
+  /* 条目级溯源的视觉语言：平台徽标 + 可点的原文链接 + 采集口径 */
+  .cites .badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:999px;background:#eef4ff;color:#1f6feb;border:1px solid #d3e2fd;margin-right:4px}
+  .cites a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(31,111,235,.35)}
+  .cites a:hover{border-bottom-color:var(--accent)}
+  .cites .citemeta{color:#8a919e}
   .timeline{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}
   .timeline .ph{flex:1 1 200px;border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:#fcfcfd}
   .timeline .ph b{display:block;margin-bottom:2px}

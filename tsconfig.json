@@ -33,5 +33,8 @@
     "apps/*/src/**/*.ts",
     "scripts/**/*.ts",
     "tests/**/*.ts"
+  ],
+  "exclude": [
+    "apps/web"
   ]
 }

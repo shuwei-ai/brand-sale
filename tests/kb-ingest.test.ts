@@ -380,9 +380,9 @@ test("契约-L3 禁止填写 contractRef：防止把公开采集洗成已授权�
   assert.throws(
     () =>
       assertSourceRegistration({
-        sourceId: "douyin_web_public",
+        sourceId: "l3_public_demo",
         tenantId: DEMO_TENANT,
-        name: "抖音公开采集",
+        name: "公开采集示例源",
         tier: "L3",
         sourceType: "l3_public",
         owner: "growth",
@@ -398,9 +398,9 @@ test("契约-L3 禁止填写 contractRef：防止把公开采集洗成已授权�
   // 不带 contractRef 的 L3 必须放行（正常路径不能被误伤）
   assert.doesNotThrow(() =>
     assertSourceRegistration({
-      sourceId: "douyin_web_public",
+      sourceId: "l3_public_demo",
       tenantId: DEMO_TENANT,
-      name: "抖音公开采集",
+      name: "公开采集示例源",
       tier: "L3",
       sourceType: "l3_public",
       owner: "growth",

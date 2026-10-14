@@ -24,6 +24,7 @@ import { DataSourceRegistry, type Provenance } from "@brandsale/datasource";
 import type { GovernanceGate } from "@brandsale/governance";
 import type { KnowledgeService, PricingStore } from "@brandsale/knowledge";
 import type { Repositories } from "@brandsale/storage";
+import type { EvidenceRegistry } from "./evidence.ts";
 
 /* ── 令牌桶 ─────────────────────────────────────────────── */
 
@@ -80,6 +81,25 @@ export interface ToolCallContext {
   attempt: number;
   emit: (e: JobStreamEvent) => void;
   signal: AbortSignal;
+  /**
+   * 正在调用工具的角色。由 `ToolRegistry.invoke` 注入（调用方不必自己填）。
+   *
+   * 为什么工具需要知道"谁在调"：聚合类工具（`platform_digest`）要对**每个**绑定源
+   * 单独跑一次闸门，而闸门请求里必须带 agent。直接透传而不是在工具里猜一个默认值，
+   * 是为了让审计日志里"谁访问了哪个源"始终准确。
+   */
+  agent?: AgentCode;
+  /**
+   * 由**系统**（而非模型）发起的一次调用，不计入 `maxCallsPerJob` 的上限。
+   *
+   * 存在的唯一理由：`platform_digest` 的单任务上限（8 次）是防**模型**换着关键词反复
+   * 触发放射式采集的，但阶段收尾前系统自己还要补取一次（见 agents.ts 的
+   * `refreshPlatformData`）—— 实测模型会在 2 分钟内把 8 次额度烧光（每次都是空结果、
+   * 却各触发一批后台采集），于是补取被上限挡下，数据照样进不了报告。
+   * 系统侧的调用**数量由构造保证有界**（每个阶段最多一次），专用这个口子是有意的：
+   * 不要把模型路径标成系统调用，那等于取消上限。
+   */
+  systemCall?: boolean;
 }
 
 export interface ToolCallRecord {
@@ -108,6 +128,14 @@ export interface ToolDeps {
   knowledge: KnowledgeService;
   pricing: PricingStore;
   datasources: DataSourceRegistry;
+  /**
+   * 平台采集证据登记表（P0 溯源）。
+   *
+   * 可选是刻意的：AgentPack 装配时会补一个缺省实例（同一 job 全阶段共享），
+   * 单独构造 deps 的测试不写它也能跑 —— 证据登记是**增强**，缺了它报告还是能出，
+   * 只是条目级引用无处可查（R13 会因为 catalog 没给证据集而跳过）。
+   */
+  evidence?: EvidenceRegistry;
 }
 
 /* ── 注册表 ─────────────────────────────────────────────── */
@@ -126,7 +154,19 @@ export class ToolRegistry {
     this.tools.set(tool.policy.name, tool);
   }
 
+  /**
+   * 全部**对模型可见**的工具。
+   *
+   * `policy.hidden` 的工具（七平台单平台原语）不在其中：它们仍然注册、仍然过闸门，
+   * 但模型看不到 —— 模型只面对聚合工具 `platform_digest`。这个过滤放在唯一出口上，
+   * 而不是让每个调用方各自记得过滤（提示词里两处、toAgentTools 一处，漏一处就等于没藏住）。
+   */
   list(): ToolImpl[] {
+    return [...this.tools.values()].filter((t) => !t.policy.hidden);
+  }
+
+  /** 含隐藏工具的全量视图，供诊断 / 单测使用。**不要**拿它去构造模型可见清单 */
+  listAll(): ToolImpl[] {
     return [...this.tools.values()];
   }
 
@@ -175,7 +215,8 @@ export class ToolRegistry {
     // 1.5) 单任务调用上限：外部计费接口必须有界。
     // 令牌桶限速率不限总量，模型换着关键词就能把同一个源问一百遍；
     // 这里按 (jobId, tool) 计数，超限直接降级，让 Agent 用已有结果收尾。
-    if (tool.policy.maxCallsPerJob !== undefined) {
+    // 系统侧的收尾补取不计入（见 ToolCallContext.systemCall：它的次数由构造保证有界）。
+    if (tool.policy.maxCallsPerJob !== undefined && !tc.systemCall) {
       const key = `${tc.jobId}|${name}`;
       const used = this.jobCalls.get(key) ?? 0;
       if (used >= tool.policy.maxCallsPerJob) {
@@ -235,10 +276,12 @@ export class ToolRegistry {
     }
 
     // 4) 超时 + 重试
+    // 执行上下文里补上 agent：聚合类工具要对每个绑定源单独跑闸门，需要知道"谁在调"。
+    const execTc: ToolCallContext = { ...tc, agent };
     let lastErr: unknown;
     for (let attempt = 0; attempt <= tool.policy.retry.attempts; attempt++) {
       try {
-        const res = await withTimeout(tool.policy.timeoutMs, tc.signal, () => tool.execute(params, tc));
+        const res = await withTimeout(tool.policy.timeoutMs, tc.signal, () => tool.execute(params, execTc));
         this.log(name, agent, started, true, res.note);
         return res;
       } catch (e) {
@@ -275,7 +318,7 @@ export class ToolRegistry {
   }
 
   private log(tool: string, agent: AgentCode, startedAt: number, ok: boolean, note?: string): void {
-    this.callLog.push({ tool, agent, at: new Date().toISOString(), ms: Date.now() - startedAt, ok, cached: Boolean(note?.includes("缓存")), ...(note ? { note } : {}) });
+    this.callLog.push({ tool, agent, at: new Date().toISOString(), ms: Date.now() - startedAt, ok, cached: Boolean(note?.includes("命中缓存")), ...(note ? { note } : {}) });
   }
 
   /** 暴露给 pi-agent-core Agent 的工具定义（按 Agent 的权限过滤） */

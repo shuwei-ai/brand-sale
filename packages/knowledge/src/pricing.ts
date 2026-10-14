@@ -21,13 +21,29 @@ import { ConfidencePolicy, ageInDays } from "./confidence.ts";
 
 export class PricingStore implements IPricingStore {
   private readonly confidence = new ConfidencePolicy();
+  private readonly allowDemo: boolean;
 
-  constructor(private readonly db: Db) {}
+  /**
+   * @param opts.allowDemo 是否允许演示样例数据参与查询/估价（默认 **false**）。
+   *
+   * 过滤放在读取侧，理由见 `Config.allowDemoData` 的注释：写入口只有 seed 一处，
+   * 而"报告引用了样例数据"这类事故的后果在读取侧，闸门就该设在读取侧。
+   * 关掉的状态下，样例达人查不到、样例报价估不出 —— 调用方拿到的是"无数据"，
+   * 于是报告会如实写「无 L2 报价样本」，而不是把样例昵称与样例金额写进去。
+   */
+  constructor(private readonly db: Db, opts: { allowDemo?: boolean } = {}) {
+    this.allowDemo = opts.allowDemo ?? false;
+  }
+
+  /** 演示数据过滤片段：`allowDemo=false` 时只放行 live/unknown，`demo` 一律不可见 */
+  private get demoFilter(): string {
+    return this.allowDemo ? "" : " AND COALESCE(provenance, 'unknown') <> 'demo'";
+  }
 
   async upsertTalent(t: TalentProfile): Promise<void> {
     this.db.run(
-      `INSERT OR REPLACE INTO talents (talent_id, platform, nickname, category, followers, engagement_rate, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO talents (talent_id, platform, nickname, category, followers, engagement_rate, updated_at, provenance, account_ref)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       t.talentId,
       t.platform,
       t.nickname,
@@ -35,13 +51,15 @@ export class PricingStore implements IPricingStore {
       t.followers,
       t.engagementRate,
       nowIso(),
+      t.provenance ?? "live",
+      t.accountRef ?? null,
     );
   }
 
   async addPricing(r: PricingRecord): Promise<void> {
     this.db.run(
-      `INSERT OR REPLACE INTO pricing (record_id, talent_id, quoted_amount, actual_amount, currency, source_type, observed_at, human_verified)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO pricing (record_id, talent_id, quoted_amount, actual_amount, currency, source_type, observed_at, human_verified, provenance)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       r.recordId || newId("prc"),
       r.talentId,
       r.quoted.amount,
@@ -50,6 +68,7 @@ export class PricingStore implements IPricingStore {
       r.sourceType,
       r.observedAt,
       r.humanVerified ? 1 : 0,
+      r.provenance ?? "live",
     );
   }
 
@@ -79,8 +98,10 @@ export class PricingStore implements IPricingStore {
       category: string;
       followers: number;
       engagement_rate: number;
+      provenance: string | null;
+      account_ref: string | null;
     }>(
-      `SELECT * FROM talents ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      `SELECT * FROM talents WHERE 1 = 1 ${where.length ? `AND ${where.join(" AND ")}` : ""}${this.demoFilter}
        ORDER BY followers DESC LIMIT ?`,
       ...params,
       q.topK ?? 20,
@@ -92,6 +113,8 @@ export class PricingStore implements IPricingStore {
       category: r.category,
       followers: r.followers,
       engagementRate: r.engagement_rate,
+      provenance: r.provenance === "demo" ? "demo" : "live",
+      ...(r.account_ref ? { accountRef: r.account_ref } : {}),
     }));
   }
 
@@ -104,8 +127,18 @@ export class PricingStore implements IPricingStore {
       source_type: string;
       observed_at: string;
       human_verified: number;
-    }>("SELECT * FROM pricing WHERE talent_id = ? ORDER BY observed_at DESC", talentId);
+    }>(
+      `SELECT * FROM pricing WHERE talent_id = ?${this.demoFilter} ORDER BY observed_at DESC`,
+      talentId,
+    );
     if (rows.length === 0) return null;
+    /* 达人行本身也要过一遍：只有报价行被打成 demo、达人没打（或反之）时，
+     * 靠单侧过滤会漏 —— 两端都查一次才算"这位达人的数据全部真实"。 */
+    const talent = this.db.get<{ provenance: string | null }>(
+      "SELECT provenance FROM talents WHERE talent_id = ?",
+      talentId,
+    );
+    if (!this.allowDemo && talent?.provenance === "demo") return null;
 
     const actuals = rows.filter((r) => r.actual_amount !== null).map((r) => r.actual_amount as number);
     const quotes = rows.map((r) => r.quoted_amount);

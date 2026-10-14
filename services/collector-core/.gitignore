@@ -1,0 +1,20 @@
+# ── 内嵌采集内核的运行时产物（上游 .gitignore 覆盖不到 vendor 进来的目录）──
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 采集落盘的 jsonl（运行期数据，不入库）
+data/
+
+# 各平台登录态（浏览器 profile，内含 Cookie，绝不入库）
+*_user_data_dir/
+# CDP 模式自己拉起的浏览器 profile（同样含 Cookie）
+browser_data/
+
+# 采集日志
+*.log
+
+.DS_Store

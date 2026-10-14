@@ -1,0 +1,26 @@
+# 构建上下文 = services/embedding-core
+#
+# 目的：只把 serve.py / requirements.txt / models 送进 daemon。
+# 尤其要排除 .venv（1.1GB，宿主原生环境的副本，容器里一点用不上），
+# 否则每次 build 都要把 2.5GB 上下文传一遍。
+
+# 宿主原生 venv（容器内用镜像自己的 site-packages）
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 权重目录下的 HF 下载元数据（64K，加载不需要，只是 snapshot_download 的记账）
+models/embeddinggemma-2/.cache/
+
+# 与本镜像无关的宿主侧文件
+setup.sh
+README.md
+docker-compose.yml
+Dockerfile
+
+# 杂项
+*.log
+.DS_Store
