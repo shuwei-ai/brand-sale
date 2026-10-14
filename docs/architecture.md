@@ -5,7 +5,7 @@
 >
 > 核对基线：2026-10-13 工作区（`npm test` 210 用例全绿、`npm run check:boundaries` 通过）。
 > 2026-10-14 局部更新：采集浏览器会话改为 `reuse` 常驻复用（§8.5）、删除死配置
-> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **213**（见 §14）。
+> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **214**（见 §14）。
 
 ## 0. 阅读指引
 
@@ -91,7 +91,7 @@
 | `apps/gateway` | 5 | 902 | HTTP + SSE 接入层 |
 | **合计（TS）** | **89** | **≈24 200** | 另有采集内核 Python（内嵌 MediaCrawler） |
 
-测试：**17 个文件 / 213 个用例**，全部离线可跑（§12）。
+测试：**17 个文件 / 214 个用例**，全部离线可跑（§12）。
 
 ---
 
@@ -146,7 +146,7 @@
 
 ```bash
 npm install                 # 一次性
-npm test                    # 全离线自检（213 用例）
+npm test                    # 全离线自检（214 用例）
 npm run migrate             # 建表（dev 模式空库会自动灌种子）
 npm run seed                # 登记内置数据源与演示租户
 npm run web:build           # 构建前端控制台 → apps/web/dist
@@ -1209,7 +1209,7 @@ knowledge → model-gateway → agent-pack → render → orchestrator → gatew
 
 ### 12.1 测试体系
 
-`npm test` = **17 个文件 / 213 个用例，全部离线可跑**：
+`npm test` = **17 个文件 / 214 个用例，全部离线可跑**：
 
 ```
 BM_LLM_MODE=mock BM_ALLOW_DEMO_DATA=true BM_MC_ENABLED=false BM_MC_LICENSE_ACK=false \
@@ -1278,7 +1278,7 @@ node --import tsx --test tests/*.test.ts
 
 | # | 位置 | 现状 | 实情 |
 |---|---|---|---|
-| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
+| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；后随用例增补变为 214）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
 | 2 | `README.md` 架构图 | `render  M16 渲染` | 渲染是 **M11**；M16 在代码里不存在（`check-boundaries.ts` 的注释也误写为 M16） |
 | 3 | `README.md` | "不构建则回退内置零构建控制台" | 旧控制台（`console.ts` + `/console-legacy`）**已删除**，现在返回引导页（§11.3） |
 | 4 | `README.md` | "七个平台采集已接入…17 个工具" 类表述 | 工具总数 **18**：10 个通用 + `platform_digest` + 7 个 hidden 原语（§7.2） |
@@ -1289,6 +1289,10 @@ node --import tsx --test tests/*.test.ts
 | 9 | `Config.parser.fallback` | 定义了 `fallback: "mineru" \| "textonly" \| "none"` 并读 `BM_PARSER_FALLBACK` | **全仓零消费**（`createParser()` 只看 `url`）。而且"解析器挂了就退回纯文本"本就**刻意不做** —— 那会产出能检索、能被引用、但毫无意义的乱码 chunk → **2026-10-14 删除字段与 `.env.example` 条目**（选择删而不是接活） |
 | 10 | 各平台 `media_platform/*/core.py` 的 `close()` | 七个平台都实现了 | `run.py:_run()` 只调 `await crawler.start()`，**从不调 `close()`** → `CDPBrowserManager.cleanup()` 那条优雅关闭路径成了死代码，浏览器只能靠 `atexit` / 信号兜底；而 collector 超时是先 SIGTERM 再 **SIGKILL**，SIGKILL 不跑 atexit → 漏孤儿窗口 → **2026-10-14 在 `_run()` 加 `try/finally` 调 `close()`** |
 | 11 | collector 采集窗口行为 | `BM_MC_CDP=auto` 时**每个采集任务都新开一个浏览器** | 一次报告 20 个任务 = 20 次窗口闪烁，且**报告交付后仍在弹**（补采任务落在报告之后才派生，见 §8.5） → **2026-10-14 新增 `reuse` 模式并设为默认** |
+| 12 | `agents.ts:platformPrefetchArgs()` | `keyword: brief.category` —— **逐字**当平台搜索词用 | `category` 一身兼两职：分类标签 + **平台内搜索关键词**。`INDUSTRY_LEXICON` 只覆盖美妆/食品/服饰，耳机这类品类规则段命中不了 → intake 退到 LLM 补全 → 模型在**没有任何形态约束**下给出英文标识符（`consumer_electronics` / `headphones`）→ 实测小红书返回 **0 条**、抖音 14 条里混进 3 条英语教学视频（"英文K歌屋：Headphones On"），报告落到「**本次任务未采集到任何平台公开内容**」 → **2026-10-14 词表补 `3C数码`、`FILL_PROMPT` 加第 7 条约束（必须中文短语）、`platformPrefetchArgs` 补注释、新增回归用例 WP-C-11** |
+
+> 注：条目 12 只是把 `category` 说清楚，**没有解耦**——`category` 仍是搜索词。新增品类时**优先补词表**，
+> 不要指望模型每次都给中文（模型只在词表未命中时才被叫到，而那时它没有约束可依）。
 
 **其它值得知道的边界**：
 
@@ -1466,7 +1470,7 @@ node --import tsx --test tests/*.test.ts
 |---|---:|---:|---|
 | `brand-self.test.ts` | 7 | 131 | 品牌自诊在"无授权数据"时必须如实写「无数据」，而不是编数字 |
 | `brief-llm-fill.test.ts` | 6 | 151 | 规则抽取结果的权威性：模型只能补空字段，不能改预算/时间窗 |
-| `brief-parse.test.ts` | 11 | 142 | 自然语言解析（规则段）纯函数、中英混合输入 |
+| `brief-parse.test.ts` | 12 | 167 | 自然语言解析（规则段）纯函数、中英混合输入；**category 会被逐字当平台搜索词，必须是中文** |
 | `collector.test.ts` | 44 | 1282 | sidecar 归一化、落盘目录契约、快照取新增行、ID 闭环、常驻浏览器端口与回收 |
 | `data-provenance.test.ts` | 16 | 602 | 条目级溯源不依赖模型自觉（证据登记 → 引用 → 渲染反查） |
 | `data-realism.test.ts` | 13 | 436 | 不引用本地样例数据；样例达人不得出现在报告里 |
@@ -1481,7 +1485,7 @@ node --import tsx --test tests/*.test.ts
 | `tool-call-guard.test.ts` | 5 | 67 | 工具调用风暴闸门（真机曾出现同一工具连续被调 131 次） |
 | `web-console.test.ts` | 5 | 214 | 前端托管契约（含路径穿越守卫） |
 | `web-search.test.ts` | 10 | 313 | 唯一外部计费源（打桩 fetch） |
-| **合计** | **213** | **≈6380** | 17 个文件 |
+| **合计** | **214** | **≈6405** | 17 个文件 |
 
 ## 附录 C · 环境变量
 

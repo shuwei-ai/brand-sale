@@ -7,7 +7,7 @@
 
 ```bash
 npm install
-npm test          # 213 个用例，全离线，不依赖任何外部服务
+npm test          # 214 个用例，全离线，不依赖任何外部服务
 npm run demo:mock # 离线桩模式跑通全链路（确定性输出）
 npm run web:build # 构建前端控制台（可选；不构建则返回内置引导页）
 npm start         # 启动 HTTP 网关（dev 模式空库自动灌种子），打开 http://127.0.0.1:8787/

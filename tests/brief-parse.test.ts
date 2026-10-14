@@ -140,3 +140,28 @@ test("WP-C-10 时间窗识别不出时返回 null，不编造默认窗口", () =
   assert.equal(parseWindow("尽快做一波投放", NOW), null);
   assert.notEqual(parseWindow("明年 618 冲一波", NOW), null, "能识别就该给出来");
 });
+
+/* ── 3C 品类：category 会被逐字当平台搜索词，必须是中文 ───── */
+
+/**
+ * `category` 不只是分类标签 —— `agents.ts:platformPrefetchArgs()` 把它**逐字**当作
+ * 平台内搜索关键词。所以它必须是一个"人真的会输进搜索框的中文词"。
+ *
+ * 反例（本用例守的就是它）：词表漏了 3C 时，intake 退到 LLM 补全，模型给出
+ * `industry: consumer_electronics` / `category: headphones`，搜索结果实测
+ * 小红书 0 条、抖音 14 条里混进 3 条英语教学视频（"英文K歌屋：Headphones On"）。
+ */
+test("WP-C-11 耳机诉求：category 必须是中文词（它会被直接用作平台搜索关键词）", () => {
+  const d = parseBriefUtterance(
+    "索尼、Bose、华为、小米四个耳机品牌，在抖音、小红书、B站投放，预算 200 万",
+    undefined,
+    NOW,
+  );
+  assert.equal(d.brief.industry, "3C数码");
+  assert.equal(d.brief.category, "耳机");
+  assert.match(d.brief.category ?? "", /[\u4e00-\u9fff]/, "category 必须含中文，英文标识符在中文平台搜不到内容");
+  assert.deepEqual(d.brief.platforms, ["douyin", "xiaohongshu", "bilibili"]);
+  assert.equal(d.brief.budget?.amount, 2_000_000);
+  assert.ok(!d.missing.includes("industry"), "词表命中后 industry 不该再进 missing");
+  assert.ok(!d.missing.includes("category"), "词表命中后 category 不该再进 missing");
+  assert.ok(d.filled.includes("industry"), "industry 应由规则段命中，而不是留给模型补");});

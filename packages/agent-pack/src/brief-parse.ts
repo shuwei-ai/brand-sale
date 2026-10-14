@@ -127,6 +127,10 @@ ${missing.join("、")}
 4. window 形如 { "from": "YYYY-MM-DD", "to": "YYYY-MM-DD" }。
 5. platforms 只能取 douyin / xiaohongshu / bilibili / weibo。
 6. objectiveWeights 三项（awareness / conversion / retention）之和必须为 1。
+7. industry / category 必须是**中文短语**（industry 形如「3C数码」「美妆个护」，
+   category 形如「耳机」「护肤品-精华」）。**绝不要用英文或下划线标识符**
+   （consumer_electronics / headphones 这类）。原因：category 会被**逐字用作平台内的
+   搜索关键词**，英文词在抖音/小红书/B站搜不到内容（实测小红书 0 条）。
 
 输出 JSON：
 { "brief": { "只包含你补的字段": "..." }, "clarifications": ["向用户追问的问题"] }`;

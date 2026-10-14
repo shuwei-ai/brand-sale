@@ -351,6 +351,24 @@ const INDUSTRY_LEXICON: { industry: string; categories: { re: RegExp; name: stri
   },
   { industry: "食品饮料", categories: [{ re: /咖啡/, name: "饮料-咖啡" }, { re: /零食/, name: "休闲食品" }, { re: /奶粉|营养品/, name: "营养保健" }] },
   { industry: "服饰鞋包", categories: [{ re: /女装/, name: "女装" }, { re: /运动鞋|跑鞋/, name: "运动鞋服" }] },
+  /*
+   * 3C 数码。**为什么必须进词表**：`category` 不只是分类标签，它会被
+   * `agents.ts:platformPrefetchArgs()` **逐字当作平台内的搜索关键词**（抖音/小红书/B站）。
+   * 词表命中不了时，intake 阶段会退到 LLM 补全，而 LLM 面对无人约束的 `category` 会给出
+   * 英文标识符（实测 `headphones`）——英文词在中文平台搜不到东西：实测小红书 0 条、
+   * 抖音 14 条里混进 3 条英语教学视频。中文名进词表就绕开了这条路径。
+   */
+  {
+    industry: "3C数码",
+    categories: [
+      { re: /耳机|耳麦|headphone|earphone|earbud/i, name: "耳机" },
+      { re: /手机|smartphone/i, name: "手机" },
+      { re: /平板|tablet/i, name: "平板电脑" },
+      { re: /笔记本|电脑|laptop/i, name: "电脑" },
+      { re: /手表|手环|watch|band/i, name: "智能穿戴" },
+      { re: /音箱|音响|speaker/i, name: "音箱" },
+    ],
+  },
 ];
 
 export function parseIndustryCategory(text: string): { industry: string; category: string } | null {

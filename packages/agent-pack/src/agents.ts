@@ -188,6 +188,13 @@ export function platformPrefetchArgs(
     : MEDIA_CRAWLER_PLATFORMS;
   const platforms = [...new Set([...fromBrief, ...enabled])];
   if (platforms.length === 0) return null;
+  /* ⚠️ `category` 在这里是**逐字当搜索关键词**用的，不是分类标签。
+   * 所以它必须是一个"人真的会输进搜索框的词"（中文短语），而不是 `headphones` 这类英文标识符：
+   * 英文词在抖音/小红书/B站搜不到内容（实测小红书 0 条、抖音 14 条混进 3 条英语教学视频）。
+   * 这条不改，另外两处必须保证 category 是中文：
+   *   ① `INDUSTRY_LEXICON`（packages/contracts/src/brief-parse.ts）——规则段命中的优先路径；
+   *   ② `FILL_PROMPT` 第 7 条（packages/agent-pack/src/brief-parse.ts）——规则段未命中时的兜底。
+   * 新增品类时优先补词表，不要指望模型每次都对。 */
   return { op: "search", keyword: brief.category, platforms, limit: PLATFORM_PREFETCH_LIMIT };
 }
 
