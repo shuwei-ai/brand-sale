@@ -5,7 +5,7 @@
 >
 > 核对基线：2026-10-13 工作区（`npm test` 210 用例全绿、`npm run check:boundaries` 通过）。
 > 2026-10-14 局部更新：采集浏览器会话改为 `reuse` 常驻复用（§8.5）、删除死配置
-> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **217**（见 §14）。
+> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **218**（见 §14）。
 
 ## 0. 阅读指引
 
@@ -91,7 +91,7 @@
 | `apps/gateway` | 5 | 902 | HTTP + SSE 接入层 |
 | **合计（TS）** | **89** | **≈24 200** | 另有采集内核 Python（内嵌 MediaCrawler） |
 
-测试：**17 个文件 / 217 个用例**，全部离线可跑（§12）。
+测试：**17 个文件 / 218 个用例**，全部离线可跑（§12）。
 
 ---
 
@@ -146,7 +146,7 @@
 
 ```bash
 npm install                 # 一次性
-npm test                    # 全离线自检（217 用例）
+npm test                    # 全离线自检（218 用例）
 npm run migrate             # 建表（dev 模式空库会自动灌种子）
 npm run seed                # 登记内置数据源与演示租户
 npm run web:build           # 构建前端控制台 → apps/web/dist
@@ -881,6 +881,26 @@ packages/datasource           七个适配器 → 七个平台工具 → platfor
 | 缓存 | `withCache`，**空结果不进缓存** | 否则"首次排队采集 → 重试"会被自己的空缓存堵死 |
 | ID 闭环 | 归一化输出的 `id`/`url` 必须能喂回 `content_detail` / `comments` | 喂错形态是**静默失败**（任务 `done` + `stored: 0`），只看任务状态发现不了 |
 
+#### 预采集覆盖哪些平台：`BM_MC_PREFETCH_SCOPE`（默认 `brief`）
+
+`platformPrefetchArgs()`（`agents.ts`）决定 intel 阶段**自动预取**投哪些平台，三个分支：
+
+| 条件 | 覆盖范围 |
+|---|---|
+| `prefetchScope=all` | 全部已装配平台，brief 声明的排在最前（`BM_MC_PLATFORMS` 交集的联合集） |
+| `brief` 且 brief 声明了平台 | **只采声明的那个集合**（业务码映射→按已装配过滤，顺序即声明顺序）；一个都没装配 → 不投递 |
+| `brief` 且 brief 没声明平台 | 不设范围，退回全部已装配平台 |
+
+**为什么默认收窄**（2026-10-14 改，此前默认是 `all`）：平台采集是分钟级的 Playwright 子进程，
+一次报告对七个平台各投一轮，"客户没打算投"的那几个平台整条链路都不会被引用 ——
+实测手机报告的来源声明里就写着「快手 / 微博 / 贴吧 / 知乎 不在本次调研范围」，
+却照样各采了一轮，纯属白烧时间与机器。
+
+范围**只约束自动预取**：工具装配与闸门仍按 `BM_MC_PLATFORMS` 全量生效，
+模型在工具循环里仍可主动采任何已装配平台（`platform_digest` 的 `platforms` 参数接受全部七个采集码）。
+收窄的是"默认行为"，不是"能力"。另注意 `BRIEF_PLATFORM_TO_MC` 只映射四个业务码
+（快手/贴吧/知乎不在 `Brief.platforms` 候选集里），所以 `brief` 模式下这三个平台不会被预采。
+
 #### 浏览器会话：`reuse` 常驻复用（默认）
 
 **问题**：内核每个采集任务都是一个新 Python 子进程，而子进程原本每次都 `launch` 一个
@@ -1209,7 +1229,7 @@ knowledge → model-gateway → agent-pack → render → orchestrator → gatew
 
 ### 12.1 测试体系
 
-`npm test` = **17 个文件 / 217 个用例，全部离线可跑**：
+`npm test` = **17 个文件 / 218 个用例，全部离线可跑**：
 
 ```
 BM_LLM_MODE=mock BM_ALLOW_DEMO_DATA=true BM_MC_ENABLED=false BM_MC_LICENSE_ACK=false \
@@ -1278,7 +1298,7 @@ node --import tsx --test tests/*.test.ts
 
 | # | 位置 | 现状 | 实情 |
 |---|---|---|---|
-| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日三次增补后为 **217**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
+| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日多次增补后为 **218**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
 | 2 | `README.md` 架构图 | `render  M16 渲染` | 渲染是 **M11**；M16 在代码里不存在（`check-boundaries.ts` 的注释也误写为 M16） |
 | 3 | `README.md` | "不构建则回退内置零构建控制台" | 旧控制台（`console.ts` + `/console-legacy`）**已删除**，现在返回引导页（§11.3） |
 | 4 | `README.md` | "七个平台采集已接入…17 个工具" 类表述 | 工具总数 **18**：10 个通用 + `platform_digest` + 7 个 hidden 原语（§7.2） |
@@ -1298,6 +1318,7 @@ node --import tsx --test tests/*.test.ts
 |---|---|---|---|
 | 13 | `agent-pack/src/synthesis.ts` **兜底合成** | `synthIntel` 把「成分党 / 平价替代 / 医研背书」（**护肤品**题材）三个竞品**硬编码**在确定性兜底路径里，并把公开检索命中的**站点名**当品牌名拼进去；`synthReport` 的快捷结论写死"已识别三类定位坐标（成分党 / 平价替代 / 医研背书）"；`quote` 块硬抄 `scripts/seed.ts` 的演示种子「达人种草占比 45% 时 ROI 最优（2.3）」并署名"KB-2 内部复盘" | 模型不可用时（该次任务 LLM 报 E-AGENT-002）耳机报告渲染出「**头部成分党（Global Information, Inc. (GII)）**」：① 类目错 —— 耳机报告在讲"成分浓度"；② 主体错 —— GII 是市场研究出版机构，不是品牌。整张"竞品格局对比"表不可用；`quote` 块在 KB 无该条目时等于**无源假引用** → **2026-10-14 竞品集改为取自 `brief.brandIds`（不足 3 家时补"其他竞品 X（未识别）"中性占位以过 Schema 的 ≥3 下限）、分析字段一律标"待核验"、快捷结论按 brief 如实叙述、`quote` 换成不承载数字的口径说明；新增 2 条回归用例（`data-provenance.test.ts`）** |
 | 14 | `Brief.brandIds`（`contracts/src/job.ts`） | 曾只有 `brandIds: string[]`，**没有"我方品牌"字段** | 同一个字段被两处按**相反**语义消费：`buildBrandSelf()` 与 `report.meta.brand` 当「我方品牌」，而「竞品格局对比」表与「品牌 vs 竞品差距矩阵」当**竞品集**（矩阵列头即「我方 \| 索尼 \| Bose \| 华为 \| 小米」）→ 后果：**「品牌自诊概览」页在任何 brief 下都填不实**，未授权时只能整页写「无数据」。→ **2026-10-14 修**：新增**可选**字段 `Brief.ownBrandId` 承接"我是谁"；`brandIds` **只**表示"本轮在投/在看的品牌集合"。**未指定 `ownBrandId` 时报告整份不做品牌自诊**：删去「品牌自诊概览」「品牌 vs 竞品差距矩阵」两页，代之以纯市场的**「竞品定位矩阵」**页（保住 `matrix` 可视化块与"竞品怎么分布"这个市场结论），`quote`/`matrix` 等必需块型不受影响；`meta.brand` 优先取 `ownBrandId`。回归用例 `brand-self.test.ts` **WP-B-8**（未指定时不得出现「我方 / 本品」字样）；WP-B-6/WP-B-7 的 fixture 显式给了 `ownBrandId`（行走的是"已指定"分支）。报告提示词（RG）同步条件化，CI 的 `brandSelf` 仍为结构必填但**只有指定自有品牌时才会进报告** |
+| 15 | `agents.ts:platformPrefetchArgs()` **预采集覆盖范围** | 曾为「**全部已装配平台**」（brief 声明的只是"优先级"），注释理由是"只按 brief 收窄会让已接入平台在报告里被写成「未使用的来源」，读起来像没接上" | 这个理由**与报告的实际行为不符**：手机报告（brief 只要 `douyin/xiaohongshu/bilibili`）的来源声明 exclusions 里本来就写着「快手 / 微博 / 贴吧 / 知乎 **不在本次调研范围**」—— 采了照样进排除项，说明这批数据从产出到引用整条链路没有一处会用到它，而每个平台是一轮分钟级 Playwright 子进程 → **2026-10-14 加 `BM_MC_PREFETCH_SCOPE`（默认 `brief`）**：默认只采 brief 声明的平台（映射后按已装配过滤）；brief 声明了但一个都没装配 → 不投递（不改成采别的平台）；brief 没声明平台 → 不设范围退回全部已装配（防"没声明就没数据"的悬崖）。`all` 保留为回退开关。范围只约束自动预取，`platform_digest` 仍接受全部七个采集码（§8.5） |
 
 **其它值得知道的边界**：
 
@@ -1482,7 +1503,7 @@ node --import tsx --test tests/*.test.ts
 | `e2e.test.ts` | 13 | 577 | LLD §7.3 强制 E2E 清单（mock 模式，全离线） |
 | `governance-fixes.test.ts` | 6 | 186 | 治理口径的三个不变量（口径错了不会有用例失败，只能专门钉） |
 | `kb-ingest.test.ts` | 15 | 508 | KB 入库通道、来源登记不变量、mutating 工具准入 |
-| `platform-collect.test.ts` | 26 | 754 | 七平台工具与适配器（打桩 fetch，不碰 MediaCrawler） |
+| `platform-collect.test.ts` | 27 | 780 | 七平台工具与适配器（打桩 fetch，不碰 MediaCrawler）；**预采集覆盖范围 = brief 声明的平台**（`BM_MC_PREFETCH_SCOPE`） |
 | `report-repair.test.ts` | 11 | 304 | 自动修复的分级语义与四条不变量（含"修复不得制造新错误"） |
 | `report-summary.test.ts` | 16 | 500 | 摘要回灌 + 向量落盘 + 模型混用守卫 |
 | `schema-coverage.test.ts` | 4 | 138 | 骨架/块型/页面角色的防漂移（加第 11 种块型时编译器不会提醒） |
@@ -1490,11 +1511,11 @@ node --import tsx --test tests/*.test.ts
 | `tool-call-guard.test.ts` | 5 | 67 | 工具调用风暴闸门（真机曾出现同一工具连续被调 131 次） |
 | `web-console.test.ts` | 5 | 214 | 前端托管契约（含路径穿越守卫） |
 | `web-search.test.ts` | 10 | 313 | 唯一外部计费源（打桩 fetch） |
-| **合计** | **217** | **≈6637** | 17 个文件 |
+| **合计** | **218** | **≈6663** | 17 个文件 |
 
 ## 附录 C · 环境变量
 
-共 **82 个变量 / 19 个分组**，完整清单与逐条注释见仓库根 `.env.example`（单一事实源）。
+共 **83 个变量 / 19 个分组**，完整清单与逐条注释见仓库根 `.env.example`（单一事实源）。
 按分组概览：
 
 ### C.1 分组与变量总览（默认值取自 `.env.example`）
@@ -1548,9 +1569,9 @@ node --import tsx --test tests/*.test.ts
 
 
 
-**三道门，缺一不可**（6 个）
+**三道门，缺一不可**（7 个）
 
-`BM_MC_ENABLED`=`false` · `BM_MC_LICENSE_ACK`=`false` · `BM_MC_COLLECTOR_URL`=`http://127.0.0.1:8890` · `BM_MC_PLATFORMS`=`xhs,dy,ks,bili,wb,tieba,zhihu` · `BM_MC_TIMEOUT_MS`=`15000` · `BM_MC_CACHE_TTL`=`1800`
+`BM_MC_ENABLED`=`false` · `BM_MC_LICENSE_ACK`=`false` · `BM_MC_COLLECTOR_URL`=`http://127.0.0.1:8890` · `BM_MC_PLATFORMS`=`xhs,dy,ks,bili,wb,tieba,zhihu` · `BM_MC_PREFETCH_SCOPE`=`brief` · `BM_MC_TIMEOUT_MS`=`15000` · `BM_MC_CACHE_TTL`=`1800`
 
 **collector sidecar（独立进程，npm run collector）**（14 个）
 

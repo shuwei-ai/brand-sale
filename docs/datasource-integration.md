@@ -84,6 +84,7 @@ BM_MC_ENABLED=true        # 1) 总开关
 BM_MC_LICENSE_ACK=true    # 2) 许可确认（见 §3，默认 false）
 BM_MC_COLLECTOR_URL=...   # 3) collector 地址（且 collector 进程真的在跑）
 BM_MC_PLATFORMS=xhs,dy,ks,bili,wb,tieba,zhihu   # 4) 逐平台开关，默认全开
+BM_MC_PREFETCH_SCOPE=brief                      # 5) 预取范围：brief（默认，只采 brief 声明的平台）/ all
 ```
 
 第二条刻意做成"必须显式做一次决定"：MediaCrawler 是非商用许可，
@@ -180,6 +181,7 @@ BM_MC_ENABLED=false               # 总开关
 BM_MC_LICENSE_ACK=false           # 许可确认（见 §3）
 BM_MC_COLLECTOR_URL=http://127.0.0.1:8890
 BM_MC_PLATFORMS=xhs,dy,ks,bili,wb,tieba,zhihu
+BM_MC_PREFETCH_SCOPE=brief        # 自动预取覆盖哪些平台（brief / all）
 BM_MC_TIMEOUT_MS=15000
 BM_MC_CACHE_TTL=1800
 

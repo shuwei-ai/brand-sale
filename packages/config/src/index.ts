@@ -22,6 +22,21 @@ export const MEDIA_CRAWLER_PLATFORMS = ["xhs", "dy", "ks", "bili", "wb", "tieba"
 export type MediaCrawlerPlatform = (typeof MEDIA_CRAWLER_PLATFORMS)[number];
 
 /**
+ * 预采集的**平台覆盖范围**（`BM_MC_PREFETCH_SCOPE`）。
+ *
+ *   · `brief`（**默认**）—— 只采 brief 声明的平台（业务码映射成采集短码后取交集）。
+ *     声明为空时不设范围，退回全部已装配平台（见 `platformPrefetchArgs` 的三分支）。
+ *   · `all` —— 全部已装配平台（brief 声明的排在最前）。这是**旧默认**，保留为回退开关。
+ *
+ * 为什么把默认从 `all` 改成 `brief`：平台采集是分钟级的 Playwright 子进程，七个平台
+ * 全开意味着为"客户没打算投"的平台各跑一轮采集。而报告在来源声明里**本来就**如实写着
+ * 「快手不在本次调研范围」—— 采了照样进排除项，等于把时间与机器白花在一份不会被引用的
+ * 数据上。需要"这个话题此刻在哪些平台被讨论"这种跨平台视野时，显式打开 `all`。
+ */
+export const MEDIA_CRAWLER_PREFETCH_SCOPES = ["brief", "all"] as const;
+export type MediaCrawlerPrefetchScope = (typeof MEDIA_CRAWLER_PREFETCH_SCOPES)[number];
+
+/**
  * 采集算子。**七平台统一这四个**——因为 MediaCrawler 对七个平台都只实现了
  * `search` / `detail` / `creator` 三种 `crawler_type`（已核对各平台 core.py）。
  *
@@ -432,6 +447,12 @@ export interface Config {
     licenseAcknowledged: boolean;
     /** 各平台开关。默认七平台全开；只登录了部分平台时可在这里收窄 */
     platforms: Record<MediaCrawlerPlatform, boolean>;
+    /**
+     * 预采集覆盖哪些平台：`brief`（默认，只采 brief 声明的）/ `all`（全部已装配平台）。
+     * 这里只描述**预采集**范围；工具装配与闸门仍按 `platforms` 全量生效，模型在
+     * 工具循环里仍可主动采任何已装配平台（`platform_digest` 的 `platforms` 参数）。
+     */
+    prefetchScope: MediaCrawlerPrefetchScope;
   };
 
   tiers: { L1: boolean; L2: boolean; L3: boolean; L4: boolean };
@@ -535,6 +556,21 @@ function parsePlatformList(raw: string): Record<MediaCrawlerPlatform, boolean> {
   return out;
 }
 
+/**
+ * 解析预采集覆盖范围。与 `parsePlatformList` 同一条纪律：**认不出就抛错**而不是
+ * 静默退回默认值 —— 写了 `BM_MC_PREFETCH_SCOPE=al` 却以为已切到全平台，
+ * 排查时只能看到"怎么还是只采了三个平台"，比直接启动失败难查得多。
+ */
+function parsePrefetchScope(raw: string): MediaCrawlerPrefetchScope {
+  const v = raw.trim().toLowerCase();
+  if (!(MEDIA_CRAWLER_PREFETCH_SCOPES as readonly string[]).includes(v)) {
+    throw new Error(
+      `BM_MC_PREFETCH_SCOPE 取值非法：「${raw}」。可选：${MEDIA_CRAWLER_PREFETCH_SCOPES.join(" / ")}`,
+    );
+  }
+  return v as MediaCrawlerPrefetchScope;
+}
+
 export function loadConfig(cwd: string = process.cwd(), overrides: Record<string, string> = {}): Config {
   const fileVars = parseDotEnv(resolve(cwd, ".env"));
   const env: Record<string, string> = { ...fileVars, ...overrides };
@@ -634,6 +670,7 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
       cacheTtlSeconds: num(get("BM_MC_CACHE_TTL"), 1_800),
       licenseAcknowledged: bool(get("BM_MC_LICENSE_ACK"), false),
       platforms: parsePlatformList(str(get("BM_MC_PLATFORMS"), MEDIA_CRAWLER_PLATFORMS.join(","))),
+      prefetchScope: parsePrefetchScope(str(get("BM_MC_PREFETCH_SCOPE"), "brief")),
     },
 
     tiers: {

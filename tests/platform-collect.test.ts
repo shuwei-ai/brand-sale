@@ -449,8 +449,9 @@ test("预采集映射：brief 的每个业务平台码都能落到一个已装�
   }
   // 反向防漂移：两边数量必须一致，避免"加了映射但 brief 里不会出现"或反之
   assert.equal(Object.keys(BRIEF_PLATFORM_TO_MC).length, POPULAR_PLATFORMS.length);
-  // 快手 / 贴吧 / 知乎不在 Brief.platforms 候选集里 —— 它们照样会被预采集覆盖
-  // （覆盖范围 = 全部已装配平台），所以这里只断言映射表本身的构成，不再断言"不该出现"。
+  // 快手 / 贴吧 / 知乎不在 Brief.platforms 候选集里，映射表里**没有**它们 ——
+  // 默认（BM_MC_PREFETCH_SCOPE=brief）下它们因而不会被预采集，只在模型主动调
+  // platform_digest 时按需采。所以这里只断言映射表本身的构成，不涉及"会不会被采到"。
   assert.deepEqual(Object.values(BRIEF_PLATFORM_TO_MC).sort(), ["bili", "dy", "wb", "xhs"]);
 });
 
@@ -475,45 +476,70 @@ test("预采集：mock 模式下不发任何外部请求（E2E 全离线的保�
   }
 });
 
-test("预采集参数：覆盖全部已装配平台（brief 声明的排在最前），且已归一到采集码", () => {
+test("预采集参数：默认只覆盖 brief 声明的平台（BM_MC_PREFETCH_SCOPE=brief）", () => {
   const cfg = loadConfig();
   const ALL: string[] = ["xhs", "dy", "ks", "bili", "wb", "tieba", "zhihu"];
 
   // 直投聚合工具（不是逐平台循环）—— 合并与可比指标计算都在工具内部完成。
-  // 覆盖范围 = 全部已装配平台：brief 的两个排在最前，其余一并纳入。
-  // 只按 brief 收窄会让"已接入且能取到数据"的平台被报告写成「未使用的来源」，
-  // 读起来等同于"这些平台没接上"——那是取数面被人为收窄，不是能力缺失。
+  // 覆盖范围 = brief 声明的平台：客户没打算投的平台不预先烧一轮分钟级采集。
+  // 依据是报告侧的行为 —— 实测手机报告的 exclusions 里就写着「快手/微博/贴吧/知乎
+  // 不在本次调研范围」，采了也只会进排除项，这批数据从产出到引用没有一处会用到它。
   const args = platformPrefetchArgs({ platforms: ["xiaohongshu", "douyin"], category: "护肤品-精华" }, cfg);
   assert.deepEqual(args, {
     op: "search",
     keyword: "护肤品-精华",
-    platforms: ALL,
+    platforms: ["xhs", "dy"], // 顺序 = brief 声明顺序，便于确定性断言
     limit: 20,
   });
 
-  // 去重：brief 里同一个平台写两次也只投一次，且 brief 声明的仍排最前
+  // 去重：brief 里同一个平台写两次也只投一次，否则白跑一次分钟级采集
   const dedup = platformPrefetchArgs({ platforms: ["douyin", "douyin"], category: "面膜" }, cfg);
-  const dedupPlatforms = dedup?.platforms as string[];
-  assert.deepEqual(dedupPlatforms, ["dy", "xhs", "ks", "bili", "wb", "tieba", "zhihu"]);
-  assert.equal(new Set(dedupPlatforms).size, dedupPlatforms.length, "平台必须去重，否则会白跑一次分钟级采集");
+  assert.deepEqual(dedup?.platforms, ["dy"]);
 
-  // brief 没声明平台时**不再返回 null**：仍覆盖全部已装配平台
-  assert.deepEqual(
-    (platformPrefetchArgs({ platforms: [], category: "面膜" }, cfg)?.platforms as string[]),
-    ALL,
-  );
-
-  // 平台开关收窄（只登录/只开了两个平台）时，覆盖范围跟着收窄
-  const narrowed = platformPrefetchArgs(
-    { platforms: ["xiaohongshu", "douyin"], category: "面膜" },
-    {
-      mediaCrawler: {
-        ...cfg.mediaCrawler,
-        platforms: { xhs: true, dy: true, ks: false, bili: false, wb: false, tieba: false, zhihu: false },
-      },
+  const onlyXhsDy = {
+    mediaCrawler: {
+      ...cfg.mediaCrawler,
+      platforms: { xhs: true, dy: true, ks: false, bili: false, wb: false, tieba: false, zhihu: false },
     },
+  };
+
+  // 声明了、但一个都没装配 → null。刻意**不**退而采别的平台：
+  // 报告会按"该平台未接入"如实写，而不是把另一批平台的证据冒充成这次调研的结论。
+  assert.equal(
+    platformPrefetchArgs({ platforms: ["weibo"], category: "面膜" }, onlyXhsDy),
+    null,
+    "brief 只要了微博而微博没装配 → 不该改采小红书/抖音",
   );
-  assert.deepEqual(narrowed?.platforms, ["xhs", "dy"], "未启用的平台不该被投递");
+
+  // brief 没声明平台 → 不设范围，退回全部已装配平台。
+  // 这条是防悬崖的：brief.platforms 允许为空（网关直接透传 brief，不做校验），
+  // 若空即 null，报告会整份拿不到平台证据 —— 正是业主投诉过的"章节空白"形态。
+  const fallback = platformPrefetchArgs({ platforms: [], category: "面膜" }, cfg);
+  assert.deepEqual(fallback?.platforms, ALL, "brief 没声明平台时不设范围");
+
+  // 平台开关收窄（只登录/只开了两个平台）时，声明的交集跟着收窄
+  const narrowed = platformPrefetchArgs({ platforms: ["xiaohongshu", "douyin"], category: "面膜" }, onlyXhsDy);
+  assert.deepEqual(narrowed?.platforms, ["xhs", "dy"]);
+});
+
+test("预采集参数：BM_MC_PREFETCH_SCOPE=all 才恢复「覆盖全部已装配平台」", () => {
+  const cfg = loadConfig();
+  const ALL: string[] = ["xhs", "dy", "ks", "bili", "wb", "tieba", "zhihu"];
+
+  // brief 声明的排在最前（顺序稳定），其余已装配平台一并纳入 —— 这是本次改动前的默认行为，
+  // 保留给"要回答这个话题此刻在哪些平台被讨论"的跨平台视野场景。
+  const all = platformPrefetchArgs(
+    { platforms: ["xiaohongshu", "douyin"], category: "护肤品-精华" },
+    { mediaCrawler: { ...cfg.mediaCrawler, prefetchScope: "all" } },
+  );
+  assert.deepEqual(all?.platforms, ALL);
+
+  // 未传 config 的老调用方（纯函数测试）：装配面按"七平台全开"处理，scope 取默认 brief ——
+  // 所以声明了平台时仍只采声明的那个
+  assert.deepEqual(
+    (platformPrefetchArgs({ platforms: ["douyin"], category: "面膜" })?.platforms as string[]),
+    ["dy"],
+  );
 });
 
 /* ── 6. 能力矩阵（跨平台可比性的唯一事实源）─────────────── */

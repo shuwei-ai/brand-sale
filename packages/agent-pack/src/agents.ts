@@ -153,6 +153,8 @@ export class DeltaPump {
  *
  * 刻意只映射 brief 里可能出现的四个：快手 / 贴吧 / 知乎不在 `Brief.platforms` 的候选集里，
  * 预采集不该替它们凭空造平台主张；确有需要时由 CI 在工具循环里按需触发。
+ * 与 `prefetchScope="brief"`（默认）合起来的后果要清楚：快手/贴吧/知乎**不会被预采集**，
+ * 只会在模型主动调 `platform_digest` 时按需采 —— 这是有意的（客户没要的平台不预先烧时间）。
  *
  * 映射表本身定义在 `@brandsale/config` —— `tool-impls.ts` 的聚合工具要用同一份做参数别名
  * 归一，两处各写一份迟早对不上。这里只做再导出，保住既有的导入路径。
@@ -163,13 +165,27 @@ export { BRIEF_PLATFORM_TO_MC } from "@brandsale/config";
 const PLATFORM_PREFETCH_LIMIT = 20;
 
 /**
- * 构造 intel 阶段平台预采集的参数；`null` 表示没有任何可投递的采集平台。
+ * 构造 intel 阶段平台预采集的参数；`null` 表示没有可投递的采集平台。
  *
- * **覆盖范围 = 全部已装配的采集平台**，而不再只取 brief 声明的平台。
- * 为什么改：竞品情报要回答的是"这个话题此刻在哪些平台被怎么讨论"，而不是"客户打算在
- * 哪几个平台投"。只按 brief 收窄会造成一个误导性后果 —— 其余**已接入且能取到数据**的平台
- * 因为"这次没查"而被写进报告的「未使用的来源」，读起来等同于"这些平台没接上"，与事实不符。
- * brief 声明的平台仍排在前面（顺序稳定，便于确定性断言），但它是**优先级**，不是白名单。
+ * **覆盖范围 = brief 声明的平台**（`config.mediaCrawler.prefetchScope`，默认 `brief`）。
+ * 为什么默认收窄（2026-10-14 改）：平台采集是分钟级的 Playwright 子进程，一次报告对
+ * 七个平台各投一轮，"客户没打算投"的那几个平台就是在白烧时间与机器；而报告在来源声明里
+ * **本来就**如实写着「快手不在本次调研范围」（手机报告实测 exclusions 四条正是如此）——
+ * 采了也照样进排除项，说明这批数据从产出到引用整条链路上没有任何一处会用到它。
+ *
+ * 三个分支（顺序即优先级）：
+ *   1. `scope="all"` → 联合集：全部已装配平台，brief 声明的排在最前。这是**旧默认**，
+ *      保留给"要回答这个话题此刻在哪些平台被讨论"的跨平台视野场景；
+ *   2. `scope="brief"` 且 brief 声明了平台 → **取声明的那个集合**（映射后按已装配过滤，
+ *      顺序即声明顺序，便于确定性断言）。声明了但一个都没装配 → `null`：
+ *      本次确实没有可采的平台，报告按"该平台未接入"如实写，而不是悄悄改采别的平台；
+ *   3. `scope="brief"` 且 brief 没声明平台 → 不设范围，退回全部已装配平台。
+ *      这条是**防悬崖**用的：`brief.platforms` 允许为空（网关直接透传 brief，不做校验），
+ *      若空即 `null`，报告会整份拿不到平台证据 —— 那正是业主投诉过的"章节空白"形态。
+ *
+ * 注意范围只约束**预采集**：工具装配与闸门仍按 `platforms` 全量生效，模型在工具循环里
+ * 仍可主动采任何已装配平台（`platform_digest` 的 `platforms` 参数接受全部七个采集码）。
+ * 也就是说收窄的是"默认行为"，不是"能力"。
  *
  * 抽成纯函数是为了让"业务码 → 采集码、去重、覆盖范围"这三件事**可被确定性测试**：
  * 它原本内联在 prefetch 里，只能靠"mock 模式不联网"间接验证，而那恰恰测不到
@@ -179,14 +195,26 @@ export function platformPrefetchArgs(
   brief: Pick<Brief, "platforms" | "category">,
   config?: Pick<Config, "mediaCrawler">,
 ): Record<string, unknown> | null {
-  const fromBrief = brief.platforms
-    .map((bp) => BRIEF_PLATFORM_TO_MC[bp])
-    .filter((p): p is MediaCrawlerPlatform => Boolean(p));
-  // 未传 config（纯函数测试 / 老调用方）按"七平台全开"处理，与"已装配即覆盖"的语义保持一致
+  const declared = [
+    ...new Set(
+      brief.platforms
+        .map((bp) => BRIEF_PLATFORM_TO_MC[bp])
+        .filter((p): p is MediaCrawlerPlatform => Boolean(p)),
+    ),
+  ];
+  // 未传 config（纯函数测试 / 老调用方）时装配面按"七平台全开"处理；scope 无法得知时
+  // 按 `loadConfig` 的同一默认值 `brief` 处理，两处默认必须一致，否则纯函数测的
+  // 和线上跑的不是同一条路径。
   const enabled = config
     ? MEDIA_CRAWLER_PLATFORMS.filter((p) => config.mediaCrawler.platforms[p])
     : MEDIA_CRAWLER_PLATFORMS;
-  const platforms = [...new Set([...fromBrief, ...enabled])];
+  const scope = config?.mediaCrawler.prefetchScope ?? "brief";
+  const platforms =
+    scope === "all"
+      ? [...new Set([...declared, ...enabled])]
+      : declared.length > 0
+        ? declared.filter((p) => enabled.includes(p))
+        : enabled;
   if (platforms.length === 0) return null;
   /* ⚠️ `category` 在这里是**逐字当搜索关键词**用的，不是分类标签。
    * 所以它必须是一个"人真的会输进搜索框的词"（中文短语），而不是 `headphones` 这类英文标识符：
@@ -855,8 +883,9 @@ export class AgentPack {
          *   ① 三道门（enabled + 许可确认 + collector 地址）—— 没有能力时发起会因 E-GOV-004 误标降级；
          *   ② 非 mock —— 保证 E2E 用例全离线、不发任何外部请求；
          *   ③ 聚合工具已装配 —— 七个平台全都没开时它不注册，不该照样投递；
-         *   ④ 至少有一个已装配平台 —— 一个平台都没启用时 platformPrefetchArgs 返回 null。
-         * 一次 `platform_digest` 覆盖**全部已装配平台**（brief 声明的排在前），而不是逐平台循环七次：
+         *   ④ 至少有一个可采平台 —— brief 声明的平台一个都没装配时 platformPrefetchArgs 返回 null。
+         * 一次 `platform_digest` 覆盖**brief 声明的平台**（默认 `BM_MC_PREFETCH_SCOPE=brief`；
+         * 显式设为 `all` 才覆盖全部已装配平台），而不是逐平台循环七次：
          *   合并、可比指标计算、逐源过闸门都在工具内部确定性完成，预取只负责把请求递进去。
          * 只投递、不等待：拿到的是"已排队"的空结果，这正是预期形态。 */
         if (mediaCrawlerReady(this.deps.config) && !this.deps.gateway.mocked && this.registry.get(PLATFORM_DIGEST_TOOL_NAME)) {
