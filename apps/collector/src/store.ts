@@ -27,12 +27,12 @@ export interface QueryFilter {
   kind?: RowKind;
   /**
    * 关键词。两种语义，按算子分：
-   *   · `op=search` —— 是**采集用语**：匹配该批采集结果（行的 `raw.source_keyword`）。
+   *   · `op=search` —— 是**采集用语**：**只**匹配该批采集结果（行的 `raw.source_keyword`）。
    *     搜索词本来就常常不在正文里（`护肤品-精华` 这类类目词，采集回来的笔记正文
    *     一条都不含它），拿它当正文子串过滤等于把刚采到的数据全部判 0。
+   *     **查不到就是空**，不再退回子串兜底 —— 见 `query()` 里那段说明：子串兜底会让
+   *     别的批次的正文冒充本批命中，而适配器"查询非空就不排队"，于是该关键词永远采不到。
    *   · 其余算子（详情 / 评论 / creator 的入参是内容 id / 达人 id）—— 仍是字段子串匹配。
-   * 另外 `op=search` 下若没有任何行带采集词（老数据 / 平台没回该字段），
-   * 退回子串匹配，避免"改完更差"。
    */
   keyword?: string;
   limit?: number;
@@ -113,17 +113,27 @@ export class CollectStore {
 
     const kw = filter.keyword?.trim().toLowerCase();
     if (kw) {
-      /* 先按"采集用语"匹配（op=search）。**这一步不是优化，是修 bug**：
-       * 采集是按 keyword 去平台搜的，落库时把搜索词写在行的 `raw.source_keyword` 上；
-       * 但查询侧原来只做正文子串过滤，于是"用 A 搜回来 220 条，再用 A 去查却是 0 条"。
-       * 实测：`keyword=护肤品-精华` → 0 条，同一份缓存里 `keyword=面膜` → 4 条。 */
-      const byCollect =
-        filter.op === "search" ? rows.filter((r) => collectKeywordOf(r) !== "" && collectKeywordOf(r) === kw) : [];
-      if (byCollect.length > 0) {
-        rows = byCollect;
+      if (filter.op === "search") {
+        /* `op=search` 的关键词是**采集用语**，只认行上记录的采集词（`raw.source_keyword`），
+         * **不再退回正文子串**。
+         *
+         * 两个理由，第二个是 2026-10-14 实测出来的硬伤：
+         *   ① 语义：搜 A 就该拿回"用 A 采回来的那一批"。采集用语本来就常常不出现在正文里
+         *      （`护肤品-精华` 这类类目词一条正文都不含它），拿正文过滤等于把真数据判 0；
+         *   ② 子串兜底会把**别的批次**的正文当成本批命中，而调用方是"查询非空 = 无需采集"
+         *      （`packages/datasource/src/media-crawler.ts` 的 `contentRows.length === 0` 才排队）——
+         *      于是该关键词**永远采不到真实数据**，报告引用的是别批次的正文。实测 `keyword=电脑`
+         *      在 dy/xhs/bili 分别命中 17/39/7 条（抖音侧是"局域网文件夹"这类**评论**、
+         *      小红书侧是"折叠屏新王"手机笔记，采集词全是别的词），而三平台**一条**带
+         *      `source_keyword=电脑` 的行都不存在。业主看到的报告"电脑市场数据"就是这批噪声。
+         *
+         * 代价是"没有 source_keyword 的老数据"（字段上线前的行 / 平台内核不回该字段）不再被
+         * 关键词搜到 —— 那是**正确**结果：查不到这一批就是没有，由适配器排队一次真实采集补上，
+         * 而不是拿别的正文冒充。 */
+        rows = rows.filter((r) => collectKeywordOf(r) === kw);
       } else {
-        // 没有行带采集词（老数据 / 该平台内核不回这个字段）→ 退回子串。
-        // id 也参与匹配：按 contentId / creatorId 查详情时，命中的就是行的 id 字段
+        /* 其余算子（详情 / 评论 / creator）的入参是内容 id / 达人 id，仍是字段子串匹配。
+         * id 也参与匹配：按 contentId / creatorId 查详情时，命中的就是行的 id 字段 */
         rows = rows.filter((r) =>
           [r.id, r.title, r.text, r.author, r.authorId, r.url].some((f) => f && f.toLowerCase().includes(kw)),
         );

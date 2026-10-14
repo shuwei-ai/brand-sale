@@ -242,17 +242,19 @@ test("算子 → 记录类型 的映射", () => {
 
 /* ── 本地缓存 ───────────────────────────────────────────── */
 
-test("缓存：同一记录多次采集保留最新，并按关键词/条数过滤", async () => {
+test("缓存：同一记录多次采集保留最新，并按采集词/条数过滤", async () => {
   const dir = mkdtempSync(join(tmpdir(), "brandsale-collector-"));
   try {
     const store = new CollectStore(dir);
     const base = normalizeBatch("xhs", "search", "content", [
-      { note_id: "n_1", title: "精华 A", desc: "抗老", liked_count: 10 },
-      { note_id: "n_2", title: "精华 B", desc: "美白", liked_count: 20 },
+      { note_id: "n_1", title: "精华 A", desc: "抗老", liked_count: 10, source_keyword: "精华" },
+      { note_id: "n_2", title: "精华 B", desc: "美白", liked_count: 20, source_keyword: "美白" },
     ]);
     await store.append("xhs", base);
     // 再采一次，n_1 的点赞涨了 —— 应覆盖旧值而不是产生第二行
-    const again = normalizeBatch("xhs", "search", "content", [{ note_id: "n_1", title: "精华 A", desc: "抗老", liked_count: 99 }]);
+    const again = normalizeBatch("xhs", "search", "content", [
+      { note_id: "n_1", title: "精华 A", desc: "抗老", liked_count: 99, source_keyword: "精华" },
+    ]);
     await store.append("xhs", again);
 
     const all = await store.query("xhs", { op: "search" });
@@ -260,6 +262,7 @@ test("缓存：同一记录多次采集保留最新，并按关键词/条数过�
     const n1 = all.rows.find((r) => r.id === "n_1")!;
     assert.equal(n1.metrics.likes, 99, "应保留最新一次采集的值");
 
+    // op=search 的关键词是**采集用语**（行上的 source_keyword），不是正文子串
     const filtered = await store.query("xhs", { op: "search", keyword: "美白" });
     assert.equal(filtered.total, 1);
     assert.equal(filtered.rows[0]!.id, "n_2");
@@ -268,8 +271,10 @@ test("缓存：同一记录多次采集保留最新，并按关键词/条数过�
     assert.equal(limited.rows.length, 1);
     assert.equal(limited.total, 2, "total 反映过滤后的总条数，limit 只影响返回条数");
 
-    // 按 id 也能命中（适配器按 contentId 查详情时依赖这一点）
-    const byId = await store.query("xhs", { op: "search", keyword: "n_2" });
+    // 按 id 命中走"无算子 + 关键词"（= 字段子串匹配）这条路径，
+    // 适配器按 contentId 查详情时依赖它。**不能**用 op=search 测这个 ——
+    // op=search 的关键词是采集用语，拿 id 当采集词查是本就没搞清语义。
+    const byId = await store.query("xhs", { keyword: "n_2" });
     assert.equal(byId.total, 1);
 
     const stats = await store.stats();
@@ -323,9 +328,26 @@ test("缓存查询：op=search 的关键词是「采集用语」，不要求出�
     );
     assert.equal(batch.total, 2);
 
-    // 采集用语匹配不到 → 退回正文子串（兼容没有 source_keyword 的老数据）
-    const legacy = await store.query("xhs", { op: "search", keyword: "换季维稳" });
-    assert.deepEqual(legacy.rows.map((r) => r.id), ["n_2"]);
+    // 采集用语匹配不到 → **返回空，不再退回正文子串**。
+    //
+    // 原实现退回子串是为了兼容没有 source_keyword 的老数据，但代价是"缓存里别的批次
+    // 碰巧含这个词"会被当成本批命中，而调用方是"查询非空 = 无需采集"（media-crawler.ts
+    // 的 `contentRows.length === 0` 才排队）→ **该关键词永远采不到真实数据**。
+    // 实测 2026-10-14：`keyword=电脑` 在 dy/xhs/bili 分别命中 17/39/7 条与电脑无关的
+    // 评论与折叠屏笔记，三平台一条 `source_keyword=电脑` 的行都不存在，报告引用的就是这批噪声。
+    // 现在的语义是"查不到这一批就是没有"，由适配器排队一次真实采集补上。
+    const notCollected = await store.query("xhs", { op: "search", keyword: "换季维稳" });
+    assert.deepEqual(notCollected.rows, [], "正文里出现过不算命中 —— 那不是这一批采回来的");
+    assert.equal(notCollected.total, 0);
+
+    // 别的批次的正文里含本关键词，同样不得混进来（n_3 的 desc 里有「护肤品-精华」）
+    const crossBatch = await store.query("xhs", { op: "search", keyword: "面膜" });
+    assert.deepEqual(crossBatch.rows.map((r) => r.id), ["n_3"], "只认采集词=面膜 的那一批");
+
+    // 非 search 算子（详情 / 评论 / creator 的入参是 id）仍走字段子串匹配 —— 这条不能一起收紧。
+    // 用"无算子 + 关键词"表达：适配器查详情/评论传的是 contentId 而不是 search 关键词。
+    const byText = await store.query("xhs", { keyword: "换季维稳" });
+    assert.deepEqual(byText.rows.map((r) => r.id), ["n_2"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
