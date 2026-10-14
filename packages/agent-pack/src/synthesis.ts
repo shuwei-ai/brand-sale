@@ -759,7 +759,7 @@ export function synthIntel(brief: { industry: string; category: string; platform
       channelMix: brief.platforms.map((p) => ({ channel: p, share: null })),
     },
     dataGaps: [
-      "本品投放指标（消耗 / ROI）缺失：未接入平台授权数据源",
+      "客户侧投放指标（消耗 / ROI）缺失：未接入平台授权数据源",
       "竞品投放消耗（官方无接口，属预期缺失）",
       "竞品声量份额与价格带分布（需可量化指数源，当前不可得）",
       "达人报价与画像（须走 L2 历史库 + 人工核验）",
@@ -1223,6 +1223,8 @@ interface ReportBrief {
   category: string;
   window: { from: string; to: string };
   budget: { amount: number };
+  /** 自有品牌；给了才出「品牌自诊」两页，否则报告只做市场调研（见 contracts `Brief.ownBrandId`） */
+  ownBrandId?: string;
 }
 
 interface ReportUpstream {
@@ -1281,6 +1283,12 @@ export function synthReport(
   });
 
   const intel = upstream.intel;
+  /* 是否做品牌自诊：**只看客户有没有指定自有品牌**（`brief.ownBrandId`），
+   * 不看 intel 有没有产出 brandSelf —— 没指定时"我方"根本不是个已知实体，
+   * 硬出这一页只会得到一整页「无数据」，还让读者误以为系统知道他是谁。
+   * 此时报告退化为**纯市场与竞品调研**（这正是大多数委托的真实形态）。 */
+  const hasOwnBrand = Boolean((brief.ownBrandId ?? "").trim());
+
   /** 品牌自身诊断：与竞品同属 intel 产物，但它说的是"我方"，引用必须单列 */
   const brandSelf = intel?.brandSelf;
   const creator = upstream.creator;
@@ -1472,7 +1480,7 @@ export function synthReport(
       ? [
           {
             type: "table",
-            columns: ["竞品", "定位", "价格带", "声量份额", "核心主张", "与本品差异"],
+            columns: ["竞品", "定位", "价格带", "声量份额", "核心主张", hasOwnBrand ? "与本品差异" : "差异化主张"],
             rows: intel.competitors.map((c) => [c.name, c.positioning, c.priceBand, c.shareOfVoice === null ? "无数据" : `${(c.shareOfVoice * 100).toFixed(0)}%`, c.keyClaims.join("；"), c.differentiation]),
             caption: "声量份额无可量化指数源，一律标为「无数据」，不编造",
             sourceRef: "phase:intel",
@@ -1484,64 +1492,117 @@ export function synthReport(
     [...intelCites, ...platformEntryCites],
   );
 
-  /* 5 品牌自身诊断（P0-1）：我方基线 */
-  push(
-    "data",
-    "品牌自诊概览",
-    "content/kpi+bullets",
-    brandSelf
-      ? [
-          {
-            type: "kpi",
-            items: [
-              kpiSelf("自有账号数", brandSelf.contentAssets.reduce((n, a) => n + (a.accountCount ?? 0), 0), brandSelf.contentAssets.some((a) => a.accountCount !== null)),
-              kpiSelf("自有作品数", brandSelf.contentAssets.reduce((n, a) => n + (a.postCount ?? 0), 0), brandSelf.contentAssets.some((a) => a.postCount !== null)),
-              { label: "口碑情感", value: SENTIMENT_LABEL[brandSelf.reputation.sentiment], unit: "", tier: brandSelf.reputation.sentiment === "unknown" ? "low" : "medium" },
-              { label: "覆盖平台", value: String(brandSelf.contentAssets.length), unit: "个", tier: "medium" },
-            ],
-            sourceRef: "phase:intel",
-          },
-          { type: "text", style: "h3", content: `我方定位：${brandSelf.positioning.statement}`, sourceRef: "phase:intel" },
-          { type: "bullets", items: brandSelf.positioning.differentiators.map((d) => `差异点：${d}`), sourceRef: "phase:intel" },
-          { type: "callout", tone: "warn", text: brandSelfCallout(brandSelf), sourceRef: "phase:intel" },
-        ]
-      : noData("品牌自诊"),
-    brandSelfCites,
-  );
+  /* 5 品牌自身诊断（P0-1）：我方基线 —— **仅当客户指定了自有品牌（`brief.ownBrandId`）时才出**。
+   * 未指定时整页省略，而不是写满「无数据」：那时的正确动作是只做市场调研，
+   * 不该拿一整页去替客户声明"我们不知道你是谁"。 */
+  if (hasOwnBrand) {
+    push(
+      "data",
+      "品牌自诊概览",
+      "content/kpi+bullets",
+      brandSelf
+        ? [
+            {
+              type: "kpi",
+              items: [
+                kpiSelf("自有账号数", brandSelf.contentAssets.reduce((n, a) => n + (a.accountCount ?? 0), 0), brandSelf.contentAssets.some((a) => a.accountCount !== null)),
+                kpiSelf("自有作品数", brandSelf.contentAssets.reduce((n, a) => n + (a.postCount ?? 0), 0), brandSelf.contentAssets.some((a) => a.postCount !== null)),
+                { label: "口碑情感", value: SENTIMENT_LABEL[brandSelf.reputation.sentiment], unit: "", tier: brandSelf.reputation.sentiment === "unknown" ? "low" : "medium" },
+                { label: "覆盖平台", value: String(brandSelf.contentAssets.length), unit: "个", tier: "medium" },
+              ],
+              sourceRef: "phase:intel",
+            },
+            { type: "text", style: "h3", content: `我方定位：${brandSelf.positioning.statement}`, sourceRef: "phase:intel" },
+            { type: "bullets", items: brandSelf.positioning.differentiators.map((d) => `差异点：${d}`), sourceRef: "phase:intel" },
+            { type: "callout", tone: "warn", text: brandSelfCallout(brandSelf), sourceRef: "phase:intel" },
+          ]
+        : noData("品牌自诊"),
+      brandSelfCites,
+    );
 
-  /* 6 品牌 vs 竞品差距矩阵 */
-  push(
-    "data",
-    "品牌 vs 竞品差距矩阵",
-    "content/matrix+table",
-    brandSelf
-      ? [
-          {
-            type: "table",
-            columns: ["对比维度", "我方", "竞品基准", "差距 / 为什么算不出"],
-            rows: brandSelf.gaps.map((g) => [g.dimension, g.self, g.benchmark, g.delta]),
-            caption: "「我方」列在未获品牌资产授权时一律写「待甲方确认」，不做任何推断",
-            sourceRef: "phase:intel",
-          },
-          {
-            type: "matrix",
-            xLabel: "公开价格带档位（低 1 → 高 3）",
-            yLabel: "公开可见内容形态数量",
-            // 矩阵单元里是数字坐标，必须声明来源，否则被 R6（无来源数字断言）拦下
-            sourceRef: "phase:intel",
-            cells: (intel?.competitors ?? []).map((c) => ({
-              x: priceBandRank(c.priceBand),
-              y: c.contentMatrix.length,
-              label: c.name,
-              size: 1,
-            })),
-          },
-          { type: "bullets", items: brandSelf.gaps.slice(0, 3).map((g) => `${g.dimension}：${g.delta}`), sourceRef: "phase:intel" },
-          { type: "callout", tone: "warn", text: "矩阵仅含竞品坐标：本品的位置未知，声量份额与粉丝画像均无授权数据源，故未绘制本方点位。", sourceRef: "phase:intel" },
-        ]
-      : noData("品牌 vs 竞品差距"),
-    brandSelfCites,
-  );
+    /* 6 品牌 vs 竞品差距矩阵（同样只在有自有品牌时出现） */
+    push(
+      "data",
+      "品牌 vs 竞品差距矩阵",
+      "content/matrix+table",
+      brandSelf
+        ? [
+            {
+              type: "table",
+              columns: ["对比维度", "我方", "竞品基准", "差距 / 为什么算不出"],
+              rows: brandSelf.gaps.map((g) => [g.dimension, g.self, g.benchmark, g.delta]),
+              caption: "「我方」列在未获品牌资产授权时一律写「待甲方确认」，不做任何推断",
+              sourceRef: "phase:intel",
+            },
+            {
+              type: "matrix",
+              xLabel: "公开价格带档位（低 1 → 高 3）",
+              yLabel: "公开可见内容形态数量",
+              // 矩阵单元里是数字坐标，必须声明来源，否则被 R6（无来源数字断言）拦下
+              sourceRef: "phase:intel",
+              cells: (intel?.competitors ?? []).map((c) => ({
+                x: priceBandRank(c.priceBand),
+                y: c.contentMatrix.length,
+                label: c.name,
+                size: 1,
+              })),
+            },
+            { type: "bullets", items: brandSelf.gaps.slice(0, 3).map((g) => `${g.dimension}：${g.delta}`), sourceRef: "phase:intel" },
+            { type: "callout", tone: "warn", text: "矩阵仅含竞品坐标：本品的位置未知，声量份额与粉丝画像均无授权数据源，故未绘制本方点位。", sourceRef: "phase:intel" },
+          ]
+        : noData("品牌 vs 竞品差距"),
+      brandSelfCites,
+    );
+  } else {
+    /* 6' 竞品定位矩阵 —— 未指定自有品牌时的替代页：**只呈现市场侧坐标**，页内不出现任何「我方」。
+     * 它同时保住两件事：chart/matrix 的可视化块下限，以及"竞品之间怎么分布"这个纯市场结论。 */
+    push(
+      "data",
+      "竞品定位矩阵",
+      "content/matrix+table",
+      intel
+        ? [
+            {
+              type: "table",
+              columns: ["竞品", "定位", "价格带", "公开内容形态数"],
+              rows: intel.competitors.map((c) => [
+                c.name,
+                c.positioning || "待核验",
+                c.priceBand || "未取到",
+                String(c.contentMatrix.length),
+              ]),
+              caption: "本页仅呈现各竞品在公开渠道的价格带与内容形态坐标，均未经人工核验",
+              sourceRef: "phase:intel",
+            },
+            {
+              type: "matrix",
+              xLabel: "公开价格带档位（低 1 → 高 3）",
+              yLabel: "公开可见内容形态数量",
+              // 矩阵单元里是数字坐标，必须声明来源，否则被 R6（无来源数字断言）拦下
+              sourceRef: "phase:intel",
+              cells: intel.competitors.map((c) => ({
+                x: priceBandRank(c.priceBand),
+                y: c.contentMatrix.length,
+                label: c.name,
+                size: 1,
+              })),
+            },
+            {
+              type: "bullets",
+              items: intel.competitors.map((c) => `${c.name}：${c.differentiation || "差异点待核验"}`),
+              sourceRef: "phase:intel",
+            },
+            {
+              type: "callout",
+              tone: "warn",
+              text: "本页为竞品公开坐标，未经人工核验；声量份额与投放消耗均无授权数据源支撑。",
+              sourceRef: "phase:intel",
+            },
+          ]
+        : noData("竞品情报"),
+      [...intelCites, ...platformEntryCites],
+    );
+  }
 
   /* 7 类目趋势与人群洞察 */
   push(
@@ -1856,7 +1917,12 @@ export function synthReport(
     meta: {
       dslVersion: "1.0",
       title,
-      brand: { id: brief.brandIds[0] ?? "unknown", name: brandLabel(brief, "未指定品牌") },
+      /* meta.brand 是"这份报告为谁而做"：指定了自有品牌才是"我方"；
+       * 未指定时回落到本轮品牌集合（它同时是报告主体与竞品集），而不是凭空写个"本品"。 */
+      brand: {
+        id: (brief.ownBrandId ?? "").trim() || brief.brandIds[0] || "unknown",
+        name: (brief.ownBrandId ?? "").trim() || brandLabel(brief, "未指定品牌"),
+      },
       window: brief.window,
       generatedAt: new Date().toISOString(),
       ...(options.degraded ? { degraded: options.degraded } : {}),

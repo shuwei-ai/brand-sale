@@ -6,8 +6,10 @@
  * 所以这里的断言集中在"没数据时它是否老老实实说没有"。
  *
  * 对应方案 `docs/requirements-implementation-plan.md` §WP-B：
- *   报告含该 2 页；gaps.length >= 3；未授权场景 contentAssets[].avgEngagement === null
- *   且存在 warn callout；measureReportDepth().slides >= 15。
+ *   报告含该 2 页（**仅当 Brief 指定了自有品牌 ownBrandId**）；gaps.length >= 3；
+ *   未授权场景 contentAssets[].avgEngagement === null 且存在 warn callout；
+ *   measureReportDepth().slides >= 15。
+ *   未指定自有品牌时报告整份不做品牌自诊（WP-B-8）—— 那时只做市场与竞品调研。
  *
  * 运行：npm test
  */
@@ -24,6 +26,8 @@ const brief = {
   platforms: ["douyin", "xiaohongshu"],
   window: { from: "2026-10-01", to: "2026-12-31" },
   brandIds: ["b_demo_1"],
+  /** 指定了自有品牌 → 报告才做品牌自诊（见 WP-B-8 的反例） */
+  ownBrandId: "b_demo_1",
   budget: { amount: 3_000_000 },
 };
 
@@ -127,5 +131,36 @@ test("WP-B-7 报告页数达到方案验收的 15 页下限", () => {
   assert.ok(
     depth.slides >= 15,
     `页数 ${depth.slides} 应 ≥ 15（方案 WP-B 把 13 页扩到 15 页）；当前策略下限为 ${DEFAULT_DEPTH_POLICY.minSlides}`,
+  );
+});
+
+test("WP-B-8 未指定自有品牌时：报告整份不做品牌自诊，且不得出现「我方 / 本品」字样", () => {
+  // 这是大多数委托的真实形态：客户只说"帮我看看这个类目"，没有告诉我他是谁。
+  // 那种情况下"我方"不是一个已知实体，任何"自诊"都只能是编的。
+  const noOwnBrand = { ...brief, ownBrandId: undefined };
+  const dsl = synthReport(noOwnBrand, { intel: synthIntel(brief, noTools) }, { synthesized: true });
+  const titles = dsl.slides.map((s) => s.title);
+
+  assert.ok(!titles.includes("品牌自诊概览"), "未指定自有品牌时不得出现「品牌自诊概览」页");
+  assert.ok(!titles.includes("品牌 vs 竞品差距矩阵"), "未指定自有品牌时不得出现「品牌 vs 竞品差距矩阵」页");
+
+  const blob = JSON.stringify(dsl);
+  assert.ok(!blob.includes("我方"), "报告任何位置都不得出现「我方」（含列名、caption、callout）");
+  assert.ok(!blob.includes("本品"), "报告任何位置都不得出现「本品」");
+
+  // 但市场侧内容与深度基线不能因此塌掉：替代页仍在，可视化块一块不少
+  const titlesWithOwn = synthReport(brief, { intel: synthIntel(brief, noTools) }, { synthesized: true }).slides.map((s) => s.title);
+  assert.ok(titles.includes("竞品定位矩阵"), "未指定自有品牌时应以「竞品定位矩阵」承接矩阵块");
+  assert.ok(!titlesWithOwn.includes("竞品定位矩阵"), "指定了自有品牌时应走「品牌 vs 竞品差距矩阵」，不出现替代页");
+
+  const depth = measureReportDepth(dsl);
+  const depthWithOwn = measureReportDepth(
+    synthReport(brief, { intel: synthIntel(brief, noTools) }, { synthesized: true }),
+  );
+  assert.ok(depth.slides >= DEFAULT_DEPTH_POLICY.minSlides, `页数 ${depth.slides} 应 ≥ ${DEFAULT_DEPTH_POLICY.minSlides}`);
+  assert.equal(
+    depth.visualBlocks,
+    depthWithOwn.visualBlocks,
+    "去掉「我方」不该顺带砍掉可视化块：替代页必须把 matrix 补回来",
   );
 });

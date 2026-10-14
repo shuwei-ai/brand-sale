@@ -49,6 +49,18 @@ export interface Brief {
   industry: string;
   category: string;
   brandIds: string[];
+  /**
+   * 甲方**自有品牌**。与 `brandIds` 语义不同，**不要混用**：
+   *   - `brandIds` = 本轮在投 / 在看的品牌集合，报告按「竞品格局」呈现；
+   *   - `ownBrandId` = "我是谁"，只有给了它，报告才会做**品牌自诊**
+   *     （第 6 页「品牌自诊概览」+ 第 7 页「品牌 vs 竞品差距矩阵」）。
+   *
+   * **不填 = 本轮只做市场与竞品调研**：报告里不出现任何「我方」页、列与字样，
+   * 也就不需要品牌资产授权。这解决了历史上的一个死结 ——
+   * 以前 `brandIds` 被两处按**相反**语义消费（`buildBrandSelf()` 当"我方"、
+   * 竞品表当"竞品集"），导致「品牌自诊概览」页在任何 brief 下都填不实。
+   */
+  ownBrandId?: string;
   budget: Money;
   objectiveWeights: { awareness: number; conversion: number; retention: number };
   window: TimeWindow;
