@@ -156,6 +156,59 @@ test("synthIntel 把 platform_digest 的 rows 转成条目级引用，无数据�
   assert.equal(empty.evidences, undefined, "没取到平台数据时不得凭空造证据");
 });
 
+/* ── ③b 兜底路径不得写死"演示题材"（2026-10-14 耳机任务事故回归）─────
+ *
+ * 事故：`synthIntel` 把「成分党 / 平价替代 / 医研背书」（**护肤品**题材）三个竞品硬编码在
+ * 确定性兜底路径里，又把公开检索命中的**站点名**当品牌名拼进去。模型不可用时（该次任务
+ * LLM 报 E-AGENT-002），耳机报告于是渲染出「头部成分党（Global Information, Inc. (GII)）」：
+ *   ① 类目错 —— 耳机报告在讲"成分浓度"；
+ *   ② 主体错 —— GII 是市场研究出版机构，不是品牌。
+ * 整张"竞品格局对比"表因此不可用。兜底路径拿不到情报时只能**如实标「待核验」**，
+ * 绝不能携带任何与具体行业绑定的文案。 */
+test("兜底合成不写死题材：竞品取自 brief.brandIds，全产物无行业硬编码残留", () => {
+  const out = synthIntel(
+    { industry: "3C数码", category: "耳机", brandIds: ["索尼", "Bose", "华为", "小米"], platforms: ["douyin", "xiaohongshu", "bilibili"], window: { from: "2026-10-01" } },
+    {},
+  );
+
+  assert.deepEqual(
+    out.competitors.map((c) => c.name),
+    ["索尼", "Bose", "华为", "小米"],
+    "兜底竞品名只能来自 brief 声明的品牌（客户给的），不能是题材标签，也不能是检索站点名",
+  );
+  assert.ok(out.competitors.every((c) => c.priceBand === "待核验"), "没有情报就标待核验，不编价格带");
+
+  const blob = JSON.stringify(out);
+  for (const residue of ["成分党", "平价替代", "医研背书", "Global Information", "consumer_electronics"]) {
+    assert.ok(!blob.includes(residue), `兜底产物不得出现演示残留「${residue}」`);
+  }
+
+  // 没给 brandIds 时退到**中性占位**，而不是退到题材标签
+  const noBrand = synthIntel({ industry: "3C数码", category: "耳机", platforms: ["douyin"], window: { from: "2026-10-01" } }, {});
+  assert.ok(
+    !/成分党|平价替代|医研背书|headphones/.test(JSON.stringify(noBrand.competitors)),
+    "无 brandIds 时也不得退回题材硬编码或英文类目",
+  );
+});
+
+test("兜底报告不携带无源数字：去掉演示种子的 ROI 断言，但保留必需的 quote 块型", () => {
+  const dsl = synthReport(
+    { brandIds: ["索尼", "Bose", "华为", "小米"], category: "耳机", window: { from: "2026-10-01", to: "2026-12-31" }, budget: { amount: 2_000_000 } },
+    { intel: intelWith([]) },
+    { synthesized: true },
+  );
+  const blob = JSON.stringify(dsl);
+
+  // 那串数字只是 scripts/seed.ts 的演示种子，KB 没这条时就等于假引用（旧报告实测渲染出来了）
+  assert.ok(!blob.includes("45%"), "不得硬抄 seed 里的 ROI 断言");
+  assert.ok(!blob.includes("成分党"), "快捷结论不得引用已删除的题材标签");
+  assert.equal(dsl.meta.title, "耳机 品牌营销策略建议", "标题用 brief.category（中文类目）");
+  assert.ok(
+    dsl.slides.some((s) => s.blocks.some((b) => b.type === "quote")),
+    "quote 是 report-depth 的必需块型 —— 去掉硬编码内容不等于删掉块型",
+  );
+});
+
 /* ── ④ 端到端：DSL 带条目级引用 + 机械附录页 + 渲染出真链接 ─── */
 
 test("报告出现条目级引用与溯源附录页，且 URL 由证据表反查而来", () => {

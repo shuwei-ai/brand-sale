@@ -5,7 +5,7 @@
 >
 > 核对基线：2026-10-13 工作区（`npm test` 210 用例全绿、`npm run check:boundaries` 通过）。
 > 2026-10-14 局部更新：采集浏览器会话改为 `reuse` 常驻复用（§8.5）、删除死配置
-> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **214**（见 §14）。
+> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **216**（见 §14）。
 
 ## 0. 阅读指引
 
@@ -91,7 +91,7 @@
 | `apps/gateway` | 5 | 902 | HTTP + SSE 接入层 |
 | **合计（TS）** | **89** | **≈24 200** | 另有采集内核 Python（内嵌 MediaCrawler） |
 
-测试：**17 个文件 / 214 个用例**，全部离线可跑（§12）。
+测试：**17 个文件 / 216 个用例**，全部离线可跑（§12）。
 
 ---
 
@@ -146,7 +146,7 @@
 
 ```bash
 npm install                 # 一次性
-npm test                    # 全离线自检（214 用例）
+npm test                    # 全离线自检（216 用例）
 npm run migrate             # 建表（dev 模式空库会自动灌种子）
 npm run seed                # 登记内置数据源与演示租户
 npm run web:build           # 构建前端控制台 → apps/web/dist
@@ -1209,7 +1209,7 @@ knowledge → model-gateway → agent-pack → render → orchestrator → gatew
 
 ### 12.1 测试体系
 
-`npm test` = **17 个文件 / 214 个用例，全部离线可跑**：
+`npm test` = **17 个文件 / 216 个用例，全部离线可跑**：
 
 ```
 BM_LLM_MODE=mock BM_ALLOW_DEMO_DATA=true BM_MC_ENABLED=false BM_MC_LICENSE_ACK=false \
@@ -1278,7 +1278,7 @@ node --import tsx --test tests/*.test.ts
 
 | # | 位置 | 现状 | 实情 |
 |---|---|---|---|
-| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；后随用例增补变为 214）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
+| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日两次增补后为 **216**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
 | 2 | `README.md` 架构图 | `render  M16 渲染` | 渲染是 **M11**；M16 在代码里不存在（`check-boundaries.ts` 的注释也误写为 M16） |
 | 3 | `README.md` | "不构建则回退内置零构建控制台" | 旧控制台（`console.ts` + `/console-legacy`）**已删除**，现在返回引导页（§11.3） |
 | 4 | `README.md` | "七个平台采集已接入…17 个工具" 类表述 | 工具总数 **18**：10 个通用 + `platform_digest` + 7 个 hidden 原语（§7.2） |
@@ -1293,6 +1293,11 @@ node --import tsx --test tests/*.test.ts
 
 > 注：条目 12 只是把 `category` 说清楚，**没有解耦**——`category` 仍是搜索词。新增品类时**优先补词表**，
 > 不要指望模型每次都给中文（模型只在词表未命中时才被叫到，而那时它没有约束可依）。
+
+| # | 位置 | 现状 | 实情 |
+|---|---|---|---|
+| 13 | `agent-pack/src/synthesis.ts` **兜底合成** | `synthIntel` 把「成分党 / 平价替代 / 医研背书」（**护肤品**题材）三个竞品**硬编码**在确定性兜底路径里，并把公开检索命中的**站点名**当品牌名拼进去；`synthReport` 的快捷结论写死"已识别三类定位坐标（成分党 / 平价替代 / 医研背书）"；`quote` 块硬抄 `scripts/seed.ts` 的演示种子「达人种草占比 45% 时 ROI 最优（2.3）」并署名"KB-2 内部复盘" | 模型不可用时（该次任务 LLM 报 E-AGENT-002）耳机报告渲染出「**头部成分党（Global Information, Inc. (GII)）**」：① 类目错 —— 耳机报告在讲"成分浓度"；② 主体错 —— GII 是市场研究出版机构，不是品牌。整张"竞品格局对比"表不可用；`quote` 块在 KB 无该条目时等于**无源假引用** → **2026-10-14 竞品集改为取自 `brief.brandIds`（不足 3 家时补"其他竞品 X（未识别）"中性占位以过 Schema 的 ≥3 下限）、分析字段一律标"待核验"、快捷结论按 brief 如实叙述、`quote` 换成不承载数字的口径说明；新增 2 条回归用例（`data-provenance.test.ts`）** |
+| 14 | `Brief.brandIds`（`contracts/src/job.ts`） | 只有 `brandIds: string[]`，**没有"我方品牌"字段** | 同一个字段被两处按**相反**语义消费：`buildBrandSelf()` 与 `report.meta.brand` 当「我方品牌」（`synthesis.ts:778` / `:1823`），而「竞品格局对比」表与「品牌 vs 竞品差距矩阵」当**竞品集**（新报告矩阵列头即「我方 \| 索尼 \| Bose \| 华为 \| 小米」）。后果：**「品牌自诊概览」页在任何 brief 下都填不实**，未授权时只能整页写「无数据」。这是设计缺口，未修 |
 
 **其它值得知道的边界**：
 
@@ -1472,7 +1477,7 @@ node --import tsx --test tests/*.test.ts
 | `brief-llm-fill.test.ts` | 6 | 151 | 规则抽取结果的权威性：模型只能补空字段，不能改预算/时间窗 |
 | `brief-parse.test.ts` | 12 | 167 | 自然语言解析（规则段）纯函数、中英混合输入；**category 会被逐字当平台搜索词，必须是中文** |
 | `collector.test.ts` | 44 | 1282 | sidecar 归一化、落盘目录契约、快照取新增行、ID 闭环、常驻浏览器端口与回收 |
-| `data-provenance.test.ts` | 16 | 602 | 条目级溯源不依赖模型自觉（证据登记 → 引用 → 渲染反查） |
+| `data-provenance.test.ts` | 18 | 655 | 条目级溯源不依赖模型自觉（证据登记 → 引用 → 渲染反查）；含**兜底路径不得写死行业文案**的回归 |
 | `data-realism.test.ts` | 13 | 436 | 不引用本地样例数据；样例达人不得出现在报告里 |
 | `e2e.test.ts` | 13 | 577 | LLD §7.3 强制 E2E 清单（mock 模式，全离线） |
 | `governance-fixes.test.ts` | 6 | 186 | 治理口径的三个不变量（口径错了不会有用例失败，只能专门钉） |
@@ -1485,7 +1490,7 @@ node --import tsx --test tests/*.test.ts
 | `tool-call-guard.test.ts` | 5 | 67 | 工具调用风暴闸门（真机曾出现同一工具连续被调 131 次） |
 | `web-console.test.ts` | 5 | 214 | 前端托管契约（含路径穿越守卫） |
 | `web-search.test.ts` | 10 | 313 | 唯一外部计费源（打桩 fetch） |
-| **合计** | **214** | **≈6405** | 17 个文件 |
+| **合计** | **216** | **≈6458** | 17 个文件 |
 
 ## 附录 C · 环境变量
 

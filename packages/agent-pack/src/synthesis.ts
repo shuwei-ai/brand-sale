@@ -707,28 +707,42 @@ export function synthIntel(brief: { industry: string; category: string; platform
     citations.push({ claim: `${meta.displayName}公开内容样本 ${n} 条（公开采集，未人工核验）`, sourceKey: meta.sourceId, confidence: 0.45 });
   }
 
-  /* 三个坐标位（价位/打法/背书）各占一家，构成"竞品格局对比"页需要的最小可比集。
-   * 名字取自公开检索的站点名，取不到就用带"未核验"标注的占位描述——绝不给具体品牌名，
-   * 因为那会读起来像实测情报。 */
-  const mkCompetitor = (angle: string, positioning: string, priceBand: string, claim: string, diff: string, confidence: number) => ({
-    name: webHits.length > 0 ? `${angle}（${webHits[0]?.siteName ?? "公开网页"}）` : `${angle}（公开检索未命中，占位）`,
-    positioning: `${brief.category} ${positioning}`,
-    priceBand,
-    keyClaims: [claim],
+  /* 竞品集只能来自 `brief.brandIds` —— 客户自己声明的品牌。
+   *
+   * 旧实现把「成分党 / 平价替代 / 医研背书」三个**护肤品**题材标签硬编码在这里（做美妆演示时
+   * 留下的），又把公开检索命中的**站点名**当品牌名拼进去。耳机任务走兜底路径时于是渲染出
+   * 「头部成分党（Global Information, Inc. (GII)）」：① 类目错 —— 耳机报告在讲"成分浓度"；
+   * ② 主体错 —— GII 是市场研究出版机构，不是品牌；整张"竞品格局对比"表不可用。
+   *
+   * 兜底路径本来就拿不到竞品情报，正确做法是**如实标「待核验」**：名字用 brief 给的品牌
+   * （客户声明，不是编的），分析字段一律留空 —— 既不编造，也不张冠李戴。 */
+  const briefBrands = (brief.brandIds ?? []).map((b) => b.trim()).filter(Boolean);
+  const mkCompetitor = (name: string) => ({
+    name,
+    positioning: "待核验（本轮无竞品情报来源）",
+    priceBand: "待核验",
+    keyClaims: ["待核验（本轮无竞品情报来源）"] as string[],
     // 声量份额必须由可量化数据源估算；公开网页检索给不出这个口径，如实置空
     shareOfVoice: null,
-    contentMatrix: [{ form: `${angle} 公开可见内容形态（未经人工核验）`, share: null, platform: platform0 }],
+    contentMatrix: [{ form: "公开可见内容形态（未经人工核验）", share: null, platform: platform0 }],
     sovTrend: [{ month, value: null }],
-    differentiation: diff,
-    confidence,
+    differentiation: "待核验",
+    confidence: 0.3,
   });
+  /* brief 声明的品牌不足 3 个时用**中性占位**补足 —— schema 硬性要求 competitors ≥ 3
+   * （`$.competitors 至少需要 3 项`）。占位明确写"未识别"，读者一眼可见这是缺口而非情报；
+   * 绝不像旧实现那样拿题材标签凑数。名字里也绝不拼检索站点名：站点名是"资料来源"，不是"竞品"。 */
+  const competitorNames =
+    briefBrands.length >= 3
+      ? briefBrands
+      : [
+          ...briefBrands,
+          ...Array.from({ length: 3 - briefBrands.length }, (_, i) => `其他竞品 ${String.fromCharCode(65 + i)}（未识别）`),
+        ];
+  const competitors = competitorNames.map((n) => mkCompetitor(n));
 
   return {
-    competitors: [
-      mkCompetitor("头部成分党", "高端成分叙事", "公开渠道高价位带", "公开页面以成分为核心卖点，具体浓度未经核验", "定位高于本品，争夺成分党而非价格敏感人群", 0.35),
-      mkCompetitor("平价替代", "性价比路线", "公开渠道低价位带", "公开页面以价格对比为切入", "与本品争夺入门用户，构成价格侧替代压力", 0.32),
-      mkCompetitor("医研背书", "专业背书路线", "公开渠道中价位带", "公开页面以专业背书建立信任", "与本品目标人群重叠度最高，需在信任层面对冲", 0.3),
-    ],
+    competitors,
     categoryInsights: {
       trends:
         webHits.length > 0
@@ -1414,14 +1428,36 @@ export function synthReport(
     ],
   };
   const overviewHasLow = (overviewItems.type === "kpi" ? overviewItems.items : []).some((it) => it.tier === "low");
+  /* 竞品集的来源在快捷结论里要如实交代：有则点名（客户声明的品牌），无则说明"未获情报"。
+   * 旧实现这里写死"已识别三类定位坐标（成分党 / 平价替代 / 医研背书）"—— 那是美妆演示的残留。 */
+  const briefBrands = (brief.brandIds ?? []).map((b) => b.trim()).filter(Boolean);
   push(
     "content",
     "核心结论速览",
     "content/kpi",
     [
       overviewItems,
-      { type: "bullets", items: ["竞品格局已识别三类定位坐标（成分党 / 平价替代 / 医研背书）", "达人分层覆盖 head / mid / tail 三层", "预算按渠道 × 阶段拆解，并给出三档情景"], sourceRef: "phase:intel" },
-      { type: "quote", text: "达人种草占比 45% 时 ROI 最优（2.3），超过 60% 后边际递减明显。", attribution: "KB-2 内部复盘", sourceRef: "phase:budget" },
+      {
+        type: "bullets",
+        items: [
+          briefBrands.length > 0
+            ? `竞品格局：按客户声明的 ${briefBrands.length} 个品牌列出（${briefBrands.join("、")}），定位与价格带待核验`
+            : "竞品格局：本轮未获竞品情报，不作定位判断",
+          "达人分层覆盖 head / mid / tail 三层",
+          "预算按渠道 × 阶段拆解，并给出三档情景",
+        ],
+        sourceRef: "phase:intel",
+      },
+      /* `quote` 是必需块型（见 report-depth 的 requiredBlockTypes），**但内容必须可溯源**。
+       * 旧实现把它写死成「达人种草占比 45% 时 ROI 最优（2.3）」并署名"KB-2 内部复盘"：
+       * 那串数字只是 `scripts/seed.ts` 里的演示种子，KB 没这条时就成了无源的假引用
+       * （旧报告实测渲染出了这一段）。这里改成不承载任何数字的口径说明。 */
+      {
+        type: "quote",
+        text: "竞品投放消耗、声量份额与达人报价均无授权数据源，本报告一律写「无数据」，不给估算值。",
+        attribution: "口径说明",
+        sourceRef: "meta:disclaimer",
+      },
       ...(overviewHasLow ? ([{ type: "callout", tone: "warn", text: "本页含低置信度估算值（ROI 与数据缺口来自模型推断），请结合人工判断使用。", sourceRef: "meta:disclaimer" }] as const) : []),
     ],
     intelCites.slice(0, 2),
