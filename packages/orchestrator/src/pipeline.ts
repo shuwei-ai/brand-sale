@@ -501,12 +501,19 @@ export class Orchestrator implements IOrchestratorPort {
     // 清历史降级记录：否则"已被修掉的降级"会跟着重跑活下来，重跑后仍显示「产出不完整」
     this.deps.repos.jobs.clearDegraded(jobId);
     this.deps.repos.phases.resetForRerun(jobId, downstream);
-    // 清理下游产物，避免新旧混杂
+    /* 清理下游产物，避免新旧混杂。
+     *
+     * ⚠️ 删的是**产物 kind**，不是阶段名 —— 两者只有部分重合（见 ARTIFACT_KIND_BY_PHASE）：
+     * `intake` 的产物是 `brief`、`creator` 的是 `creator_candidates`。早先这里直接拿阶段名
+     * 去 IN 匹配，于是这两类产物**删不掉**；再加上写产物用的是 `addIfAbsent`，
+     * 重跑后它们会**保留旧内容**：报告用的是新的（阶段产物走 output_json），
+     * 而控制台产物面板点开是上一轮的旧达人名单 —— 实测 2026-10-15 重跑 creator 后
+     * `creator_candidates` 仍是前一天那份（里面还有已经能填上的「未采集」）。 */
     for (const p of downstream) {
       this.deps.repos.db.run(
         "DELETE FROM artifacts WHERE job_id = ? AND kind IN (?, 'report_dsl', 'report_markdown', 'report_html')",
         jobId,
-        p,
+        ARTIFACT_KIND_BY_PHASE[p],
       );
     }
     this.deps.repos.jobs.setStatus(jobId, "running", idx / PHASE_ORDER.length, phase);

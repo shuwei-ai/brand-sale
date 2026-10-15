@@ -299,7 +299,8 @@ evidences?: { entryId: string; quote: string /* ≤80 字摘录 */; useFor?: str
 3. **降级路径补取一次平台数据**（`packages/agent-pack/src/agents.ts` 的 `refreshPlatformData`）：
    Pi 循环结束（无论成功失败）之后、出终稿之前，用同一批参数重放一次 `platform_digest`，
    把期间落库的数据捞回来；creator 阶段还会据此**重建真实账号人选池**（`buildCreatorPool`）。
-   预取时证据表为空的话，creator 阶段开头也会先补一次再建池。
+   creator 阶段开头也会先补一次再建池，判定条件是 `needsPlatformRefresh()`：
+   **池子为空，或存在"有真实条目却没粉丝量"的账号**（后者治"半池"，见 §13.2 末尾）。
 4. **提示词与结构说明**：`entryId` 示例改成占位符（`pf_xhs_ 前缀 + 原始内容 id`），
    并明确"rows 为空就留空 evidences，系统会机械补齐；编造的一律摘除并标为产出不完整"。
 5. **台账缓存命中改结构化字段**（`Provenance.cacheHit`）：原来靠 `note.includes("缓存")` 判断，
@@ -423,7 +424,7 @@ python run.py --platform xhs --type creator --creator-id 69e0d0fa00000000330040e
    wb `uid` / ks `id`）。它是"按主页补采"的入参；归一化后的 `authorId` 是脱敏哈希，
    喂回内核必然失败。**只入参、不展示**。
 3. **采集侧自动补采**（`apps/collector/src/tasks.ts:enqueueAuthorProfiles`）：一次 `search`
-   落库后，按 `raw.author_user_id` 取前 `BM_MC_PROFILE_ENRICH_MAX`（默认 12）位作者，
+   落库后，按 `raw.author_user_id` 取前 `BM_MC_PROFILE_ENRICH_MAX`（默认 30，2026-10-15 由 12 提高）位作者，
    派生**一个** `op=creator` + `profileOnly` 的任务（`--creator-id a,b,c` 逗号列表，
    内核原生支持多 ID）排到队尾。开关 `BM_MC_PROFILE_ENRICH`（默认开）。
    `POST /collect` 也开放了 `profileOnly: true`，便于手工"只补一个账号的资料"。
@@ -571,3 +572,37 @@ brief.notes     = 双十一大促…重点品牌 施华蔻 / 赫莲娜 / 兰蔻 
 - `tests/collector.test.ts`（新增 1 例）：搜索顺带取回的资料行必须归一化为
   `op=creator`，不得以内容行身份混进 `op=search`。
 - 全量 **180 tests 通过**、`npm run typecheck` 通过。
+
+## 15. 「为什么还有未采集的？」：补读条件治"半池" + 补采上限（2026-10-15 增补）
+
+业主在电脑品类的报告（`job_0mv85fh3yw2r0i3u465` / `job_0mv86by83ilvbnn0h1a`）截图追问：
+人选页的粉丝量一列，77 条真实条目、79 位真实账号都进来了，**为什么还有 7 位写着「未采集」？**
+
+### 15.1 根因：三条，都不是"采不到"
+
+事实前提：这 7 位的主页资料**大部分已经采到了**，只是报告读缓存的那一刻还没落库；
+剩下 2 位是真的没采。
+
+1. **时序竞争（主因，5 位）**：内容行与资料行是两条链路。搜索任务先落库（内容行天生不带粉丝量），
+   B站搜索**顺带**写出 13:59:04 的资料行，抖音/小红书则要等 13:59:11 / 13:59:22 那轮派生的
+   主页补采。而 intel 阶段的预取只在 13:57:24 发生一次 —— 报告读缓存时后两批资料行还没到。
+2. **补读条件太窄（半池盲区）**：creator 阶段只在**证据池完全为空**时才补读
+   （`aggregatePlatformAccounts(...).length === 0`）。B站那 18 位作者已经把池子填满了，
+   于是"池子非空"判定为假 → 补读被跳过 → 抖音/小红书那批作者永远拿不到粉丝量。
+3. **补采上限（2 位）**：`BM_MC_PROFILE_ENRICH_MAX` 默认 12，而抖音那批有 25 位作者，
+   排在 12 位之后的两人从未被派生补采过。
+
+### 15.2 修法
+
+1. **补读条件改为 `needsPlatformRefresh(entries)`**（`packages/agent-pack/src/agents.ts`）：
+   池子为空 **或** 存在"有真实条目却没粉丝量"的账号即补读。代价有界 ——
+   内容行还在缓存时适配器不重新投递采集，证据登记又按 `entryId` 去重，所以只补进新增的资料行。
+   已知边界：平台侧本来就给不出粉丝量的账号（快手主页 405）会让它恒为真，可以接受
+   （每次 creator 阶段最多补一次，不重采、不脏写）。
+2. **补采上限 12 → 30**（`apps/collector/src/config.ts`）：整批作者本来就合成一个任务跑
+   （`--creator-id a,b,c`），提高上限不会成比例加重平台侧登录校验。
+
+### 15.3 测试
+
+- `tests/platform-collect.test.ts`：`needsPlatformRefresh` 三分支 —— 空池要补、
+  全都有粉丝量不补、**半池（有人缺粉丝量）要补**。

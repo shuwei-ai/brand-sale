@@ -195,6 +195,38 @@ test("运行期进度落库：每个阶段开跑时 jobs.progress 已经是该�
   }
 });
 
+/* ── 重跑与产物清理 ─────────────────────────────────────── */
+
+/**
+ * 重跑某个阶段时，**下游产物必须被重写**，不能留着上一轮那份。
+ *
+ * 踩过的坑：清理时拿**阶段名**去 IN 匹配产物 `kind`，而两者只有部分重合
+ * （`intake`→`brief`、`creator`→`creator_candidates`，见 ARTIFACT_KIND_BY_PHASE），
+ * 再加上写产物用的是 `addIfAbsent` —— 于是重跑 creator 后报告用的是新数据
+ * （阶段产物走 output_json），控制台产物面板点开却是**上一轮的达人名单**。
+ * 实测 2026-10-15：重跑后 `creator_candidates` 仍是前一天那份，里面还留着
+ * 当时采不到的「未采集」，看起来像修复没生效。
+ */
+test("重跑 creator：达人候选产物被重写，不留上一轮的旧名单", async () => {
+  const { c, dispose } = await freshContainer();
+  try {
+    const { jobId } = await c.orchestrator.startJob({ idempotencyKey: "k-rerun-artifact", spec: { brief: BRIEF } }, ctx);
+    await waitDone(c, jobId);
+    const before = c.repos.artifacts.list(jobId).find((a) => a.kind === "creator_candidates");
+    assert.ok(before, "首轮应产出 creator_candidates 产物");
+
+    await new Promise((r) => setTimeout(r, 5)); // 让产物 id 的生成时刻可区分
+    await c.orchestrator.rerunPhase(jobId, DEMO_TENANT, "creator");
+    await waitDone(c, jobId);
+
+    const after = c.repos.artifacts.list(jobId).find((a) => a.kind === "creator_candidates");
+    assert.ok(after, "重跑后仍应有 creator_candidates");
+    assert.notEqual(after.artifactId, before!.artifactId, "重跑 creator 必须写入新产物（阶段名 ≠ 产物 kind 的坑）");
+  } finally {
+    dispose();
+  }
+});
+
 /* ── 流式合帧 ───────────────────────────────────────────── */
 
 test("DeltaPump：细碎增量被合帧，且收尾时最后一段必须吐出去", () => {

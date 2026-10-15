@@ -226,6 +226,35 @@ export function platformPrefetchArgs(
   return { op: "search", keyword: brief.category, platforms, limit: PLATFORM_PREFETCH_LIMIT };
 }
 
+/**
+ * creator 阶段要不要再补读一次平台数据（纯函数，便于单测）。
+ *
+ * 起因（业主截图追问"为什么还有未采集的？"）：报告人选页的粉丝量一列仍有 7 位写着
+ * 「未采集」，而这些人的主页资料其实**已经采到了**，只是报告读缓存时还没落库。
+ *
+ * 为什么"池子非空"不等于"数据到齐了"：内容行与主页资料行是**两条采集链路**、到达时间不同 ——
+ * 搜索任务先落库（内容行天生不带粉丝量），collector 随后才派生作者主页补采
+ * （`enqueueAuthorProfiles`，只打一次主页接口，见 apps/collector/src/tasks.ts），
+ * 而 B站搜索会顺带写出资料行、抖音/小红书要等那轮派生的补采。旧条件只判
+ * `accounts.length === 0`，在**半池**这种最常见的形态下恰好为假：
+ * B站已经带回来 18 位作者的资料行 → 池子非空 → 补读被跳过 → 晚一轮落库的
+ * 抖音/小红书那批作者永远拿不到粉丝量（实测 5 位卡在这里、2 位卡在补采上限）。
+ *
+ * 判定改成"存在真实条目却没粉丝量的账号"，两种形态都要补：
+ *   · 池子为空   → 补（原有行为：防"数据到了、池子还是空的"）；
+ *   · 池子非空但有人缺粉丝量 → 补（新增：治半池盲区）。
+ * 代价是有界的一次本地缓存查询：内容行还在缓存里时适配器**不会重新投递采集**
+ * （packages/datasource/src/media-crawler.ts 只在 contentRows 为空时才排队），
+ * 登记又按 entryId 去重（EvidenceRegistry.record），所以只补进新增的资料行。
+ *
+ * 已知边界：平台侧本来就给不出粉丝量的账号（真机：快手主页接口 405）会让这里恒为真。
+ * 可以接受 —— 不重采、不脏写，只多一次缓存读，且 creator 阶段每次运行最多补一次。
+ */
+export function needsPlatformRefresh(entries: readonly EvidenceEntry[]): boolean {
+  const accounts = aggregatePlatformAccounts(entries);
+  return accounts.length === 0 || accounts.some((a) => a.followers === null);
+}
+
 export interface PhaseResult extends PhaseRunOutput {
   /** 该阶段的台账 id */
   ledgerId?: string;
@@ -920,8 +949,11 @@ export class AgentPack {
          *
          * 证据表为空时先补取一次：intel 用的是预取那一刻的空结果，而采集通常在
          * 几分钟后才落库；不补的话这里拿到的永远是空池（实测产出了 `待确认头部达人`
-         * 这类占位人选）。补取的代价是一次本地查询（同参数采集会被侧车去重）。 */
-        if (aggregatePlatformAccounts(this.evidence.list(tc.jobId)).length === 0) {
+         * 这类占位人选）。补取的代价是一次本地查询（同参数采集会被侧车去重）。
+         *
+         * 判定条件**不只是"空池"**：半池（有内容行、但主页资料行还没落库）是实测最常见的
+         * 形态，见 `needsPlatformRefresh` 的长注释 —— 那正是"粉丝量仍显示未采集"的成因。 */
+        if (needsPlatformRefresh(this.evidence.list(tc.jobId))) {
           await this.refreshPlatformData(phase, input, tc, out, degradedKeys);
         }
         this.buildCreatorPool(input, tc, out);

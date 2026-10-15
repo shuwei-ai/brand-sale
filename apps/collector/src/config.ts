@@ -64,6 +64,10 @@ export interface CollectorConfig {
    * 抖音只在 `user/profile/other` 接口），报告人选页的"粉丝量"一列此前恒为"未采集"。
    * 补采是 `op=creator` + profile-only（只打一次主页接口，不抓作品），单次几秒。
    * `maxAuthors` 限制一次搜索最多补几位作者 —— 一次搜索几十个作者全补会把平台刷爆。
+   * 默认值 2026-10-15 由 12 提到 **30**：实测一次搜索的作者数常到 25 上下（电脑品类
+   * 抖音那批 25 位），而报告的人选页只认"采到了的" —— 12 位之后的作者粉丝量会永远
+   * 停留在「未采集」。整批作者是**合成一个任务**跑的（见 tasks.ts:enqueueAuthorProfiles），
+   * 所以提高上限并不成比例地加重平台侧登录校验。
    * 关掉：`BM_MC_PROFILE_ENRICH=false`。
    */
   profileEnrich: { enabled: boolean; maxAuthors: number };
@@ -142,7 +146,7 @@ export function loadCollectorConfig(cwd: string = process.cwd()): CollectorConfi
     maskNickname: bool(get("BM_MC_MASK_NICKNAME"), false),
     profileEnrich: {
       enabled: bool(get("BM_MC_PROFILE_ENRICH"), true),
-      maxAuthors: num(get("BM_MC_PROFILE_ENRICH_MAX"), 12),
+      maxAuthors: num(get("BM_MC_PROFILE_ENRICH_MAX"), 30),
     },
   };
 }

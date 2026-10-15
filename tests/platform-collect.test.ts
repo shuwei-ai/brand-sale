@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { loadConfig, MEDIA_CRAWLER_PLATFORM_META, MEDIA_CRAWLER_PLATFORMS, comparableCommentMetrics, comparableContentMetrics } from "@brandsale/config";
 import { POPULAR_PLATFORMS, type Brief, type TenantContext } from "@brandsale/contracts";
 import { MEDIA_CRAWLER_SOURCE_IDS } from "@brandsale/datasource";
-import { BRIEF_PLATFORM_TO_MC, PHASE_TOOL_HINT, PLATFORM_DIGEST_TOOL_NAME, PLATFORM_TOOL_NAME, platformPrefetchArgs } from "@brandsale/agent-pack";
+import { BRIEF_PLATFORM_TO_MC, PHASE_TOOL_HINT, PLATFORM_DIGEST_TOOL_NAME, PLATFORM_TOOL_NAME, needsPlatformRefresh, platformPrefetchArgs, toEvidenceEntries } from "@brandsale/agent-pack";
 import { createContainer, type Container } from "../apps/gateway/src/container.ts";
 import { seed, DEMO_TENANT } from "../scripts/seed.ts";
 
@@ -520,6 +520,55 @@ test("预采集参数：默认只覆盖 brief 声明的平台（BM_MC_PREFETCH_S
   // 平台开关收窄（只登录/只开了两个平台）时，声明的交集跟着收窄
   const narrowed = platformPrefetchArgs({ platforms: ["xiaohongshu", "douyin"], category: "面膜" }, onlyXhsDy);
   assert.deepEqual(narrowed?.platforms, ["xhs", "dy"]);
+});
+
+/* ── 5b. creator 阶段的补读条件（"为什么还有未采集的？"）────────
+ *
+ * 业主截图追问：77 条真实条目、79 位真实账号都进了报告，粉丝量一列**仍有 7 位「未采集」**。
+ * 其中 5 位不是采不到，而是报告读缓存时资料行还没落库（内容行先到、主页补采晚一轮）。
+ * 旧条件只在"证据池完全为空"时补读，而 B站搜索顺带写回的资料行已经把池子填满
+ * → 判定为假 → 补读被跳过 → 晚一批落库的抖音/小红书作者永远拿不到粉丝量。
+ */
+test("补读条件：空池要补、半池（有人缺粉丝量）要补、全有粉丝量才不补", () => {
+  /** 内容行（搜索落库，天生不带粉丝量） */
+  const content = (platform: string, platformName: string, id: string, author: string) =>
+    toEvidenceEntries([{ platform, platformName, id, text: "正文", author, url: `https://example.invalid/${id}`, metrics: { likes: 3 } }], {
+      op: "search",
+      collectedAt: "2026-05-20T08:00:00Z",
+    });
+  /** 个人主页资料行（补采落库，含粉丝量） */
+  const profile = (platform: string, platformName: string, id: string, author: string, followers: number) =>
+    toEvidenceEntries([{ platform, platformName, id, text: "", author, url: `https://example.invalid/${id}`, metrics: { followers } }], {
+      op: "creator",
+      collectedAt: "2026-05-20T08:02:00Z",
+    });
+
+  // ① 空池 → 补（原有行为：数据到了、池子还是空的）
+  assert.equal(needsPlatformRefresh([]), true, "证据表为空时必须补读");
+
+  // ② 只有内容行、一条资料行都没有 → 补（粉丝量全缺）
+  const onlyContent = [...content("xhs", "小红书", "n1", "甲"), ...content("dy", "抖音", "v1", "乙")];
+  assert.equal(needsPlatformRefresh(onlyContent), true, "池子非空但没有一位有粉丝量 → 仍要补读");
+
+  // ③ **半池**：B站搜索顺带写回了资料行，抖音那批还在路上 → 必须补。
+  // 这正是旧条件（只看"池子是否为空"）漏掉的形态。
+  const half = [
+    ...content("xhs", "小红书", "n1", "甲"),
+    ...content("dy", "抖音", "v1", "乙"),
+    ...profile("xhs", "小红书", "n1_profile", "甲", 12800),
+  ];
+  assert.equal(needsPlatformRefresh(half), true, "半池：有人有粉丝量、有人没有 → 必须再补读一次");
+
+  // ④ 每人都拿到粉丝量 → 不补（省掉一次本地查询）
+  const full = [...half, ...profile("dy", "抖音", "v1_profile", "乙", 30500)];
+  assert.equal(needsPlatformRefresh(full), false, "粉丝量到齐后不该再补读");
+
+  // ⑤ 资料行与内容行同名同平台才算同一账号：只补到一个平台时另一个平台仍算缺
+  assert.equal(
+    needsPlatformRefresh([...content("xhs", "小红书", "n1", "甲"), ...profile("dy", "抖音", "v1_profile", "乙", 1)]),
+    true,
+    "按（平台+作者）聚合：平台对不上的资料行不能算作该账号已有粉丝量",
+  );
 });
 
 test("预采集参数：BM_MC_PREFETCH_SCOPE=all 才恢复「覆盖全部已装配平台」", () => {

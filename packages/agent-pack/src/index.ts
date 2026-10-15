@@ -2,7 +2,7 @@
  * @brandsale/agent-pack —— M9 AgentPack + M10 ToolRegistry
  */
 
-export { AgentPack, BRIEF_PLATFORM_TO_MC, DeltaPump, MOCK_BRIEF, createToolCallGuard, extractJsonObject, platformPrefetchArgs, type AgentRuntimeDeps, type PhaseResult, type PhaseStrategy, type ToolCallGuardDecision } from "./agents.ts";
+export { AgentPack, BRIEF_PLATFORM_TO_MC, DeltaPump, MOCK_BRIEF, createToolCallGuard, extractJsonObject, needsPlatformRefresh, platformPrefetchArgs, type AgentRuntimeDeps, type PhaseResult, type PhaseStrategy, type ToolCallGuardDecision } from "./agents.ts";
 export { ToolRegistry, policy, TIER_GOVERNANCE, type ToolCallContext, type ToolCallRecord, type ToolDeps, type ToolImpl } from "./tools.ts";
 export { PHASE_TOOL_HINT, TOOL_IMPLEMENTATIONS, PLATFORM_TOOLS, PLATFORM_TOOL_NAME, PLATFORM_DIGEST_TOOL_NAME, admitTool, registerAllTools, bindDeps } from "./tool-impls.ts";
 export { SYSTEM_PROMPTS, contextBlock } from "./prompts.ts";

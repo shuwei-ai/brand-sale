@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MEDIA_CRAWLER_PLATFORM_META, MEDIA_CRAWLER_PLATFORMS } from "@brandsale/config";
 import { kindOf, normalizeBatch } from "../apps/collector/src/normalize.ts";
+import { loadCollectorConfig } from "../apps/collector/src/config.ts";
 import { CollectStore } from "../apps/collector/src/store.ts";
 import { TaskManager } from "../apps/collector/src/tasks.ts";
 import { buildRunnerArgs, lastKernelError, readRecordsSince, snapshotDataFiles } from "../apps/collector/src/core-runner.ts";
@@ -1301,4 +1302,19 @@ test("作者主页自动补采：队列满时不丢，进积压并在内核空�
     else process.env["FAKE_KERNEL_DELAY_MS"] = prevDelay;
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+/**
+ * 补采上限的默认值。
+ *
+ * 一次搜索的作者数常到 25 上下（电脑品类抖音那批实测 25 位），而排在 `maxAuthors`
+ * 之后的作者**永远不会被派生补采** —— 他们的粉丝量会恒为「未采集」。
+ * 业主看到的"为什么还有未采集的"里有 2 位就是这么丢的（12 位之后的两位）。
+ * 这里把默认值钉住，改它必须有意识地改这个断言。
+ */
+test("补采上限默认值：覆盖一次搜索的常见作者数（30），且自动补采默认开", () => {
+  const cfg = loadCollectorConfig();
+  assert.equal(cfg.profileEnrich.enabled, true, "主页资料自动补采默认开 —— 关掉的话粉丝量一列全空");
+  assert.equal(cfg.profileEnrich.maxAuthors, 30);
+  assert.ok(cfg.profileEnrich.maxAuthors >= 25, "默认值低于一次搜索的常见作者数，就等于给报告留一排「未采集」");
 });
