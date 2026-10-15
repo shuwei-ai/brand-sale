@@ -5,7 +5,7 @@
 >
 > 核对基线：2026-10-13 工作区（`npm test` 210 用例全绿、`npm run check:boundaries` 通过）。
 > 2026-10-14 局部更新：采集浏览器会话改为 `reuse` 常驻复用（§8.5）、删除死配置
-> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **218**（见 §14）。
+> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **220**（见 §14）。
 
 ## 0. 阅读指引
 
@@ -91,7 +91,7 @@
 | `apps/gateway` | 5 | 902 | HTTP + SSE 接入层 |
 | **合计（TS）** | **89** | **≈24 200** | 另有采集内核 Python（内嵌 MediaCrawler） |
 
-测试：**17 个文件 / 218 个用例**，全部离线可跑（§12）。
+测试：**17 个文件 / 220 个用例**，全部离线可跑（§12）。
 
 ---
 
@@ -146,7 +146,7 @@
 
 ```bash
 npm install                 # 一次性
-npm test                    # 全离线自检（218 用例）
+npm test                    # 全离线自检（220 用例）
 npm run migrate             # 建表（dev 模式空库会自动灌种子）
 npm run seed                # 登记内置数据源与演示租户
 npm run web:build           # 构建前端控制台 → apps/web/dist
@@ -434,9 +434,9 @@ ReportDsl {
 | `platform_entry` | **条目级**平台内容引用 | 用 `ref.entryId` 反查证据表，拼出 URL / 发布时间 |
 | `model_inference` | 模型推断（必须 `tier: "low"`） | 无 |
 
-### 5.3 校验规则 R1–R13（`validateReportDsl`）
+### 5.3 校验规则 R1–R14（`validateReportDsl`）
 
-> 设计说明（`report.ts:352-377`）："每个数字必须有引用"这条不变量如果逐字符比对 claim 文本，
+> 设计说明（`report.ts:695-720`）："每个数字必须有引用"这条不变量如果逐字符比对 claim 文本，
 > 在实践中不可行（生成文本与 citation 文案不可能字字相同）。因此把它具化为**可判定的规则**。
 
 **不可修复 / 拒绝渲染（hard error）**：
@@ -459,8 +459,20 @@ ReportDsl {
 | R5 | `model_inference` 却 `tier≠low` | 降到 low（warn） |
 | R9 | `tier="low"` 的 KPI 所在页缺 `warn` callout | 补一个 |
 | R11 | `block.sourceRef` 不在 `logicalRefs ∪ 已声明 sources` | 别名归一（warn） |
+| R14 | **未指定自有品牌**（`opts.hasOwnBrand === false`）却在报告渲染文本里出现「我方 / 本品 / 本方 / 品牌自诊」 | 剔除含违禁词的句子 / 条目 / 列 / 标签（见 `stripOwnBrandLeak`） |
 
 **只提示不阻塞**：R7（结构性页面豁免）、R12（可溯源引用占比 < 60% → warn，深度问题交给深度策略）。
+
+**R14 的两个设计要点**（2026-10-15 新增）：
+
+- **扫描与修复共用同一遍 walk**（`stripOwnBrandLeak(dsl, { apply })`）。R14 是 `repairable: true` 的 error，
+  而 `compile` 的流程是「autoRepair → 再校验 → 仍有 error 就抛错拒绝渲染」：只要扫描覆盖的槽位比修复
+  覆盖的多**一个**，那个槽位上的违禁词就会在修复后继续报 error → **报告整份丢失**。这与
+  `MISPLACED_LOGICAL_REF_RE` 注释里记的那次真机事故（`job_0mv5ydf69a7aio1uhfd`）同一形态，
+  所以这里不做"扫描一份、修复另一份"。护栏是回归用例 WP-B-9（夹具把**每一种可渲染槽位**都塞满违禁词）。
+- **"负面声明"也算违规**。模型很爱写「由于未指定自有品牌，报告不含任何『我方』或『本品』的自诊数据」——
+  它是在守规矩，但**声明本身就把这两个词写进了报告**。规则必须连它一起拦，否则"报告里不得出现我方"
+  这条校验形同虚设。要交代口径就描述动作、不复述名词（提示词已给出正例/反例）。
 
 **降级阶梯**（R13 失效时）：条目级 → 来源级（保留 `sourceKey`）→ `model_inference/low`。
 
@@ -472,6 +484,10 @@ ReportDsl {
 - **`cosmeticActions`（观感级）** → 不脏 `job.degraded`（只影响 cover/toc/section/closing，
   或 appendix 且 claim 不含数字）。
   `CompileResult.repairs[].severity: "data" | "cosmetic"`，编排层只记 data 级。
+- **R14 的分级口径**（2026-10-15）：**只有"能被精确定位到被删的那几句、且那几句不含数字"的
+  句子级修复才算观感级**（真机形状：口径页那句「本报告不含任何『我方』或『本品』数据」——它不承载
+  任何事实，抹掉它不该把一份完好报告标成「产出不完整」）；标签替换 / 整块删除 / 整列删除一律按
+  数据级处理（那类改动动了结构，宁可标脏）。判据落在 `OwnBrandLeakHit.digits` 上。
 
 > **历史事故（务必看这段再改 autoRepair）**：R3 的前置特例是"逻辑命名空间被误当数据源"
 > （`meta:*` / `phase:*` / `tool:*` / `degrade:*` 是**块级 sourceRef** 的写法，不是数据源；
@@ -738,7 +754,7 @@ Pi 循环只吐出一句半截话，结构化解析失败；轮到直连兜底�
 4. 回喂结果要**重新走一遍 `enrichReportProvenance`**（回喂得到的是全新输出，不重跑会丢溯源）；
 5. 仍不达标 → 落 `meta.degraded`，任务标 `partial`（**如实标注，不假装达标**）。
 
-### 7.7 提示词组织（`prompts.ts`，217 行）
+### 7.7 提示词组织（`prompts.ts`，230 行）
 
 ```
 SYSTEM_PROMPTS[code] = PER_AGENT[code] + "\n\n" + COMMON_RULES
@@ -1230,7 +1246,7 @@ knowledge → model-gateway → agent-pack → render → orchestrator → gatew
 
 ### 12.1 测试体系
 
-`npm test` = **17 个文件 / 218 个用例，全部离线可跑**：
+`npm test` = **17 个文件 / 220 个用例，全部离线可跑**：
 
 ```
 BM_LLM_MODE=mock BM_ALLOW_DEMO_DATA=true BM_MC_ENABLED=false BM_MC_LICENSE_ACK=false \
@@ -1299,7 +1315,7 @@ node --import tsx --test tests/*.test.ts
 
 | # | 位置 | 现状 | 实情 |
 |---|---|---|---|
-| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日多次增补后为 **218**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
+| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日多次增补后为 **220**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
 | 2 | `README.md` 架构图 | `render  M16 渲染` | 渲染是 **M11**；M16 在代码里不存在（`check-boundaries.ts` 的注释也误写为 M16） |
 | 3 | `README.md` | "不构建则回退内置零构建控制台" | 旧控制台（`console.ts` + `/console-legacy`）**已删除**，现在返回引导页（§11.3） |
 | 4 | `README.md` | "七个平台采集已接入…17 个工具" 类表述 | 工具总数 **18**：10 个通用 + `platform_digest` + 7 个 hidden 原语（§7.2） |
@@ -1321,6 +1337,7 @@ node --import tsx --test tests/*.test.ts
 | 14 | `Brief.brandIds`（`contracts/src/job.ts`） | 曾只有 `brandIds: string[]`，**没有"我方品牌"字段** | 同一个字段被两处按**相反**语义消费：`buildBrandSelf()` 与 `report.meta.brand` 当「我方品牌」，而「竞品格局对比」表与「品牌 vs 竞品差距矩阵」当**竞品集**（矩阵列头即「我方 \| 索尼 \| Bose \| 华为 \| 小米」）→ 后果：**「品牌自诊概览」页在任何 brief 下都填不实**，未授权时只能整页写「无数据」。→ **2026-10-14 修**：新增**可选**字段 `Brief.ownBrandId` 承接"我是谁"；`brandIds` **只**表示"本轮在投/在看的品牌集合"。**未指定 `ownBrandId` 时报告整份不做品牌自诊**：删去「品牌自诊概览」「品牌 vs 竞品差距矩阵」两页，代之以纯市场的**「竞品定位矩阵」**页（保住 `matrix` 可视化块与"竞品怎么分布"这个市场结论），`quote`/`matrix` 等必需块型不受影响；`meta.brand` 优先取 `ownBrandId`。回归用例 `brand-self.test.ts` **WP-B-8**（未指定时不得出现「我方 / 本品」字样）；WP-B-6/WP-B-7 的 fixture 显式给了 `ownBrandId`（行走的是"已指定"分支）。报告提示词（RG）同步条件化，CI 的 `brandSelf` 仍为结构必填但**只有指定自有品牌时才会进报告** |
 | 15 | `agents.ts:platformPrefetchArgs()` **预采集覆盖范围** | 曾为「**全部已装配平台**」（brief 声明的只是"优先级"），注释理由是"只按 brief 收窄会让已接入平台在报告里被写成「未使用的来源」，读起来像没接上" | 这个理由**与报告的实际行为不符**：手机报告（brief 只要 `douyin/xiaohongshu/bilibili`）的来源声明 exclusions 里本来就写着「快手 / 微博 / 贴吧 / 知乎 **不在本次调研范围**」—— 采了照样进排除项，说明这批数据从产出到引用整条链路没有一处会用到它，而每个平台是一轮分钟级 Playwright 子进程 → **2026-10-14 加 `BM_MC_PREFETCH_SCOPE`（默认 `brief`）**：默认只采 brief 声明的平台（映射后按已装配过滤）；brief 声明了但一个都没装配 → 不投递（不改成采别的平台）；brief 没声明平台 → 不设范围退回全部已装配（防"没声明就没数据"的悬崖）。`all` 保留为回退开关。范围只约束自动预取，`platform_digest` 仍接受全部七个采集码（§8.5） |
 | 16 | `apps/collector/src/store.ts` **`op=search` 的子串兜底** | `store.query()` 在"没有任何行带采集词"时**退回正文子串过滤**（注释理由是"兼容没有 `source_keyword` 的老数据，避免改完更差"） | 兜底把**别的批次**的正文当成本批命中：它不只影响返回内容，还改写了调用方的决策 —— `media-crawler.ts` 是"`contentRows.length === 0` 才排队采集"，于是"缓存里有别的内容碰巧含这个词"= **该关键词永远不排队、永远采不到真实数据**。实测 2026-10-14 电脑任务（brief `category=电脑`）：预取在 dy/xhs/bili 分别命中 17/39/7 条，全库 `source_keyword=电脑` 的行数为 **0**；intel 的 12 条 `evidences` 里出现了「同网络就用 Localseed，电脑就创建一个局域网文件夹」（抖音**评论**）与「折叠屏新王💥一篇看懂升级配置」（小红书**手机**笔记）——报告会把它们当"电脑市场证据"引用。同一根因也解释了耳机任务：dy 至今没有一条 `source_keyword=耳机` 的行（只有模型自选的 `headphones`），因为首次预取就被子串假命中挡掉了 → **2026-10-14 改为 `op=search` 只认采集词、查不到即为空**，由适配器排队一次真实采集补上；其余算子（详情/评论/creator 的入参是 id）仍走字段子串匹配（§8.5） |
+| 17 | `contracts/src/report.ts` **缺 R14**：未指定自有品牌时"不得出现「我方」"只有**提示词约束**，无机械校验 | 模型路径的唯一防线是 RG 提示词的一句话（"正文也不要出现我方/本品/我们"）。而模型会**为了守规矩反而违规**：2026-10-14 电脑报告（`job_0mv86by83ilvbnn0h1a`，brief 未给 `ownBrandId`）的「数据来源与口径声明」页里写着「由于未指定自有品牌，报告中不包含任何"我方"或"本品"的自诊数据」—— 声明本身就把这两个词写进了报告，读者（与任何机械检查）看到的是同一串字。报告的其余部分干净，所以这条只能靠人眼发现 | → **2026-10-15 新增 R14**（`error / repairable`，`validateReportDsl` + `autoRepair` + `stripOwnBrandLeak` 三者同一份槽位枚举），覆盖**全部可渲染槽位**（页标题、正文、条目、KPI、表格列名/单元格/表注、图表系列名与轴标签、矩阵标签、引文与出处、时间轴、`citations[].claim`、`sourceDeclaration` 的 `coverage`/`exclusions[].reason`），修复动作是"剔除含违禁词的句子 / 条目 / 列 / 标签"；`citations[].claim` **只改写不删除**（删引用会撞 R6，那是另一个不变量）。调用链上 `hasOwnBrand` 必须从 `agent-pack.finalizeReport` 与 `orchestrator.renderReport` **两处**都传下去 —— 少传一处就会出现"自校验说没问题、渲染期却拒绝渲染"的分叉。回归用例 `brand-self.test.ts` **WP-B-9/WP-B-10**（含"每种槽位都塞满违禁词，修复后必须过校验"的防死结用例）；提示词同步给出正/反例 |
 
 **其它值得知道的边界**：
 
@@ -1399,7 +1416,7 @@ node --import tsx --test tests/*.test.ts
 | `src/tool-impls.ts` | 1165 | 工具的实现（对应 LLD §2.10 的「依赖工具」列） |
 | `src/tools.ts` | 387 | M10 ToolRegistry：工具注册与治理（对应 LLD §2.11） |
 | `src/brief-parse.ts` | 222 | 自然语言 Brief 解析 —— **LLM 补全段**。 |
-| `src/prompts.ts` | 217 | 六个 Agent 的系统提示词（对应 LLD §2.10 的「通用约定」五条） |
+| `src/prompts.ts` | 230 | 六个 Agent 的系统提示词（对应 LLD §2.10 的「通用约定」五条） |
 | `src/evidence.ts` | 154 | 平台采集证据登记表（P0 报告溯源）。 |
 | `src/index.ts` | 75 | @brandsale/agent-pack —— M9 AgentPack + M10 ToolRegistry |
 
@@ -1496,7 +1513,7 @@ node --import tsx --test tests/*.test.ts
 
 | 测试文件 | 用例 | 行数 | 守住什么 |
 |---|---:|---:|---|
-| `brand-self.test.ts` | 8 | 166 | 品牌自诊在"无授权数据"时必须如实写「无数据」，而不是编数字；**未指定自有品牌（`ownBrandId`）时整份报告不做自诊、且不得出现「我方/本品」字样** |
+| `brand-self.test.ts` | 10 | 385 | 品牌自诊在"无授权数据"时必须如实写「无数据」，而不是编数字；**未指定自有品牌（`ownBrandId`）时整份报告不做自诊、且不得出现「我方/本品」字样**（R14：任何槽位出现违禁词都要判错，且机械修复后仍要过校验） |
 | `brief-llm-fill.test.ts` | 6 | 151 | 规则抽取结果的权威性：模型只能补空字段，不能改预算/时间窗 |
 | `brief-parse.test.ts` | 12 | 167 | 自然语言解析（规则段）纯函数、中英混合输入；**category 会被逐字当平台搜索词，必须是中文** |
 | `collector.test.ts` | 44 | 1282 | sidecar 归一化、落盘目录契约、快照取新增行、ID 闭环、常驻浏览器端口与回收 |
@@ -1513,7 +1530,7 @@ node --import tsx --test tests/*.test.ts
 | `tool-call-guard.test.ts` | 5 | 67 | 工具调用风暴闸门（真机曾出现同一工具连续被调 131 次） |
 | `web-console.test.ts` | 5 | 214 | 前端托管契约（含路径穿越守卫） |
 | `web-search.test.ts` | 10 | 313 | 唯一外部计费源（打桩 fetch） |
-| **合计** | **218** | **≈6663** | 17 个文件 |
+| **合计** | **220** | **≈6904** | 17 个文件 |
 
 ## 附录 C · 环境变量
 

@@ -16,7 +16,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_DEPTH_POLICY, measureReportDepth } from "@brandsale/contracts";
+import {
+  DEFAULT_DEPTH_POLICY,
+  OWN_BRAND_LEAK_RE,
+  autoRepair,
+  measureReportDepth,
+  stripOwnBrandLeak,
+  validateReportDsl,
+  type ReportDsl,
+} from "@brandsale/contracts";
 import { CompetitorIntelSchema, synthIntel, synthReport } from "@brandsale/agent-pack";
 
 /** 未接入任何品牌资产数据源的最小 Brief（这是当前的真实处境） */
@@ -163,4 +171,215 @@ test("WP-B-8 未指定自有品牌时：报告整份不做品牌自诊，且不�
     depthWithOwn.visualBlocks,
     "去掉「我方」不该顺带砍掉可视化块：替代页必须把 matrix 补回来",
   );
+});
+
+/* ── WP-B-9 / WP-B-10：R14 未指定自有品牌时的「我方口径」泄漏 ──────────── */
+
+/**
+ * 一份把**每一种可渲染槽位**都塞进违禁词的最小报告。
+ *
+ * 为什么非得覆盖到"每一种槽位"：R14 是 `repairable: true` 的 error，而 `render.compile`
+ * 的流程是「autoRepair → 再校验一次 → 仍有 error 就抛错拒绝渲染」。只要扫描覆盖的槽位比
+ * 修复覆盖的多**一个**，那个槽位上的违禁词就会在修复后继续报 error → 报告整份丢失。
+ * 这份夹具就是那条不变量的护栏（与 report-repair 里"autoRepair 不得制造新 error"同源）。
+ */
+const leakyDsl: ReportDsl = {
+  meta: {
+    dslVersion: "1.0",
+    title: "我方 Q4 市场调研报告",
+    brand: { id: "b1", name: "未指定品牌" },
+    window: { from: "2026-10-01", to: "2026-12-31" },
+    generatedAt: "2026-10-15T00:00:00.000Z",
+  },
+  sourceDeclaration: {
+    grade: "L3",
+    sources: [{ key: "mc_dy", displayName: "抖音", grade: "L3", asOf: "2026-10-15", coverage: "我方通过公开检索取数" }],
+    exclusions: [{ key: "mc_ks", reason: "快手不在本次我方调研范围" }],
+  },
+  slides: [
+    {
+      index: 0,
+      pageRole: "cover",
+      title: "我方双十一投放方案",
+      layoutId: "cover/hero",
+      blocks: [{ type: "text", style: "body", content: "竞品格局调研" }],
+      citations: [],
+    },
+    {
+      index: 1,
+      pageRole: "data",
+      title: "数据来源与口径声明",
+      layoutId: "content/default",
+      blocks: [
+        /* 真机形状：模型为了守规矩而写的**负面声明** —— 声明本身就把词写进了报告 */
+        {
+          type: "text",
+          style: "body",
+          content: "本页数字全部来自公开采集。由于未指定自有品牌，报告不含任何「我方」或「本品」的自诊数据。",
+          sourceRef: "meta:sourceDeclaration",
+        },
+        { type: "bullets", items: ["我方在小红书的声量低于竞品", "竞品内容以测评与开箱为主"], sourceRef: "phase:intel" },
+        {
+          type: "kpi",
+          items: [
+            { label: "覆盖平台", value: "3", unit: "个" },
+            { label: "我方", value: "待甲方确认", tier: "low" },
+          ],
+          sourceRef: "phase:intel",
+        },
+        {
+          type: "table",
+          columns: ["维度", "我方", "竞品基准"],
+          rows: [["公开发声量", "低", "中"]],
+          caption: "「我方」列仅在有自有品牌时才有值",
+          sourceRef: "phase:intel",
+        },
+        {
+          type: "chart",
+          chartType: "bar",
+          series: [{ name: "我方声量", points: [{ x: "抖音", y: 12 }, { x: "我方", y: 3 }] }],
+          axis: { xLabel: "平台", yLabel: "我方声量占比" },
+          sourceRef: "phase:intel",
+        },
+        {
+          type: "matrix",
+          xLabel: "价格带",
+          yLabel: "我方内容形态数",
+          cells: [
+            { x: 1, y: 2, label: "竞品 A" },
+            { x: 3, y: 1, label: "我方" },
+          ],
+          sourceRef: "phase:intel",
+        },
+        {
+          type: "timeline",
+          phases: [{ label: "我方预热期", from: "2026-10-01", to: "2026-10-07", items: ["我方发布 3 条短视频", "竞品保持静默"] }],
+          sourceRef: "phase:intel",
+        },
+        { type: "quote", text: "我方要抢首屏", attribution: "我方", sourceRef: "phase:intel" },
+        { type: "callout", tone: "warn", text: "我方品牌资产未获授权，本页仅作定性判断。", sourceRef: "phase:intel" },
+        { type: "image", ref: "https://example.com/struct.png", caption: "我方投放结构示意", sourceRef: "phase:intel" },
+      ],
+      citations: [
+        { claim: "我方抖音账号近 30 天互动率 3.2%", kind: "data_source", ref: { sourceKey: "mc_dy" }, confidence: 0.5, tier: "low", verifiedBy: "auto" },
+        { claim: "公开采集样本覆盖 3 个平台", kind: "data_source", ref: { sourceKey: "mc_dy" }, confidence: 0.6, tier: "medium", verifiedBy: "auto" },
+      ],
+    },
+  ],
+};
+
+test("WP-B-9 R14：未指定自有品牌时，任何槽位出现「我方」口径都判错，且机械修复后仍能过校验", () => {
+  const scan = stripOwnBrandLeak(leakyDsl, { apply: false });
+  // 逐个槽位族都要被抓到：漏掉任何一族，"修复后仍报错 → 拒绝渲染"的死结就会复现
+  for (const frag of [
+    "meta.title",
+    "coverage",
+    "exclusions[0].reason",
+    "slides[0].title",
+    ".content",
+    ".items[0]",
+    ".items", // kpi
+    ".columns[1]",
+    ".caption",
+    ".series[0].name",
+    ".axis.yLabel",
+    ".cells[1].label",
+    ".phases[0].label",
+    ".attribution",
+    ".citations[0].claim",
+  ]) {
+    assert.ok(
+      scan.hits.some((h) => h.path.includes(frag)),
+      `槽位 ${frag} 上的违禁词必须被扫描到（漏一个 = 修复后仍报错 = 报告整份丢失）`,
+    );
+  }
+
+  // 指定了自有品牌时**不**触发：这些字样在那种报告里是合法的（品牌自诊页本来就要写「我方」）
+  assert.equal(
+    validateReportDsl(leakyDsl, { hasOwnBrand: true }).issues.filter((i) => i.message.includes("我方")).length,
+    0,
+    "有自有品牌时 R14 必须沉默",
+  );
+  assert.equal(autoRepair(leakyDsl, { hasOwnBrand: true }).dsl.slides[1]!.title, "数据来源与口径声明");
+
+  const before = validateReportDsl(leakyDsl, { hasOwnBrand: false });
+  const r14 = before.issues.filter((i) => i.message.includes("我方"));
+  assert.equal(r14.length, 1, "R14 聚合成一条 error（样例只列前 3 处）");
+  assert.equal(r14[0]!.level, "error");
+  assert.equal(r14[0]!.repairable, true, "必须标可机械修复 —— 否则渲染期会直接拒绝整份报告");
+  assert.equal(before.ok, false);
+
+  const { dsl: fixed, actions, cosmeticActions } = autoRepair(leakyDsl, { hasOwnBrand: false });
+  assert.equal(OWN_BRAND_LEAK_RE.test(JSON.stringify(fixed)), false, "修复后整份 DSL 不得再出现「我方 / 本品 / 本方 / 品牌自诊」");
+  const post = validateReportDsl(fixed, { hasOwnBrand: false });
+  assert.equal(post.ok, true, `修复后必须过校验（否则 compile 抛错、报告丢失）：${JSON.stringify(post.issues)}`);
+  assert.ok(actions.length + cosmeticActions.length > 0, "每一处改动都要留下可回溯的 action");
+
+  // 结构不能因为剔除而塌掉
+  const s1 = fixed.slides[1]!;
+  assert.equal(fixed.slides.length, 2, "页数不变");
+  const table = s1.blocks.find((b) => b.type === "table");
+  assert.ok(table && table.type === "table");
+  assert.deepEqual(table.columns, ["维度", "竞品基准"], "「我方」列整列删除，其余列保留");
+  assert.deepEqual(table.rows, [["公开发声量", "中"]], "行要与列同步裁掉，不能错位");
+  assert.equal(table.caption, "列仅在有自有品牌时才有值", "表注里的「我方」按词摘掉（不是整段删）");
+  const bullets = s1.blocks.find((b) => b.type === "bullets");
+  assert.ok(bullets && bullets.type === "bullets");
+  assert.deepEqual(bullets.items, ["竞品内容以测评与开箱为主"], "只删讲自有品牌的条目，其余条目保留");
+  const quote = s1.blocks.find((b) => b.type === "quote");
+  assert.ok(quote && quote.type === "quote");
+  assert.equal(quote.attribution, undefined, "出处整个就是违禁词时连同槽位一起删掉");
+  assert.equal(quote.text, "本轮未指定自有品牌，本页只呈现公开市场与竞品信息。", "必填文本被摘空时用中性文案补位（不删块）");
+  const image = s1.blocks.find((b) => b.type === "image");
+  assert.ok(image && image.type === "image");
+  assert.equal(image.caption, "投放结构示意", "图注按词摘，保留其余信息");
+  const matrix = s1.blocks.find((b) => b.type === "matrix");
+  assert.ok(matrix && matrix.type === "matrix");
+  assert.deepEqual(matrix.cells.map((c) => c.label), ["竞品 A", "—"], "点位标签被摘空时用中性占位，避免空标签");
+  const chart = s1.blocks.find((b) => b.type === "chart");
+  assert.ok(chart && chart.type === "chart");
+  assert.equal(chart.series[0]!.name, "声量", "短标签按词摘（「我方声量」→「声量」），保留可用信息");
+  assert.equal(chart.axis?.yLabel, "声量占比");
+});
+
+test("WP-B-10 R14 的分级：负面声明按观感级修复（不脏任务），带数字的越界断言必须标脏", () => {
+  // 真机形状（job_0mv86by83ilvbnn0h1a 的口径页）：模型主动写"不含任何我方或本品数据"。
+  // 它是在守规矩，但读者看到的是同一串字 —— 规则必须连它一起拦，否则这条校验形同虚设。
+  const briefWithNote = { ...brief, ownBrandId: undefined };
+  const dsl = synthReport(briefWithNote, { intel: synthIntel(brief, noTools) }, { synthesized: true });
+  const patched: ReportDsl = {
+    ...dsl,
+    slides: dsl.slides.map((s, i) =>
+      i === 1
+        ? {
+            ...s,
+            blocks: [
+              { type: "text", style: "body", content: "本报告所有量化指标均来源于公开采集。由于未指定自有品牌，报告中不包含任何「我方」或「本品」的自诊数据。", sourceRef: "meta:sourceDeclaration" },
+              ...s.blocks,
+            ],
+          }
+        : s,
+    ),
+  };
+
+  const { dsl: fixed, actions, cosmeticActions } = autoRepair(patched, { hasOwnBrand: false });
+  const text = fixed.slides[1]!.blocks[0];
+  assert.ok(text && text.type === "text");
+  assert.equal(text.content, "本报告所有量化指标均来源于公开采集。", "只删那一句负面声明，同段其余内容原样保留");
+  assert.equal(cosmeticActions.filter((a) => a.includes("我方")).length, 1);
+  assert.equal(actions.filter((a) => a.includes("我方")).length, 0, "纯措辞、不含数字 → 不该把一份完好报告标成「产出不完整」");
+  assert.equal(validateReportDsl(fixed, { hasOwnBrand: false }).ok, true);
+
+  // 反面：如果是**带数字的越界断言**，删掉它属于数据级修复，必须标脏
+  const forge: ReportDsl = {
+    ...fixed,
+    slides: fixed.slides.map((s, i) =>
+      i === 1
+        ? { ...s, blocks: [{ type: "text", style: "body", content: "我方抖音账号近 30 天互动率 3.2%。", sourceRef: "meta:sourceDeclaration" }, ...s.blocks] }
+        : s,
+    ),
+  };
+  const r = autoRepair(forge, { hasOwnBrand: false });
+  assert.equal(r.actions.filter((a) => a.includes("我方")).length, 1, "带数字的我方断言被删属于数据级改动");
+  assert.equal(r.cosmeticActions.filter((a) => a.includes("我方")).length, 0);
 });

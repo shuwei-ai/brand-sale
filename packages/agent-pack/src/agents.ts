@@ -1082,7 +1082,7 @@ export class AgentPack {
 
     if (pi.ok) {
       if (phase !== "report") return pi;
-      const refined = await this.finalizeReport(tc, prompt, pi.value as ReportDsl, degradedKeys, pump, creatorsOf(input));
+      const refined = await this.finalizeReport(tc, prompt, pi.value as ReportDsl, degradedKeys, pump, creatorsOf(input), input.job.spec.brief.ownBrandId);
       return { ...pi, value: refined.value, note: refined.note ? `${pi.note ?? ""}；${refined.note}`.replace(/^；/, "") : pi.note };
     }
     console.warn(`[agent-pack] ${phase} Pi 循环未通过：${pi.errors.join(" | ").slice(0, 200)}`);
@@ -1107,7 +1107,7 @@ export class AgentPack {
       let value: unknown = direct.value;
       let note = `结构化输出通过（重试 ${direct.retries} 次）`;
       if (phase === "report") {
-        const refined = await this.finalizeReport(tc, prompt, value as ReportDsl, degradedKeys, pump, creatorsOf(input));
+        const refined = await this.finalizeReport(tc, prompt, value as ReportDsl, degradedKeys, pump, creatorsOf(input), input.job.spec.brief.ownBrandId);
         value = refined.value;
         if (refined.note) note += `；${refined.note}`;
       }
@@ -1157,11 +1157,14 @@ export class AgentPack {
     degradedKeys: string[],
     pump?: DeltaPump,
     creators?: CreatorOutput,
+    /** 本轮是否指定了自有品牌 —— R14（未指定时不得出现「我方」口径）需要它 */
+    ownBrandId?: string,
   ): Promise<{ value: ReportDsl; note?: string }> {
     const policy = this.depthPolicy();
     const catalog = this.sourceCatalog(tc.ctx, tc.jobId);
+    const hasOwnBrand = Boolean((ownBrandId ?? "").trim());
     const enriched = this.enrichProvenance(tc, value, catalog, creators);
-    const first = validateReportDsl(enriched, { catalog, minTraceableRatio: policy.minTraceableRatio });
+    const first = validateReportDsl(enriched, { catalog, minTraceableRatio: policy.minTraceableRatio, hasOwnBrand });
     // 只有「不可机械修复」的 error 才值得回喂；可修复项交给渲染期 autoRepair 降级处理
     const blocking = first.issues.filter((i) => i.level === "error" && !i.repairable);
     const depth = measureReportDepth(enriched, policy);
@@ -1204,7 +1207,7 @@ ${describeDepthPolicy(policy)}`;
     if (repaired.ok) {
       // 回喂得到的是一份**全新的**模型输出：机械补齐必须再走一遍，否则修好的报告反而丢了溯源
       const v2 = this.enrichProvenance(tc, repaired.value as ReportDsl, catalog, creators);
-      const stillBlocking = validateReportDsl(v2, { catalog, minTraceableRatio: policy.minTraceableRatio }).issues.filter(
+      const stillBlocking = validateReportDsl(v2, { catalog, minTraceableRatio: policy.minTraceableRatio, hasOwnBrand }).issues.filter(
         (i) => i.level === "error" && !i.repairable,
       );
       const depth2 = measureReportDepth(v2, policy);

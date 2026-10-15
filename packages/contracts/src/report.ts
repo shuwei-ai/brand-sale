@@ -347,6 +347,348 @@ export interface ReportValidationOptions {
   catalog?: SourceCatalog;
   /** 可溯源引用占比下限（低于则 warn，不阻塞渲染） */
   minTraceableRatio?: number;
+  /**
+   * 本轮 Brief 是否指定了自有品牌（`Brief.ownBrandId`）。
+   *
+   * `false` → 启用 **R14**：报告渲染文本里不得出现「我方 / 本品 / 本方 / 品牌自诊」。
+   * `true` / 缺省 → 跳过 R14。**缺省不等于 false**：渲染期单独调 `compile()` 的调用方
+   * （测试、回放工具）不该因为没传这个字段就被凭空收紧。
+   */
+  hasOwnBrand?: boolean;
+}
+
+/* ── R14：未指定自有品牌时的「我方口径」泄漏 ───────────────── */
+
+/**
+ * 违禁词：**本轮没指定自有品牌**（`Brief.ownBrandId` 缺省）时，这些字样在报告里
+ * 没有任何合法形态 —— 那时「我方」不是个已知实体，写出来只能是编的。
+ *
+ * 为什么连"负面声明"也算：模型很爱写「由于未指定自有品牌，报告不含任何『我方』或『本品』
+ * 的自诊数据」。它是在守规矩，但**声明本身就把这两个词写进了报告**，读者看到的是同一串字。
+ * 正确写法是描述动作、不复述名词：「本轮未指定自有品牌，报告聚焦公开市场与竞品调研」。
+ *
+ * 为什么**不**纳入「我们」：它在报告里有两义（品牌自称 vs 顾问自称，如"我们建议…"），
+ * 机械判定会误伤后者 —— 那一半只由提示词约束（`agent-pack/src/prompts.ts` 的 RG 段）。
+ */
+export const OWN_BRAND_LEAK_RE = /我方|本品|本方|品牌自诊/;
+
+/** 剔除泄漏句后整串为空时的兜底：无数字、无违禁词、不引入任何新断言 */
+const OWN_BRAND_NEUTRAL_FILL = "本轮未指定自有品牌，本页只呈现公开市场与竞品信息。";
+const OWN_BRAND_NEUTRAL_TITLE = "市场与竞品调研";
+/** 标签类槽位（列名 / 轴标签 / KPI 标签）的兜底：标签是结构骨架，不能整块删掉 */
+const OWN_BRAND_NEUTRAL_LABEL = "指标";
+
+/** 单个槽位的处置结果 */
+type LeakFix =
+  | { kind: "none" }
+  /** `removed` = 被摘掉的原文片段，用于判定该修复是否动了数字（见 autoRepair 的分级） */
+  | { kind: "text"; value: string; removed: string }
+  | { kind: "empty"; removed: string };
+
+/** 删掉含违禁词的**句子**；整串都被删光时返回 null */
+function dropLeakSentences(s: string): { value: string | null; removed: string } {
+  const parts = s.split(/(?<=[。；！？!?;\n])/);
+  const kept = parts.filter((p) => !OWN_BRAND_LEAK_RE.test(p));
+  const joined = kept.join("").trim();
+  return { value: joined === "" ? null : joined, removed: parts.filter((p) => OWN_BRAND_LEAK_RE.test(p)).join("").trim() };
+}
+
+/** 只摘掉违禁**词**（用于列名 / 轴标签 / KPI 标签这类短标签）；摘空返回 null */
+function dropLeakTokens(s: string): string | null {
+  const joined = s
+    .replace(new RegExp(OWN_BRAND_LEAK_RE.source, "g"), "")
+    /* 摘掉词以后留下的空引号/空括号（「我方」→「」）要一并清掉，否则报告里会出现残缺标点 */
+    .replace(/[「『"'（(]\s*[」』"'）)]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return joined === "" ? null : joined;
+}
+
+const fixSentence = (s: string): LeakFix => {
+  if (!OWN_BRAND_LEAK_RE.test(s)) return { kind: "none" };
+  const { value, removed } = dropLeakSentences(s);
+  return value === null ? { kind: "empty", removed: s } : { kind: "text", value, removed };
+};
+
+const fixLabel = (s: string): LeakFix => {
+  if (!OWN_BRAND_LEAK_RE.test(s)) return { kind: "none" };
+  const v = dropLeakTokens(s);
+  return v === null ? { kind: "empty", removed: s } : { kind: "text", value: v, removed: s };
+};
+
+export interface OwnBrandLeakHit {
+  path: string;
+  /** 原文（调用方负责截断） */
+  text: string;
+  /** 处置说明，直接拼进 autoRepair 的 action 文案 */
+  action: string;
+  /**
+   * 该修复是否碰了数字。
+   *   `false` → 观感级（剔除的是"自我指涉"，不承载任何事实），对应 `cosmeticActions`；
+   *   `true`  → 数据级，任务必须标 partial。
+   * 判定口径：**只有能被精确定位到"删掉的那几句"、且那几句不含数字**的句子级修复才算 false；
+   * 标签替换 / 整块删除 / 整列删除一律按 true 保守处理（那类改动动了结构，宁可标脏）。
+   */
+  digits: boolean;
+}
+
+/**
+ * **R14 的唯一实现**：扫描并（可选）剔除「未指定自有品牌却出现我方口径」的文本。
+ *
+ * 为什么扫描与修复必须共用这一个函数：R14 是 `repairable: true` 的 error，
+ * `render.compile` 的流程是「autoRepair → 再校验一次 → 仍有 error 就抛错拒绝渲染」。
+ * 只要扫描覆盖的槽位比修复覆盖的多**一个**，那个槽位上的违禁词就会在修复后继续报 error
+ * → 报告整份丢失（与 `MISPLACED_LOGICAL_REF_RE` 注释里记的那次真机事故同一形态）。
+ * 所以这里不做"扫描一份、修复另一份"，而是同一遍 walk（`apply: false` 时只收集不改写）。
+ *
+ * 槽位边界（**有意留下**的两处）：
+ *   · `citations[].claim` 虽然会渲染进溯源附录，但**只改写、绝不删除** ——
+ *     删引用会撞 R6（无来源数字断言），那是另一个不变量，不能在这个修复里顺手破坏；
+ *   · `slide.notes` 不渲染，不参与。
+ */
+export function stripOwnBrandLeak(dsl: ReportDsl, opts: { apply?: boolean } = {}): { dsl: ReportDsl; hits: OwnBrandLeakHit[] } {
+  const apply = opts.apply !== false;
+  const hits: OwnBrandLeakHit[] = [];
+  const record = (path: string, text: string, action: string, removed?: string): void => {
+    hits.push({
+      path,
+      text: text.replace(/\s+/g, " ").slice(0, 60),
+      action,
+      digits: removed === undefined ? true : /\d/.test(removed),
+    });
+  };
+
+  /* ── 元信息 ── */
+  let meta = dsl.meta;
+  const titleFix = fixSentence(dsl.meta.title);
+  if (titleFix.kind !== "none") {
+    const value = titleFix.kind === "text" ? titleFix.value : OWN_BRAND_NEUTRAL_TITLE;
+    record("meta.title", dsl.meta.title, `报告标题改为「${value}」`, titleFix.removed);
+    meta = { ...dsl.meta, title: value };
+  }
+
+  /* ── 来源声明里会被渲染的两处自由文本 ── */
+  let sources = dsl.sourceDeclaration?.sources ?? [];
+  sources = sources.map((s, i) => {
+    const f = fixSentence(s.coverage ?? "");
+    if (f.kind === "none") return s;
+    const value = f.kind === "text" ? f.value : "—";
+    record(`sourceDeclaration.sources[${i}].coverage`, s.coverage ?? "", `取数口径改写为「${value}」`, f.removed);
+    return { ...s, coverage: value };
+  });
+  let exclusions = dsl.sourceDeclaration?.exclusions ?? [];
+  exclusions = exclusions.map((e, i) => {
+    const f = fixSentence(e.reason ?? "");
+    if (f.kind === "none") return e;
+    const value = f.kind === "text" ? f.value : "本轮未使用该来源";
+    record(`sourceDeclaration.exclusions[${i}].reason`, e.reason ?? "", `排除理由改写为「${value}」`, f.removed);
+    return { ...e, reason: value };
+  });
+
+  const slides = dsl.slides.map((slide) => {
+    const p = `slides[${slide.index}]`;
+    let title = slide.title;
+    const tf = fixSentence(slide.title);
+    if (tf.kind !== "none") {
+      title = tf.kind === "text" ? tf.value : OWN_BRAND_NEUTRAL_TITLE;
+      record(`${p}.title`, slide.title, `页标题改为「${title}」`, tf.removed);
+    }
+
+    /** 必填自由文本：删句；删空用中性文案补位（不删块，保住块型结构） */
+    const fillText = (text: string, path: string, what: string): string => {
+      const f = fixSentence(text);
+      if (f.kind === "none") return text;
+      const value = f.kind === "text" ? f.value : OWN_BRAND_NEUTRAL_FILL;
+      record(path, text, `${what}改写为「${value.slice(0, 24)}…」`, f.removed);
+      return value;
+    };
+    /**
+     * 短标签的统一入口。`hit=false` 表示没动过（**必须保留原值，包括 undefined**：
+     * 给原本没有的轴标题凭空补一个「指标」是另一种失真）；
+     * `hit=true` 且 `value=undefined` 表示整个槽位该删（可选槽位）或该用中性词补位（必填槽位）。
+     */
+    const editLabel = (text: string | undefined, path: string, what: string, fallback?: string): { hit: boolean; value?: string } => {
+      if (!text || !OWN_BRAND_LEAK_RE.test(text)) return { hit: false };
+      const f = fixLabel(text);
+      const value = f.kind === "text" ? f.value : fallback;
+      record(path, text, value === undefined ? `删除${what}` : `${what}改写为「${value}」`);
+      return { hit: true, value };
+    };
+    /** 短标签的通用改写：未命中 → 原值原样返回（含 undefined）；命中且摘空 → 用 fallback，没有 fallback 就删掉该槽位 */
+    const relabel = (text: string | undefined, path: string, what: string, fallback?: string): string | undefined => {
+      const r = editLabel(text, path, what, fallback);
+      return r.hit ? r.value : text;
+    };
+    /** 必填短标签：摘空 → 用中性词补位（标签是结构骨架，不能为空、也不能整块删） */
+    const requiredLabel = (text: string, path: string, what: string, fallback = OWN_BRAND_NEUTRAL_LABEL): string =>
+      relabel(text, path, what, fallback) ?? fallback;
+
+    const blocks: Block[] = [];
+    for (const [bi, b] of slide.blocks.entries()) {
+      const bp = `${p}.blocks[${bi}]`;
+
+      if (b.type === "text") {
+        blocks.push({ ...b, content: fillText(b.content, `${bp}.content`, "正文") });
+        continue;
+      }
+      if (b.type === "callout") {
+        blocks.push({ ...b, text: fillText(b.text, `${bp}.text`, "警示语") });
+        continue;
+      }
+      if (b.type === "quote") {
+        blocks.push({ ...b, text: fillText(b.text, `${bp}.text`, "引文"), attribution: relabel(b.attribution, `${bp}.attribution`, "出处") });
+        continue;
+      }
+      if (b.type === "image") {
+        const caption = relabel(b.caption, `${bp}.caption`, "图注");
+        blocks.push(caption === undefined ? { ...b, caption: undefined } : { ...b, caption });
+        continue;
+      }
+      if (b.type === "bullets") {
+        const items = b.items.flatMap((it, i) => {
+          const f = fixSentence(it);
+          if (f.kind === "none") return [it];
+          if (f.kind === "text") {
+            record(`${bp}.items[${i}]`, it, "条目改写", f.removed);
+            return [f.value];
+          }
+          record(`${bp}.items[${i}]`, it, "删除整条（整条都在讲自有品牌）", f.removed);
+          return [];
+        });
+        if (items.length === 0) {
+          record(bp, "", "整块删除（条目全被剔除）");
+          continue;
+        }
+        blocks.push({ ...b, items });
+        continue;
+      }
+      if (b.type === "kpi") {
+        const items = b.items.flatMap((it, i) => {
+          const labelF = fixLabel(it.label);
+          const valueF = fixSentence(it.value);
+          if (labelF.kind === "none" && valueF.kind === "none") return [it];
+          if (labelF.kind === "empty" || valueF.kind === "empty") {
+            record(`${bp}.items[${i}]`, `${it.label}:${it.value}`, "删除该 KPI（名称/取值整条都在讲自有品牌）");
+            return [];
+          }
+          const label = labelF.kind === "text" ? labelF.value : it.label;
+          const value = valueF.kind === "text" ? valueF.value : it.value;
+          const unit = relabel(it.unit, `${bp}.items[${i}].unit`, "单位");
+          record(`${bp}.items[${i}]`, `${it.label}:${it.value}`, `KPI 改写为「${label}:${value}」`);
+          return [{ ...it, label, value, unit }];
+        });
+        if (items.length === 0) {
+          record(bp, "", "整块删除（KPI 全被剔除）");
+          continue;
+        }
+        blocks.push({ ...b, items });
+        continue;
+      }
+      if (b.type === "table") {
+        const dropCols = new Set<number>();
+        const columns = b.columns.flatMap((c, i) => {
+          const f = fixLabel(c);
+          if (f.kind === "none") return [c];
+          if (f.kind === "text") {
+            record(`${bp}.columns[${i}]`, c, `列名改写为「${f.value}」`);
+            return [f.value];
+          }
+          record(`${bp}.columns[${i}]`, c, "整列删除（列名与内容都在讲自有品牌）");
+          dropCols.add(i);
+          return [];
+        });
+        if (columns.length === 0) {
+          record(bp, "", "整块删除（列全被剔除）");
+          continue;
+        }
+        const rows = b.rows.map((row, ri) =>
+          row.flatMap((cell, ci) => {
+            if (dropCols.has(ci)) return [];
+            const f = fixLabel(cell);
+            if (f.kind === "none") return [cell];
+            const value = f.kind === "text" ? f.value : "—";
+            record(`${bp}.rows[${ri}][${ci}]`, cell, `单元格改写为「${value}」`);
+            return [value];
+          }),
+        );
+        const caption = relabel(b.caption, `${bp}.caption`, "表注");
+        blocks.push(caption === undefined ? { ...b, columns, rows, caption: undefined } : { ...b, columns, rows, caption });
+        continue;
+      }
+      if (b.type === "timeline") {
+        const phases = b.phases.map((ph, pi) => {
+          const label = requiredLabel(ph.label, `${bp}.phases[${pi}].label`, "阶段名");
+          const items = ph.items.flatMap((it, ii) => {
+            const f = fixSentence(it);
+            if (f.kind === "none") return [it];
+            if (f.kind === "text") {
+              record(`${bp}.phases[${pi}].items[${ii}]`, it, "条目改写", f.removed);
+              return [f.value];
+            }
+            record(`${bp}.phases[${pi}].items[${ii}]`, it, "删除整条", f.removed);
+            return [];
+          });
+          return { ...ph, label, items };
+        });
+        blocks.push({ ...b, phases });
+        continue;
+      }
+      if (b.type === "chart") {
+        const axis = b.axis
+          ? {
+              ...b.axis,
+              /* ⚠️ 兜底用中性词，不能回落到原值 —— 那会把刚摘掉的违禁词又写回去 */
+              xLabel: relabel(b.axis.xLabel, `${bp}.axis.xLabel`, "X 轴标题", OWN_BRAND_NEUTRAL_LABEL),
+              yLabel: relabel(b.axis.yLabel, `${bp}.axis.yLabel`, "Y 轴标题", OWN_BRAND_NEUTRAL_LABEL),
+            }
+          : undefined;
+        const series = b.series.map((s, si) => {
+          const name = requiredLabel(s.name, `${bp}.series[${si}].name`, "系列名");
+          const points = s.points.map((pt, pi2) => {
+            const x = requiredLabel(pt.x, `${bp}.series[${si}].points[${pi2}].x`, "横轴取值", "—");
+            return { ...pt, x };
+          });
+          return { ...s, name, points };
+        });
+        blocks.push(axis ? { ...b, series, axis } : { ...b, series });
+        continue;
+      }
+      if (b.type === "matrix") {
+        const cells = b.cells.map((c, ci) => {
+          const label = requiredLabel(c.label, `${bp}.cells[${ci}].label`, "点位标签", "—");
+          return { ...c, label };
+        });
+        blocks.push({
+          ...b,
+          xLabel: requiredLabel(b.xLabel, `${bp}.xLabel`, "X 轴标题"),
+          yLabel: requiredLabel(b.yLabel, `${bp}.yLabel`, "Y 轴标题"),
+          cells,
+        });
+        continue;
+      }
+      blocks.push(b);
+    }
+
+    const citations = slide.citations.map((c, ci) => {
+      const f = fixSentence(c.claim);
+      if (f.kind === "none") return c;
+      const value = f.kind === "text" ? f.value : OWN_BRAND_NEUTRAL_FILL;
+      record(`${p}.citations[${ci}].claim`, c.claim, `引用表述改写为「${value.slice(0, 24)}…」（只改写不删除：删引用会撞 R6）`, f.removed);
+      return { ...c, claim: value };
+    });
+
+    /* 块全被剔除时补一个中性正文块：空页在渲染层没有意义，而 R14 的修法本身不该产出空页 */
+    const finalBlocks: Block[] = blocks.length > 0 ? blocks : [{ type: "text", style: "body", content: OWN_BRAND_NEUTRAL_FILL }];
+    if (blocks.length === 0 && slide.blocks.length > 0) record(`${p}.blocks`, "", "补一个中性正文块（块被剔空）");
+
+    return { ...slide, title, blocks: finalBlocks, citations };
+  });
+
+  if (!apply) return { dsl, hits };
+  return {
+    dsl: { ...dsl, meta, sourceDeclaration: { ...dsl.sourceDeclaration, sources, exclusions }, slides },
+    hits,
+  };
 }
 
 /**
@@ -374,6 +716,8 @@ export interface ReportValidationOptions {
  *     R11 block.sourceRef 不在 logicalRefs ∪ 已声明 sources → warn / 可修复（别名归一）
  *     R13 kind=platform_entry 的 ref.entryId 不在 catalog.evidenceEntries → error / 可修复
  *         （降级优先级：条目级 → 来源级（保留 sourceKey）→ model_inference/low）
+ *     R14 未指定自有品牌（`opts.hasOwnBrand === false`）时报告出现「我方 / 本品 / 本方 / 品牌自诊」
+ *         → error / 可修复（剔除含违禁词的句子/条目/列；见 stripOwnBrandLeak）
  */
 export function validateReportDsl(
   dsl: ReportDsl,
@@ -595,6 +939,24 @@ export function validateReportDsl(
     }
   }
 
+  /* R14 未指定自有品牌时的「我方口径」泄漏
+   * 扫描与修复共用 stripOwnBrandLeak 的同一遍 walk —— 见该函数的注释（两套实现必然分叉）。 */
+  if (opts.hasOwnBrand === false) {
+    const leak = stripOwnBrandLeak(dsl, { apply: false });
+    if (leak.hits.length > 0) {
+      const sample = leak.hits.slice(0, 3).map((h) => `${h.path}「${h.text}」`);
+      issues.push({
+        level: "error",
+        path: leak.hits[0]!.path,
+        message:
+          `本轮未指定自有品牌（Brief.ownBrandId 缺省），但报告里出现了以「我方」为主语的文本：${sample.join("；")}` +
+          `（共 ${leak.hits.length} 处）`,
+        fix: "剔除这些句子 / 条目 / 列。注意「本报告不含任何『我方』或『本品』数据」这类**负面声明也算违规**——声明本身就把词写进了报告",
+        repairable: true,
+      });
+    }
+  }
+
   return { ok: issues.every((i) => i.level !== "error"), issues };
 }
 
@@ -761,11 +1123,24 @@ export function autoRepair(dsl: ReportDsl, opts: ReportValidationOptions = {}): 
     return { ...slide, blocks, citations };
   });
 
-  return {
-    dsl: { ...dsl, sourceDeclaration: { ...dsl.sourceDeclaration, sources }, slides },
-    actions,
-    cosmeticActions,
-  };
+  /* R14：未指定自有品牌时的「我方口径」剔除。
+   *
+   * 分级标准沿用现有原则（见本函数顶部注释）：**含数字的修复算 data，纯措辞算 cosmetic**。
+   * 那条负面声明（「本报告不含任何『我方』或『本品』数据」）没有数字、也没有承载任何事实，
+   * 抹掉它属于观感级修复，不该把一份完好报告升格成「产出不完整」；
+   * 反过来，删掉「我方抖音账号互动率 3.2%」这类带数字的越界断言必须标脏。 */
+  let repaired: ReportDsl = { ...dsl, sourceDeclaration: { ...dsl.sourceDeclaration, sources }, slides };
+  if (opts.hasOwnBrand === false) {
+    const leak = stripOwnBrandLeak(repaired, { apply: true });
+    for (const h of leak.hits) {
+      const text = `${h.path}: ${h.action}（本轮未指定自有品牌，报告不得出现「我方」口径）`;
+      if (h.digits) actions.push(text);
+      else cosmeticActions.push(text);
+    }
+    repaired = leak.dsl;
+  }
+
+  return { dsl: repaired, actions, cosmeticActions };
 }
 
 export const DISCLAIMER_TEXT =

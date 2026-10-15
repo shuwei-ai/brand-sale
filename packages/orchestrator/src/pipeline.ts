@@ -355,9 +355,14 @@ export class Orchestrator implements IOrchestratorPort {
        * render 包只允许依赖 contracts/config，不允许在渲染期查库。
        * 少了这一步，渲染期兜底校验就无法识别「未登记来源」，收紧后的 R1~R4 会全部静默跳过。 */
       const catalog = this.deps.agentPack.sourceCatalog(ctx, jobId);
+      /* `hasOwnBrand` 必须传到渲染期：R14（未指定自有品牌时不得出现「我方」口径）
+       * 在 agent-pack 的自校验与渲染期的 compile 里各跑一次，
+       * 少传一个地方就会出现「自校验说没问题、渲染期却拒绝渲染」的分叉。 */
+      const brief = this.deps.repos.jobs.get(jobId)?.spec?.brief;
       const compiled = await this.deps.render.compile(dsl as never, {
         catalog,
         minTraceableRatio: DEFAULT_DEPTH_POLICY.minTraceableRatio,
+        hasOwnBrand: Boolean((brief?.ownBrandId ?? "").trim()),
       });
       this.assertAlive();
       this.deps.repos.artifacts.addIfAbsent(jobId, compiled.kind === "html" ? "report_html" : "report_markdown", { inline: compiled.ref.inline });
