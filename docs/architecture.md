@@ -5,7 +5,7 @@
 >
 > 核对基线：2026-10-13 工作区（`npm test` 210 用例全绿、`npm run check:boundaries` 通过）。
 > 2026-10-14 局部更新：采集浏览器会话改为 `reuse` 常驻复用（§8.5）、删除死配置
-> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **223**（见 §14）。
+> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **227**（见 §14）。
 
 ## 0. 阅读指引
 
@@ -91,7 +91,7 @@
 | `apps/gateway` | 5 | 902 | HTTP + SSE 接入层 |
 | **合计（TS）** | **89** | **≈24 200** | 另有采集内核 Python（内嵌 MediaCrawler） |
 
-测试：**17 个文件 / 223 个用例**，全部离线可跑（§12）。
+测试：**17 个文件 / 227 个用例**，全部离线可跑（§12）。
 
 ---
 
@@ -146,7 +146,7 @@
 
 ```bash
 npm install                 # 一次性
-npm test                    # 全离线自检（223 用例）
+npm test                    # 全离线自检（227 用例）
 npm run migrate             # 建表（dev 模式空库会自动灌种子）
 npm run seed                # 登记内置数据源与演示租户
 npm run web:build           # 构建前端控制台 → apps/web/dist
@@ -492,6 +492,22 @@ ReportDsl {
   句子级修复才算观感级**（真机形状：口径页那句「本报告不含任何『我方』或『本品』数据」——它不承载
   任何事实，抹掉它不该把一份完好报告标成「产出不完整」）；标签替换 / 整块删除 / 整列删除一律按
   数据级处理（那类改动动了结构，宁可标脏）。判据落在 `OwnBrandLeakHit.digits` 上。
+- **缺失声明型引用**（2026-10-15）：`kind=data_source` 但 claim 在说「这里没有数据」
+  （未采集 / 无样本 / 无法获取 …）时**移除该引用**而不降级。缺失不是数据来源、更不是推断：
+  降级会凭空造出一条「模型推断：所有候选人报价未采集」；而按下面的误置特例它还会被"改挂"到
+  本页含数字的**人选矩阵**上，把矩阵标成"数据出自报价工具"（真机 `job_0mv86by83ilvbnn0h1a` 的
+  slides[7] 正是这个形状）。判据取 **claim 的语义**：同一个 key 配上真实断言（"报价区间 1–3 万"）
+  仍按未声明来源降级 —— 那时它确实在编造，必须标脏。
+  ⚠️ 带 R6 保护：移除后本页若既无可用引用、又有含数字无来源的块，则**不移除**（退回降级）——
+  宁可多一条可见的推断标注，也不让修复动作制造出不可修复的 error（见下节事故形态）。
+- **`tier:"low"` 的 KPI 缺 warn callout**（2026-10-15）：自动补那个 warn callout 记 **cosmetic**。
+  它不改写任何数字、也不丢任何出处，按上面的分级原则就是观感修复；归 data 级会把一份完好报告
+  标成「产出不完整」，而读者看到的其实是一个**更**安全的报告 —— 语义正好反了。
+  根因在提示词侧：R9 的判定是 `tier === "low"`，提示词此前写的是「confidence < 0.45」，术语对不上。
+- **逻辑引用的裸写形式**（2026-10-15）：`REF_ALIASES` 早就把 `pricing` 归一到 `tool:pricing`，
+  但引用形态判定只对**带前缀**的字符串做正则，别名表没参与 —— 写 `tool:pricing` 会被"降落"到块级
+  `sourceRef`，写裸的 `pricing` 却掉进降级路径。同一个东西两种命运，只取决于模型敲没敲那个前缀。
+  现在 `isMisplacedLogicalRef` 一并认「别名表能归一」的裸写；**认不出的自造 key（`mc_unknown`）仍降级**。
 
 > **历史事故（务必看这段再改 autoRepair）**：R3 的前置特例是"逻辑命名空间被误当数据源"
 > （`meta:*` / `phase:*` / `tool:*` / `degrade:*` 是**块级 sourceRef** 的写法，不是数据源；
@@ -503,7 +519,7 @@ ReportDsl {
 >
 > 现行做法：把这条逻辑引用**改挂到该页含数字断言的 block 上当 `sourceRef`**（最小改动，
 > 溯源还保住了），认不出的写法才退回移除；并且 R6 与 autoRepair **共用唯一判定函数**
-> `isMisplacedLogicalRef`。回归用例：`tests/report-repair.test.ts` ⑧⑨⑩⑪。
+> `isMisplacedLogicalRef`。回归用例：`tests/report-repair.test.ts` ⑧⑨⑩⑪⑫⑬⑭⑮。
 
 ### 5.5 深度策略（`report-depth.ts`）
 
@@ -1250,7 +1266,7 @@ knowledge → model-gateway → agent-pack → render → orchestrator → gatew
 
 ### 12.1 测试体系
 
-`npm test` = **17 个文件 / 223 个用例，全部离线可跑**：
+`npm test` = **17 个文件 / 227 个用例，全部离线可跑**：
 
 ```
 BM_LLM_MODE=mock BM_ALLOW_DEMO_DATA=true BM_MC_ENABLED=false BM_MC_LICENSE_ACK=false \
@@ -1319,7 +1335,7 @@ node --import tsx --test tests/*.test.ts
 
 | # | 位置 | 现状 | 实情 |
 |---|---|---|---|
-| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日多次增补后为 **220**、2026-10-15 为 **223**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
+| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日多次增补后为 **220**、2026-10-15 为 **223** → **227**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
 | 2 | `README.md` 架构图 | `render  M16 渲染` | 渲染是 **M11**；M16 在代码里不存在（`check-boundaries.ts` 的注释也误写为 M16） |
 | 3 | `README.md` | "不构建则回退内置零构建控制台" | 旧控制台（`console.ts` + `/console-legacy`）**已删除**，现在返回引导页（§11.3） |
 | 4 | `README.md` | "七个平台采集已接入…17 个工具" 类表述 | 工具总数 **18**：10 个通用 + `platform_digest` + 7 个 hidden 原语（§7.2） |
@@ -1342,6 +1358,8 @@ node --import tsx --test tests/*.test.ts
 | 15 | `agents.ts:platformPrefetchArgs()` **预采集覆盖范围** | 曾为「**全部已装配平台**」（brief 声明的只是"优先级"），注释理由是"只按 brief 收窄会让已接入平台在报告里被写成「未使用的来源」，读起来像没接上" | 这个理由**与报告的实际行为不符**：手机报告（brief 只要 `douyin/xiaohongshu/bilibili`）的来源声明 exclusions 里本来就写着「快手 / 微博 / 贴吧 / 知乎 **不在本次调研范围**」—— 采了照样进排除项，说明这批数据从产出到引用整条链路没有一处会用到它，而每个平台是一轮分钟级 Playwright 子进程 → **2026-10-14 加 `BM_MC_PREFETCH_SCOPE`（默认 `brief`）**：默认只采 brief 声明的平台（映射后按已装配过滤）；brief 声明了但一个都没装配 → 不投递（不改成采别的平台）；brief 没声明平台 → 不设范围退回全部已装配（防"没声明就没数据"的悬崖）。`all` 保留为回退开关。范围只约束自动预取，`platform_digest` 仍接受全部七个采集码（§8.5） |
 | 16 | `apps/collector/src/store.ts` **`op=search` 的子串兜底** | `store.query()` 在"没有任何行带采集词"时**退回正文子串过滤**（注释理由是"兼容没有 `source_keyword` 的老数据，避免改完更差"） | 兜底把**别的批次**的正文当成本批命中：它不只影响返回内容，还改写了调用方的决策 —— `media-crawler.ts` 是"`contentRows.length === 0` 才排队采集"，于是"缓存里有别的内容碰巧含这个词"= **该关键词永远不排队、永远采不到真实数据**。实测 2026-10-14 电脑任务（brief `category=电脑`）：预取在 dy/xhs/bili 分别命中 17/39/7 条，全库 `source_keyword=电脑` 的行数为 **0**；intel 的 12 条 `evidences` 里出现了「同网络就用 Localseed，电脑就创建一个局域网文件夹」（抖音**评论**）与「折叠屏新王💥一篇看懂升级配置」（小红书**手机**笔记）——报告会把它们当"电脑市场证据"引用。同一根因也解释了耳机任务：dy 至今没有一条 `source_keyword=耳机` 的行（只有模型自选的 `headphones`），因为首次预取就被子串假命中挡掉了 → **2026-10-14 改为 `op=search` 只认采集词、查不到即为空**，由适配器排队一次真实采集补上；其余算子（详情/评论/creator 的入参是 id）仍走字段子串匹配（§8.5） |
 | 17 | `contracts/src/report.ts` **缺 R14**：未指定自有品牌时"不得出现「我方」"只有**提示词约束**，无机械校验 | 模型路径的唯一防线是 RG 提示词的一句话（"正文也不要出现我方/本品/我们"）。而模型会**为了守规矩反而违规**：2026-10-14 电脑报告（`job_0mv86by83ilvbnn0h1a`，brief 未给 `ownBrandId`）的「数据来源与口径声明」页里写着「由于未指定自有品牌，报告中不包含任何"我方"或"本品"的自诊数据」—— 声明本身就把这两个词写进了报告，读者（与任何机械检查）看到的是同一串字。报告的其余部分干净，所以这条只能靠人眼发现 | → **2026-10-15 新增 R14**（`error / repairable`，`validateReportDsl` + `autoRepair` + `stripOwnBrandLeak` 三者同一份槽位枚举），覆盖**全部可渲染槽位**（页标题、正文、条目、KPI、表格列名/单元格/表注、图表系列名与轴标签、矩阵标签、引文与出处、时间轴、`citations[].claim`、`sourceDeclaration` 的 `coverage`/`exclusions[].reason`），修复动作是"剔除含违禁词的句子 / 条目 / 列 / 标签"；`citations[].claim` **只改写不删除**（删引用会撞 R6，那是另一个不变量）。调用链上 `hasOwnBrand` 必须从 `agent-pack.finalizeReport` 与 `orchestrator.renderReport` **两处**都传下去 —— 少传一处就会出现"自校验说没问题、渲染期却拒绝渲染"的分叉。回归用例 `brand-self.test.ts` **WP-B-9/WP-B-10**（含"每种槽位都塞满违禁词，修复后必须过校验"的防死结用例）；提示词同步给出正/反例 |
+
+| 18 | `contracts/src/report.ts` **autoRepair 的两处分级错位** + `agent-pack/src/prompts.ts` **R9 的术语与契约对不上** | ① `pricing` 这类**裸写**逻辑引用掉进"引用了未声明的来源"降级 —— `REF_ALIASES` 早就把 `pricing` 归一到 `tool:pricing`，但引用形态判定只对**带前缀**的字符串做正则，别名表根本没参与；② 缺失声明（claim=「所有候选人报价未采集」）被降级成 `model_inference/low`，报告里凭空多出一条「模型推断：报价未采集」；③ R9 自动补的 warn callout 记 **data 级**；④ 提示词写「confidence < 0.45 的 KPI」，而 R9 实际判定的是 `tier === "low"`，模型无从遵守 | 真机 `job_0mv86by83ilvbnn0h1a`（2026-10-15）控制台报「降级与缺失（1 项）」→「产出不完整」，拆开看是**模型写作瑕疵被系统纠正**、报告本身并无数据缺失（77 条真实证据、粉丝量 24/24 全为真值）→ **2026-10-15 修**：缺失声明改判为**移除**且判据取 claim 语义（带 R6 保护，见 §5.4）；补 warn callout 与「裸写逻辑引用降落为块级 sourceRef」一并归 **cosmetic**；提示词改用契约的原术语（`tier:"low"`）并新增「**规则 C｜『缺失』不是引用**」+ 规则 A 反例补 `pricing`。修复后同一份真实 DSL 的 **data 级修复 2 → 0**、error 0。回归用例 `report-repair.test.ts` ⑫⑬⑭⑮ |
 
 **其它值得知道的边界**：
 
@@ -1527,14 +1545,14 @@ node --import tsx --test tests/*.test.ts
 | `governance-fixes.test.ts` | 6 | 186 | 治理口径的三个不变量（口径错了不会有用例失败，只能专门钉） |
 | `kb-ingest.test.ts` | 15 | 508 | KB 入库通道、来源登记不变量、mutating 工具准入 |
 | `platform-collect.test.ts` | 28 | 829 | 七平台工具与适配器（打桩 fetch，不碰 MediaCrawler）；**预采集覆盖范围 = brief 声明的平台**（`BM_MC_PREFETCH_SCOPE`） |
-| `report-repair.test.ts` | 11 | 304 | 自动修复的分级语义与四条不变量（含"修复不得制造新错误"） |
+| `report-repair.test.ts` | 15 | 424 | 自动修复的分级语义与四条不变量（含"修复不得制造新错误"）；缺失声明须移除不降级、R9 补 callout 只记观感、裸写逻辑引用与带前缀等价 |
 | `report-summary.test.ts` | 16 | 500 | 摘要回灌 + 向量落盘 + 模型混用守卫 |
 | `schema-coverage.test.ts` | 4 | 138 | 骨架/块型/页面角色的防漂移（加第 11 种块型时编译器不会提醒） |
 | `stream-replay.test.ts` | 6 | 251 | 进度实时性与刷新后流式回放 |
 | `tool-call-guard.test.ts` | 5 | 67 | 工具调用风暴闸门（真机曾出现同一工具连续被调 131 次） |
 | `web-console.test.ts` | 5 | 214 | 前端托管契约（含路径穿越守卫） |
 | `web-search.test.ts` | 10 | 313 | 唯一外部计费源（打桩 fetch） |
-| **合计** | **223** | **≈7001** | 17 个文件 |
+| **合计** | **227** | **≈7121** | 17 个文件 |
 
 ## 附录 C · 环境变量
 

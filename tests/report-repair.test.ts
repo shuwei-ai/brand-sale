@@ -302,3 +302,123 @@ test("⑪ 块型缺口必须点名「还没用上的可用块型」，否则回�
     "清单条数要与实际可用块型数一致（写死的数字会随契约漂移）",
   );
 });
+
+/**
+ * ⑫ ⑬ 缺失声明被写成了引用（真机 job_0mv86by83ilvbnn0h1a 的 slides[7]）。
+ *
+ * 现场：模型写 `{"kind":"data_source","ref":{"sourceKey":"pricing"},"claim":"所有候选人报价未采集"}`。
+ * 旧实现把它当"引用了未声明的来源"降级 → 报告里凭空多出一条**「模型推断：所有候选人报价未采集」**，
+ * 而且任务被标成 partial——读者看到的是"缺失"，状态说的是"产出不完整"，语义正好相反。
+ * 缺失不是数据来源，更不是推断：它在同页 callout 里已经写过一遍了。
+ */
+test("⑫ 缺失声明写成引用 → 移除且只记 cosmetic；不得造出「模型推断」条目、不得误挂无关块", () => {
+  const input = dsl([
+    slide(
+      0,
+      "data",
+      [
+        cite({ claim: "品牌声量占比 45%", ref: { sourceKey: "mc_xhs" }, tier: "low" }),
+        cite({ claim: "所有候选人报价未采集", ref: { sourceKey: "pricing" }, tier: "low" }),
+      ],
+      [
+        { type: "table", columns: ["昵称", "粉丝量"], rows: [["硬件茶谈", "3968624"]], sourceRef: "phase:creator" },
+        { type: "callout", tone: "warn", text: "报价未采集，投放前须人工询价与档期确认。" },
+      ],
+    ),
+  ]);
+
+  const { dsl: fixed, actions, cosmeticActions } = autoRepair(input, { catalog: PROD_CATALOG });
+  const page = fixed.slides[0]!;
+
+  assert.equal(page.citations.length, 1, "缺失声明不能留在 citations（真实来源那条不受影响）");
+  assert.equal(page.citations[0]!.ref.sourceKey, "mc_xhs");
+  assert.ok(
+    !page.citations.some((c) => c.kind === "model_inference"),
+    "缺失不是推断——造一条「模型推断：报价未采集」比不写更糟",
+  );
+  assert.equal(actions.length, 0, "缺失声明不承载数据断言，不该把完好报告标成「产出不完整」");
+  assert.equal(cosmeticActions.length, 1);
+  assert.match(cosmeticActions[0]!, /未采集/);
+
+  const post = validateReportDsl(fixed, { catalog: PROD_CATALOG });
+  assert.equal(post.issues.filter((i) => i.level === "error").length, 0, "移除动作不得制造新的 error");
+});
+
+test("⑬ R6 保护：缺失声明是本页唯一引用时**不移除**（宁可多一条引用，不可丢报告）", () => {
+  // 本页有含数字且无 sourceRef 的块，且这条缺失声明是唯一 citation。
+  // 若移除，citations 归零 → R6 报一条 repairable:false 的 error → compile 抛错、报告整份丢失
+  // （job_0mv5ydf69a7aio1uhfd 的事故形态）。此时保守回退到原来的降级路径。
+  const input = dsl([
+    slide(
+      0,
+      "data",
+      [cite({ claim: "所有候选人报价未采集", ref: { sourceKey: "pricing" }, tier: "low" })],
+      [{ type: "table", columns: ["昵称"], rows: [["硬件茶谈"]], caption: "共 3 位候选人" }],
+    ),
+  ]);
+
+  const { dsl: fixed, actions } = autoRepair(input, { catalog: PROD_CATALOG });
+  const page = fixed.slides[0]!;
+
+  assert.equal(page.citations.length, 1, "移除会让本页归零并触发不可修复的 R6 error → 必须保留");
+  assert.equal(page.citations[0]!.kind, "model_inference", "回退路径就是原来的降级（可见地标成推断）");
+  assert.equal(actions.length, 1, "回退意味着仍按数据级上报——这是刻意的保守取舍");
+  assert.equal(validateReportDsl(fixed, { catalog: PROD_CATALOG }).ok, true);
+});
+
+test("⑭ low 置信度 KPI 缺 warn callout → 自动补，且只记 cosmetic（补的是合规提示，不是数据）", () => {
+  const input = dsl([
+    slide(
+      0,
+      "content",
+      [cite({ claim: "品牌声量占比 45%", ref: { sourceKey: "mc_xhs" }, tier: "low" })],
+      [{ type: "kpi", items: [{ label: "Q4 大促预算占比", value: "60", unit: "%", tier: "low" }] }],
+    ),
+  ]);
+
+  const { dsl: fixed, actions, cosmeticActions } = autoRepair(input, { catalog: PROD_CATALOG });
+  const page = fixed.slides[0]!;
+
+  assert.equal(actions.length, 0, "补 callout 不改写任何数字也不丢出处 → 不该把完好报告标成「产出不完整」");
+  assert.equal(cosmeticActions.length, 1);
+  assert.match(cosmeticActions[0]!, /warn callout/);
+  assert.ok(
+    page.blocks.some((b) => b.type === "callout" && b.tone === "warn"),
+    "callout 必须真的补上去（补记 cosmetic 不等于不补）",
+  );
+});
+
+/**
+ * ⑮ 逻辑引用的**裸写**形式。
+ *
+ * `REF_ALIASES` 早就把 `pricing` 归一到 `tool:pricing`，但引用形态判定只对**带前缀**的字符串做正则，
+ * 别名表根本没参与——写 `tool:pricing` 会被"降落"到块级 sourceRef，写裸的 `pricing` 却掉进降级路径。
+ * 同一个东西两种命运，只取决于模型有没有敲那个前缀。
+ */
+test("⑮ 裸写的逻辑引用与带前缀等价：落回块级 sourceRef，而不是降级标脏", () => {
+  const input = dsl([
+    slide(
+      0,
+      "content",
+      [cite({ claim: "报价区间 1–3 万", ref: { sourceKey: "pricing" } })],
+      [{ type: "kpi", items: [{ label: "报价区间", value: "30000", unit: "CNY", tier: "medium" }] }],
+    ),
+  ]);
+
+  const { dsl: fixed, actions, cosmeticActions } = autoRepair(input, { catalog: PROD_CATALOG });
+  const page = fixed.slides[0]!;
+
+  assert.equal(page.citations.length, 0, "pricing 是工具产物的逻辑引用，不是数据源");
+  assert.equal((page.blocks[0] as { sourceRef?: string }).sourceRef, "tool:pricing");
+  assert.equal(actions.length, 0, "落回块级 sourceRef 比降级更正确，不该标脏");
+  assert.match(cosmeticActions[0]!, /tool:pricing/);
+
+  // 不认识的自造 key 必须继续降级 —— 那不是逻辑引用，是编造
+  const bogus = dsl([
+    slide(0, "content", [cite({ claim: "声量占比 45%", ref: { sourceKey: "mc_unknown" } })], [
+      { type: "kpi", items: [{ label: "占比", value: "45", unit: "%", tier: "high" }] },
+    ]),
+  ]);
+  const r = autoRepair(bogus, { catalog: PROD_CATALOG });
+  assert.equal(r.actions.length, 1, "mc_unknown 不是别名能归一的写法，必须按数据级上报");
+});

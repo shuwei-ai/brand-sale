@@ -177,7 +177,13 @@ const PER_AGENT: Record<AgentCode, string> = {
 - **规则 A｜citation.ref.sourceKey 只能取「可用数据源清单」里的 key**（如 mc_xhs / volc_web_search）。
   正例：{ "kind": "data_source", "ref": { "sourceKey": "mc_xhs" }, "claim": "…" }
   反例：{ "kind": "data_source", "ref": { "sourceKey": "phase:intel" }, "claim": "…" }
-  ↑ 这条会被系统**机械删除**（还会把任务误标成"部分成功"）—— phase:* 不是数据源。
+        { "kind": "data_source", "ref": { "sourceKey": "pricing" }, "claim": "…" } ← 把工具名当成了数据源
+  ↑ 这类引用会被系统**机械移除或降级**（还会把任务误标成"部分成功"）——
+  phase:* / tool:* / meta:* / degrade:* 以及它们的裸写形式（intel / budget / pricing …）都不是数据源。
+- **规则 C｜「缺失」不是引用**：某数据本轮没采到（未采集 / 无样本 / 无法获取）时，
+  那是**要告知读者的事实**，写在 callout 或正文里；**不要为它造一条 citation**。
+  例如「所有候选人报价未采集」应放进 callout，写成 citation 会被判"引用了未声明的来源"，
+  报告会被标注为经过自动修复。citations 只放**有真实出处**的断言。
 - **规则 B｜block.sourceRef 只用逻辑命名空间**：phase:* / meta:* / tool:* / degrade:*，
   例如来源声明页用 "meta:sourceDeclaration"，上游阶段产物用 "phase:intel" / "phase:budget"，工具产物用 "tool:pricing"。
   正例：{ "type": "kpi", "items": [ … ], "sourceRef": "phase:budget" }
@@ -189,7 +195,9 @@ const PER_AGENT: Record<AgentCode, string> = {
 - 「数字断言」的判定很宽：百分比、金额、日期、样本量、分数、以及 L1/L2/L3 这类等级标签，
   只要文本里出现阿拉伯数字就算。渲染校验会拒绝任何"有数字但既无 citation 也无 sourceRef"的页面；
 - 某页实在给不出 citation 时，改写成不含数字的定性表述，或给该页含数字的 block 加 sourceRef，不要硬写；
-- confidence < 0.45 的 KPI 所在页面必须包含一个 tone="warn" 的 callout；
+- **KPI 条目的 tier 标成 "low" 的页面，必须同页给一个 tone:"warn" 的 callout**（几组 low 共用一个即可），
+  说明该估算值的局限。漏了系统会自动补一个，但那属于兜底修复、报告会被标注为"经过自动修复"；
+- tier 的判断标准：有真实出处（工具 / 知识库 / 平台采集）→ medium 及以上；自己推的、样本不足或来源单一 → low。
 - sourceDeclaration.exclusions 必须列出本次**没有使用**的数据源及原因。
 
 【竞品格局页 · 跨平台指标口径】

@@ -339,8 +339,43 @@ const refOf = (b: Block): string | undefined => ("sourceRef" in b ? (b as { sour
  * job_0mv5ydf69a7aio1uhfd：报告整份丢失，且该错误既进不了回喂清单、也无法被机械修复）。
  */
 const MISPLACED_LOGICAL_REF_RE = /^(meta|phase|tool|degrade):/;
+
+/**
+ * 逻辑引用的**裸写**形式（`pricing` / `budget` / `intel` …）与带前缀的写法等价。
+ *
+ * `REF_ALIASES` 的存在意义就是"把观测到的自由写法收敛到命名空间"，但这个判定此前
+ * 只对**带前缀**的字符串做正则匹配，别名表根本没参与 —— 于是模型写 `tool:pricing`
+ * 会被正确"降落"到块级 sourceRef，写裸的 `pricing` 却掉进"引用了未声明的来源"降级路径。
+ * 同一个东西两种命运，只取决于模型有没有敲那个前缀（真机 job_0mv86by83ilvbnn0h1a 的
+ * slides[7] 正是裸写）。
+ *
+ * ⚠️ 只有**别名表能归一**的写法才参与判定：不认识的自造 key（如 `mc_unknown` 这类真来源
+ * 写错了名）必须继续走降级 —— 那不是逻辑引用，是编造。
+ */
+const isBareLogicalRef = (c: ReportCitation): boolean =>
+  c.kind === "data_source" &&
+  typeof c.ref?.sourceKey === "string" &&
+  REF_ALIASES[c.ref.sourceKey.trim()] !== undefined;
+
 const isMisplacedLogicalRef = (c: ReportCitation): boolean =>
-  c.kind === "data_source" && typeof c.ref?.sourceKey === "string" && MISPLACED_LOGICAL_REF_RE.test(c.ref.sourceKey);
+  c.kind === "data_source" &&
+  typeof c.ref?.sourceKey === "string" &&
+  (MISPLACED_LOGICAL_REF_RE.test(c.ref.sourceKey) || isBareLogicalRef(c));
+
+/**
+ * 「缺失声明」型引用：claim 在说"这里没有数据"，而不是"数据来自某处"。
+ *
+ * 模型没有专门的地方表达"未采集"，会把这类声明塞进 `citations`（真机 job_0mv86by83ilvbnn0h1a
+ * 的 slides[7]：`{"sourceKey":"pricing","claim":"所有候选人报价未采集"}`）—— 结果被当成
+ * "引用了未声明的来源"降级成 `model_inference/low`，报告里凭空多出一条
+ * 「模型推断：所有候选人报价未采集」。**缺失不是推断**。
+ *
+ * 判据取 **claim 的语义**而不是 key 的形态：同一个 key 配上真实断言（"报价区间 1–3 万"）
+ * 仍按正常的未声明来源降级处理 —— 那时它确实是在编造，必须标脏。
+ */
+const ABSENCE_CLAIM_RE = /(未采集|未获取|未能获取|无法获取|无样本|暂无样本|暂无数据|无公开数据|数据缺失)/;
+const isAbsenceClaimCitation = (c: ReportCitation): boolean =>
+  c.kind === "data_source" && ABSENCE_CLAIM_RE.test(c.claim);
 
 export interface ReportValidationOptions {
   /** 本次真实可用的数据源目录；缺省时跳过 R1/R2/R4 的来源存在性校验 */
@@ -1031,8 +1066,41 @@ export function autoRepair(dsl: ReportDsl, opts: ReportValidationOptions = {}): 
      * 正确做法是把它**降落到本该待的地方**：赋给本页含数字断言的块当 sourceRef ——
      * 模型的原意本来就是「这页数据出自 X 阶段产物」，这正是块级 sourceRef 的定义，语义零损伤。
      * 认不出的写法（不在 logicalRefs 里）才退回移除 —— 那种引用谁也不认识，留着也是错的。 */
+
+    /* R3 前置特例 ①：**缺失声明**被写成了引用 —— 直接移除，既不降级也不改挂。
+     *
+     * 「所有候选人报价未采集」不是数据来源主张，而是"这里没有数据"的告知；模型没有别的地方
+     * 放它，就塞进了 citations（真机 job_0mv86by83ilvbnn0h1a 的 slides[7]）。这类引用：
+     *   - 降级成 model_inference/low → 凭空造一条「模型推断：报价未采集」，缺失不是推断；
+     *   - 改挂块级 sourceRef 更糟 → 本页含数字的人选矩阵会被标成"数据出自报价工具"，
+     *     而矩阵跟报价毫无关系（真实 DSL 里正是这么被误挂的）。
+     * 正确处置是移除，缺失信息由同页 callout 承载（提示词也明确要求这么写）。
+     *
+     * ⚠️ 必须带 R6 保护：删掉后本页若既无可用引用、又有含数字且无来源的块，就会在紧接着的
+     * 第二次校验里多报一条 `repairable: false` 的 error → 报告整份丢失（同 job_0mv5ydf69a7aio1uhfd
+     * 的事故形态）。此时退回原来的降级路径，宁可贵一条引用也不丢报告。
+     */
+    const absence = citations.filter(isAbsenceClaimCitation);
+    if (absence.length > 0) {
+      const survivors = citations.filter((c) => !isAbsenceClaimCitation(c));
+      const usableSurvivors = survivors.filter((c) => !isMisplacedLogicalRef(c)).length;
+      const everyNumericBlockSourced = blocks.every((b) => numericClaims(b).length === 0 || !!refOf(b));
+      if (usableSurvivors > 0 || everyNumericBlockSourced) {
+        citations = survivors;
+        for (const c of absence) {
+          cosmeticActions.push(
+            `slides[${slide.index}].citations: 移除缺失声明「${c.claim.slice(0, 20)}」（"未采集/无样本"不是数据来源，缺失应由 callout 或正文说明）`,
+          );
+        }
+      }
+    }
+
     const misplacedRefs: string[] = [];
     citations = citations.filter((c) => {
+      /* 缺失声明引用走到这里 = 上面的 R6 保护判定"不能删"（删了本页数字断言会失去来源）。
+       * 此时必须**豁免**下面的误置处理：它同样会把裸写的 `pricing` 移除，保护就白做了。
+       * 让它按普通"未声明来源"降级，宁可多一条可见的推断标注，也不丢报告。 */
+      if (isAbsenceClaimCitation(c)) return true;
       if (!isMisplacedLogicalRef(c)) return true;
       const raw = c.ref.sourceKey as string;
       const key = normalizeRef(raw);
@@ -1101,11 +1169,18 @@ export function autoRepair(dsl: ReportDsl, opts: ReportValidationOptions = {}): 
       return b;
     });
 
-    /* R9：low 置信度补 warn callout */
+    /* R9：low 置信度补 warn callout
+     *
+     * 归 **cosmetic**：这是"补全一个合规提示"，既不改写任何数字、也不丢任何出处 ——
+     * 按本函数顶部的分级原则（`cosmeticActions` = 内容语义零损伤）就该算观感修复。
+     * 归 data 级会让一份 15 页完好报告被标成「产出不完整」，读者看到的是一个**更**安全的
+     * 报告，状态却在说"有东西缺失"，语义正好反了（真机 job_0mv86by83ilvbnn0h1a 即此）。
+     * 根因（模型漏写配套 callout）由提示词侧修：R9 的判定是 `tier === "low"`，
+     * 而提示词此前写的是「confidence < 0.45」，术语对不上，模型无从遵守。 */
     const hasLowTier = blocks.some((b) => b.type === "kpi" && b.items.some((it) => it.tier === "low"));
     const hasWarn = blocks.some((b) => b.type === "callout" && b.tone === "warn");
     if (hasLowTier && !hasWarn) {
-      actions.push(`slides[${slide.index}]: 自动补 warn callout（存在 low 置信度 KPI）`);
+      cosmeticActions.push(`slides[${slide.index}]: 自动补 warn callout（存在 low 置信度 KPI）`);
       blocks = [
         ...blocks,
         {
