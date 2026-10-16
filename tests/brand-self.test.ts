@@ -25,7 +25,7 @@ import {
   validateReportDsl,
   type ReportDsl,
 } from "@brandsale/contracts";
-import { CompetitorIntelSchema, synthIntel, synthReport } from "@brandsale/agent-pack";
+import { CompetitorIntelSchema, PLATFORM_DIGEST_TOOL_NAME, synthIntel, synthReport } from "@brandsale/agent-pack";
 
 /** 未接入任何品牌资产数据源的最小 Brief（这是当前的真实处境） */
 const brief = {
@@ -382,4 +382,77 @@ test("WP-B-10 R14 的分级：负面声明按观感级修复（不脏任务）�
   const r = autoRepair(forge, { hasOwnBrand: false });
   assert.equal(r.actions.filter((a) => a.includes("我方")).length, 1, "带数字的我方断言被删属于数据级改动");
   assert.equal(r.cosmeticActions.filter((a) => a.includes("我方")).length, 0);
+});
+
+/* ── WP-B-11/12 兜底竞品表的真实素材（2026-10-16）─────────────────────────
+ * 业主反馈：竞品表六行全是「待核验（本轮无竞品情报来源）」，'没有核验数据给到我，
+ * 没有意义'。而兜底当时手里其实有素材：行业级联网检索命中了 4 条报道、平台缓存里
+ * 有几百条含品牌名的内容 —— 一个都没用上。修法：intel 预取按品牌各投一次联网检索
+ * （key = `web_search_brand_${brand}`），兜底把命中标题**逐字引用**进竞品表
+ * （标「公开报道口径，未经核验」，不解析数字、不编造），再用平台证据按品牌名
+ * 统计真实内容条数。 */
+
+const evBrief = {
+  industry: "两轮出行",
+  category: "电动车",
+  platforms: ["douyin", "xiaohongshu", "bilibili"],
+  window: { from: "2026-10-01", to: "2026-12-31" },
+  brandIds: ["雅迪", "九号", "爱玛"],
+  budget: { amount: 3_000_000 },
+};
+
+test("WP-B-11 兜底竞品表：有品牌级检索/平台内容时必须引用公开口径，而不是整列「待核验」", () => {
+  const tools = {
+    web_search_brand_雅迪: {
+      result: { results: [{ title: "雅迪冠能3上市 售价4199元起", siteName: "新浪财经", url: "https://example.com/yadea" }] },
+    },
+    [PLATFORM_DIGEST_TOOL_NAME]: {
+      result: {
+        rows: [
+          { platform: "douyin", id: "d1", title: "雅迪冠能3 续航实测", text: "高速路 200 公里", author: "超哥超车" },
+          { platform: "douyin", id: "d2", title: "九号 E 系列开箱", text: "智能化配置", author: "工控圈" },
+          { platform: "bilibili", id: "b1", title: "九号 vs 雅迪 对比评测", text: "同价位对比", author: "者也" },
+        ],
+      },
+    },
+  };
+
+  const intel = synthIntel(evBrief, tools);
+  const byName = new Map(intel.competitors.map((c) => [c.name, c]));
+
+  // 雅迪：检索命中 + 平台内容双路都有素材
+  const yadea = byName.get("雅迪")!;
+  assert.match(yadea.positioning, /^公开报道口径（未经核验）：新浪财经：雅迪冠能3/);
+  assert.match(yadea.priceBand, /4199/, "标题里的价格信息逐字引用（不是解析出的数字）");
+  assert.ok(yadea.keyClaims.some((k) => k.includes("雅迪冠能3上市")));
+  assert.match(yadea.contentMatrix[0]!.form, /公开可见内容 2 条/, "平台证据按品牌名匹配（对比评测两条都含「雅迪」）");
+  assert.equal(yadea.contentMatrix[0]!.share, null, "样本内条数不能换算成声量份额 —— 口径不同");
+  assert.equal(yadea.confidence > 0.3, true);
+
+  // 九号：没有品牌级检索命中，但平台内容有 → 至少内容条数是真实的
+  const ninebot = byName.get("九号")!;
+  assert.match(ninebot.contentMatrix[0]!.form, /公开可见内容 2 条/);
+  assert.match(ninebot.positioning, /待核验/, "无检索命中时定位仍如实待核验 —— 不拿平台标题冒充报道");
+
+  // 爱玛：两路全空 → 保持「待核验」，绝不编
+  const aima = byName.get("爱玛")!;
+  assert.match(aima.positioning, /待核验/);
+  assert.equal(aima.confidence, 0.3);
+
+  // 品牌检索命中要进 citations（读者能点回来源）
+  assert.ok(intel.citations.some((c) => c.claim.includes("雅迪冠能3上市")), "品牌检索引用不能缺席");
+
+  // 兜底产物必须能过自己的 schema（有数字/有引用的硬校验）
+  CompetitorIntelSchema.validate(intel);
+});
+
+test("WP-B-12 兜底竞品表：无任何素材时行为不变（整列待核验、置信度 0.3）", () => {
+  const intel = synthIntel(evBrief, {});
+  for (const c of intel.competitors) {
+    assert.match(c.positioning, /待核验/);
+    assert.equal(c.confidence, 0.3);
+    assert.equal(c.shareOfVoice, null);
+  }
+  assert.equal(intel.competitors.length >= 3, true);
+  CompetitorIntelSchema.validate(intel);
 });

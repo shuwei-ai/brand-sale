@@ -685,6 +685,26 @@ export function synthIntel(brief: { industry: string; category: string; platform
     citations.push({ claim: `${w.siteName ?? "公开网页"}：${w.title ?? ""}`.slice(0, 60), sourceKey: WEB_SEARCH_SOURCE_ID, confidence: 0.45 });
   }
 
+  /* 品牌级联网检索结果（intel 预取按品牌投递，key = `web_search_brand_${brand}`）。
+   *
+   * 旧兜底对竞品表**一个字的真实素材都不用**：即便行业检索命中了「新国标重塑市场格局」
+   * 这类报道、平台缓存里有几百条含品牌名的内容，六家竞品仍整列写「待核验（本轮无竞品
+   * 情报来源）」——业主的反馈：'没有核验数据给到我，没有意义'。
+   * 现在按品牌取回检索命中（引用原句、标「未经核验」，不解析数字、不编造），
+   * 再用平台证据按品牌名统计真实内容条数，竞品表至少有一列看得见的东西。 */
+  const brandWebHits = new Map<string, { title: string; siteName: string }[]>();
+  for (const brand of (brief.brandIds ?? []).map((b) => b.trim()).filter(Boolean)) {
+    const bw = unwrap(tools[`web_search_brand_${brand}`]) as { results?: { title?: string; siteName?: string }[] } | undefined;
+    const hits = (bw?.results ?? [])
+      .filter((w) => w.title)
+      .slice(0, 3)
+      .map((w) => ({ title: String(w.title), siteName: str(w.siteName, "公开网页") }));
+    if (hits.length > 0) brandWebHits.set(brand, hits);
+  }
+  for (const [brand, hits] of brandWebHits) {
+    citations.push({ claim: `${brand}：${hits[0]!.title}`.slice(0, 60), sourceKey: WEB_SEARCH_SOURCE_ID, confidence: 0.45 });
+  }
+
   /* 平台采集数据（P0 溯源）。
    *
    * 旧实现在这里**一个字节都没用** platform_digest 的返回 —— 平台数据接了等于没接：
@@ -717,18 +737,43 @@ export function synthIntel(brief: { industry: string; category: string; platform
    * 兜底路径本来就拿不到竞品情报，正确做法是**如实标「待核验」**：名字用 brief 给的品牌
    * （客户声明，不是编的），分析字段一律留空 —— 既不编造，也不张冠李戴。 */
   const briefBrands = (brief.brandIds ?? []).map((b) => b.trim()).filter(Boolean);
-  const mkCompetitor = (name: string) => ({
-    name,
-    positioning: "待核验（本轮无竞品情报来源）",
-    priceBand: "待核验",
-    keyClaims: ["待核验（本轮无竞品情报来源）"] as string[],
-    // 声量份额必须由可量化数据源估算；公开网页检索给不出这个口径，如实置空
-    shareOfVoice: null,
-    contentMatrix: [{ form: "公开可见内容形态（未经人工核验）", share: null, platform: platform0 }],
-    sovTrend: [{ month, value: null }],
-    differentiation: "待核验",
-    confidence: 0.3,
-  });
+  const mkCompetitor = (name: string) => {
+    /* 素材两路，都是"引用"而不是"分析"：
+     * ① 品牌级联网检索命中 —— 标题逐字引用（公开报道口径，未经人工核验）；
+     * ② 平台证据按品牌名匹配标题 —— 真实的内容条数与代表作（公开采集，样本内口径）。
+     * 两路都空（没配检索 Key 且平台无该品牌内容）才回退「待核验」。 */
+    const hits = brandWebHits.get(name) ?? [];
+    const claims = hits.slice(0, 2).map((w) => `${w.siteName}：${w.title}`.slice(0, 80));
+    const priceHit = hits.find((w) => /(元|价|¥|万)/.test(w.title));
+    // 平台内容条数：标题含品牌名（子串匹配，样本内口径；评测量/对比帖天然含多品牌）
+    const brandRows = platformRows.filter((r) => str(r.title).includes(name));
+    return {
+      name,
+      positioning: claims[0]
+        ? `公开报道口径（未经核验）：${claims[0]}`
+        : "待核验（本轮无竞品情报来源）",
+      priceBand: priceHit ? `公开报道口径（未经核验）：${priceHit.title}`.slice(0, 80) : "待核验",
+      keyClaims: (claims.length > 0 ? claims : ["待核验（本轮无竞品情报来源）"]) as string[],
+      // 声量份额必须由可量化数据源估算；公开网页检索给不出这个口径，如实置空
+      // （平台条数只进 contentMatrix.form 的文本，换算成 0-1 的"份额"就是编口径）
+      shareOfVoice: null,
+      contentMatrix: [
+        {
+          form:
+            brandRows.length > 0
+              ? `公开可见内容 ${brandRows.length} 条（${platform0} 等平台样本内）`
+              : "公开可见内容形态（未经人工核验）",
+          share: null,
+          platform: platform0,
+        },
+      ],
+      sovTrend: [{ month, value: null }],
+      differentiation: claims[1]
+        ? `公开报道口径（未经核验）：${claims[1]}`.slice(0, 100)
+        : "待核验",
+      confidence: claims.length > 0 ? 0.45 : 0.3,
+    };
+  };
   /* brief 声明的品牌不足 3 个时用**中性占位**补足 —— schema 硬性要求 competitors ≥ 3
    * （`$.competitors 至少需要 3 项`）。占位明确写"未识别"，读者一眼可见这是缺口而非情报；
    * 绝不像旧实现那样拿题材标签凑数。名字里也绝不拼检索站点名：站点名是"资料来源"，不是"竞品"。 */

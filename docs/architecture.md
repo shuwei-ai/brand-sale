@@ -5,7 +5,7 @@
 >
 > 核对基线：2026-10-13 工作区（`npm test` 210 用例全绿、`npm run check:boundaries` 通过）。
 > 2026-10-14 局部更新：采集浏览器会话改为 `reuse` 常驻复用（§8.5）、删除死配置
-> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **227**（见 §14）。
+> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **229**（见 §14）。
 
 ## 0. 阅读指引
 
@@ -91,7 +91,7 @@
 | `apps/gateway` | 5 | 902 | HTTP + SSE 接入层 |
 | **合计（TS）** | **89** | **≈24 200** | 另有采集内核 Python（内嵌 MediaCrawler） |
 
-测试：**17 个文件 / 227 个用例**，全部离线可跑（§12）。
+测试：**17 个文件 / 229 个用例**，全部离线可跑（§12）。
 
 ---
 
@@ -146,7 +146,7 @@
 
 ```bash
 npm install                 # 一次性
-npm test                    # 全离线自检（227 用例）
+npm test                    # 全离线自检（229 用例）
 npm run migrate             # 建表（dev 模式空库会自动灌种子）
 npm run seed                # 登记内置数据源与演示租户
 npm run web:build           # 构建前端控制台 → apps/web/dist
@@ -730,7 +730,11 @@ validateReportDsl()     仍不通过且 error 不可修复 → 抛 E-RENDER-001�
                     │     工具往返 → 结构化输出 → Schema 校验
                     │     ✅ 成功（report 阶段还要过 finalizeReport）
                     │     ✘ 失败（无工具 / 抛错 / 校验不过）↓
-准备提示词 ─────────┤
+                    │  ①′ 追问重试（**一次**）：向循环追加「只输出完整 JSON，
+                    │     附上失败原因」→ 等 idle → 重解析（只看追问后的增量文本）。
+                    │     治两种实测高频失败：模型只回自然语言前言没吐 JSON、
+                    │     输出了 JSON 但字段空壳 —— 流式本身是通的，差一次收口。
+准备提示词 ─────────┤  ✅ 追问后产出（note 标「追问一次后」）
 + 预取平台数据       ├─ ② 单次结构化输出（completeJson，**不调工具**）
 （refreshPlatformData）│     ✅ 成功（同样过 finalizeReport）
                     │     ✘ 失败（E-AGENT-001 校验不过 / E-AGENT-002 调用失败）↓
@@ -840,9 +844,15 @@ SYSTEM_PROMPTS[code] = PER_AGENT[code] + "\n\n" + COMMON_RULES
 
 1. **是适配器而不是后门**：走标准 `Provenance`，台账登记 L3，`synthetic: false`；
 2. **单任务调用有界**：`maxCallsPerJob = 30` —— 令牌桶只管速率不管总量，计费接口必须另有**总额闸门**；
+   intel 预取一次消耗 N+1 次（1 行业级 + N 品牌级，N ≤ 8），远低于上限；
 3. **能力缺席即不暴露**：未配 `BM_WEB_SEARCH_API_KEY` 时适配器不注册，工具**不会出现在模型清单里**
    （宁可工具清单里没有，也不让模型去调一个必然失败的工具）；`BM_LLM_MODE=mock` 时 intel 阶段跳过预取，
    因此 E2E 用例可以无条件离线跑。
+4. **预取含品牌级检索**（2026-10-16）：intel 预取对 brief 的每个 `brandId` 各投一次
+   `${brand} ${category} 价格 定位 卖点 评测`（prefetch key = `web_search_brand_${brand}`）——
+   此前只有一条行业级 query，CI 素材里没有任何一家竞品的定位/价格带，Pi 失败掉进兜底时
+   竞品表只能整列写「待核验」；命中标题由 `synthIntel` **逐字引用**进竞品表并标
+   「公开报道口径，未经核验」，平台证据按品牌名统计的内容条数进 `contentMatrix.form`。
 
 **已移除且不要重加**：千川 / 星图 / 蒲公英 / 生意参谋 / 巨量算数 ——
 它们从未接入真实平台，只输出确定性伪随机数（`provenance.synthetic = true`）。
@@ -1266,7 +1276,7 @@ knowledge → model-gateway → agent-pack → render → orchestrator → gatew
 
 ### 12.1 测试体系
 
-`npm test` = **17 个文件 / 227 个用例，全部离线可跑**：
+`npm test` = **17 个文件 / 229 个用例，全部离线可跑**：
 
 ```
 BM_LLM_MODE=mock BM_ALLOW_DEMO_DATA=true BM_MC_ENABLED=false BM_MC_LICENSE_ACK=false \
@@ -1335,7 +1345,7 @@ node --import tsx --test tests/*.test.ts
 
 | # | 位置 | 现状 | 实情 |
 |---|---|---|---|
-| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日多次增补后为 **220**、2026-10-15 为 **223** → **227**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
+| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日多次增补后为 **220**、2026-10-15 为 **227**、2026-10-16 为 **229**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
 | 2 | `README.md` 架构图 | `render  M16 渲染` | 渲染是 **M11**；M16 在代码里不存在（`check-boundaries.ts` 的注释也误写为 M16） |
 | 3 | `README.md` | "不构建则回退内置零构建控制台" | 旧控制台（`console.ts` + `/console-legacy`）**已删除**，现在返回引导页（§11.3） |
 | 4 | `README.md` | "七个平台采集已接入…17 个工具" 类表述 | 工具总数 **18**：10 个通用 + `platform_digest` + 7 个 hidden 原语（§7.2） |
@@ -1353,7 +1363,7 @@ node --import tsx --test tests/*.test.ts
 
 | # | 位置 | 现状 | 实情 |
 |---|---|---|---|
-| 13 | `agent-pack/src/synthesis.ts` **兜底合成** | `synthIntel` 把「成分党 / 平价替代 / 医研背书」（**护肤品**题材）三个竞品**硬编码**在确定性兜底路径里，并把公开检索命中的**站点名**当品牌名拼进去；`synthReport` 的快捷结论写死"已识别三类定位坐标（成分党 / 平价替代 / 医研背书）"；`quote` 块硬抄 `scripts/seed.ts` 的演示种子「达人种草占比 45% 时 ROI 最优（2.3）」并署名"KB-2 内部复盘" | 模型不可用时（该次任务 LLM 报 E-AGENT-002）耳机报告渲染出「**头部成分党（Global Information, Inc. (GII)）**」：① 类目错 —— 耳机报告在讲"成分浓度"；② 主体错 —— GII 是市场研究出版机构，不是品牌。整张"竞品格局对比"表不可用；`quote` 块在 KB 无该条目时等于**无源假引用** → **2026-10-14 竞品集改为取自 `brief.brandIds`（不足 3 家时补"其他竞品 X（未识别）"中性占位以过 Schema 的 ≥3 下限）、分析字段一律标"待核验"、快捷结论按 brief 如实叙述、`quote` 换成不承载数字的口径说明；新增 2 条回归用例（`data-provenance.test.ts`）** |
+| 13 | `agent-pack/src/synthesis.ts` **兜底合成** | `synthIntel` 把「成分党 / 平价替代 / 医研背书」（**护肤品**题材）三个竞品**硬编码**在确定性兜底路径里，并把公开检索命中的**站点名**当品牌名拼进去；`synthReport` 的快捷结论写死"已识别三类定位坐标（成分党 / 平价替代 / 医研背书）"；`quote` 块硬抄 `scripts/seed.ts` 的演示种子「达人种草占比 45% 时 ROI 最优（2.3）」并署名"KB-2 内部复盘" | 模型不可用时（该次任务 LLM 报 E-AGENT-002）耳机报告渲染出「**头部成分党（Global Information, Inc. (GII)）**」：① 类目错 —— 耳机报告在讲"成分浓度"；② 主体错 —— GII 是市场研究出版机构，不是品牌。整张"竞品格局对比"表不可用；`quote` 块在 KB 无该条目时等于**无源假引用** → **2026-10-14 竞品集改为取自 `brief.brandIds`（不足 3 家时补"其他竞品 X（未识别）"中性占位以过 Schema 的 ≥3 下限）、分析字段一律标"待核验"、快捷结论按 brief 如实叙述、`quote` 换成不承载数字的口径说明；新增 2 条回归用例（`data-provenance.test.ts`）**；**2026-10-16 再改**：业主反馈整列「待核验」没有意义 —— 兜底手里其实有素材（行业级检索命中 + 平台缓存几百条内容）却一个没用。现按品牌取回 `web_search_brand_${brand}` 预取结果，命中标题**逐字引用**进 positioning/priceBand/keyClaims/differentiation（标「公开报道口径，未经核验」），平台证据按品牌名统计的内容条数进 `contentMatrix.form`；两路全空才回退「待核验」。新增 WP-B-11/12（`brand-self.test.ts`）** |
 | 14 | `Brief.brandIds`（`contracts/src/job.ts`） | 曾只有 `brandIds: string[]`，**没有"我方品牌"字段** | 同一个字段被两处按**相反**语义消费：`buildBrandSelf()` 与 `report.meta.brand` 当「我方品牌」，而「竞品格局对比」表与「品牌 vs 竞品差距矩阵」当**竞品集**（矩阵列头即「我方 \| 索尼 \| Bose \| 华为 \| 小米」）→ 后果：**「品牌自诊概览」页在任何 brief 下都填不实**，未授权时只能整页写「无数据」。→ **2026-10-14 修**：新增**可选**字段 `Brief.ownBrandId` 承接"我是谁"；`brandIds` **只**表示"本轮在投/在看的品牌集合"。**未指定 `ownBrandId` 时报告整份不做品牌自诊**：删去「品牌自诊概览」「品牌 vs 竞品差距矩阵」两页，代之以纯市场的**「竞品定位矩阵」**页（保住 `matrix` 可视化块与"竞品怎么分布"这个市场结论），`quote`/`matrix` 等必需块型不受影响；`meta.brand` 优先取 `ownBrandId`。回归用例 `brand-self.test.ts` **WP-B-8**（未指定时不得出现「我方 / 本品」字样）；WP-B-6/WP-B-7 的 fixture 显式给了 `ownBrandId`（行走的是"已指定"分支）。报告提示词（RG）同步条件化，CI 的 `brandSelf` 仍为结构必填但**只有指定自有品牌时才会进报告** |
 | 15 | `agents.ts:platformPrefetchArgs()` **预采集覆盖范围** | 曾为「**全部已装配平台**」（brief 声明的只是"优先级"），注释理由是"只按 brief 收窄会让已接入平台在报告里被写成「未使用的来源」，读起来像没接上" | 这个理由**与报告的实际行为不符**：手机报告（brief 只要 `douyin/xiaohongshu/bilibili`）的来源声明 exclusions 里本来就写着「快手 / 微博 / 贴吧 / 知乎 **不在本次调研范围**」—— 采了照样进排除项，说明这批数据从产出到引用整条链路没有一处会用到它，而每个平台是一轮分钟级 Playwright 子进程 → **2026-10-14 加 `BM_MC_PREFETCH_SCOPE`（默认 `brief`）**：默认只采 brief 声明的平台（映射后按已装配过滤）；brief 声明了但一个都没装配 → 不投递（不改成采别的平台）；brief 没声明平台 → 不设范围退回全部已装配（防"没声明就没数据"的悬崖）。`all` 保留为回退开关。范围只约束自动预取，`platform_digest` 仍接受全部七个采集码（§8.5） |
 | 16 | `apps/collector/src/store.ts` **`op=search` 的子串兜底** | `store.query()` 在"没有任何行带采集词"时**退回正文子串过滤**（注释理由是"兼容没有 `source_keyword` 的老数据，避免改完更差"） | 兜底把**别的批次**的正文当成本批命中：它不只影响返回内容，还改写了调用方的决策 —— `media-crawler.ts` 是"`contentRows.length === 0` 才排队采集"，于是"缓存里有别的内容碰巧含这个词"= **该关键词永远不排队、永远采不到真实数据**。实测 2026-10-14 电脑任务（brief `category=电脑`）：预取在 dy/xhs/bili 分别命中 17/39/7 条，全库 `source_keyword=电脑` 的行数为 **0**；intel 的 12 条 `evidences` 里出现了「同网络就用 Localseed，电脑就创建一个局域网文件夹」（抖音**评论**）与「折叠屏新王💥一篇看懂升级配置」（小红书**手机**笔记）——报告会把它们当"电脑市场证据"引用。同一根因也解释了耳机任务：dy 至今没有一条 `source_keyword=耳机` 的行（只有模型自选的 `headphones`），因为首次预取就被子串假命中挡掉了 → **2026-10-14 改为 `op=search` 只认采集词、查不到即为空**，由适配器排队一次真实采集补上；其余算子（详情/评论/creator 的入参是 id）仍走字段子串匹配（§8.5） |
@@ -1535,7 +1545,7 @@ node --import tsx --test tests/*.test.ts
 
 | 测试文件 | 用例 | 行数 | 守住什么 |
 |---|---:|---:|---|
-| `brand-self.test.ts` | 10 | 385 | 品牌自诊在"无授权数据"时必须如实写「无数据」，而不是编数字；**未指定自有品牌（`ownBrandId`）时整份报告不做自诊、且不得出现「我方/本品」字样**（R14：任何槽位出现违禁词都要判错，且机械修复后仍要过校验） |
+| `brand-self.test.ts` | 12 | 385 | 品牌自诊在"无授权数据"时必须如实写「无数据」，而不是编数字；**未指定自有品牌（`ownBrandId`）时整份报告不做自诊、且不得出现「我方/本品」字样**（R14：任何槽位出现违禁词都要判错，且机械修复后仍要过校验） |
 | `brief-llm-fill.test.ts` | 6 | 151 | 规则抽取结果的权威性：模型只能补空字段，不能改预算/时间窗 |
 | `brief-parse.test.ts` | 12 | 167 | 自然语言解析（规则段）纯函数、中英混合输入；**category 会被逐字当平台搜索词，必须是中文** |
 | `collector.test.ts` | 45 | 1320 | sidecar 归一化、落盘目录契约、快照取新增行、ID 闭环、常驻浏览器端口与回收 |
@@ -1552,7 +1562,7 @@ node --import tsx --test tests/*.test.ts
 | `tool-call-guard.test.ts` | 5 | 67 | 工具调用风暴闸门（真机曾出现同一工具连续被调 131 次） |
 | `web-console.test.ts` | 5 | 214 | 前端托管契约（含路径穿越守卫） |
 | `web-search.test.ts` | 10 | 313 | 唯一外部计费源（打桩 fetch） |
-| **合计** | **227** | **≈7121** | 17 个文件 |
+| **合计** | **229** | **≈7300** | 17 个文件 |
 
 ## 附录 C · 环境变量
 

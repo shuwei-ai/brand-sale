@@ -902,6 +902,21 @@ export class AgentPack {
             query: `${brief.industry} ${brief.category} 市场趋势 竞品动态 ${brief.window.to.slice(0, 4)}`,
             count: this.deps.config.webSearch.defaultCount,
           });
+          /* 品牌级检索（一次一品牌，落在 brief 声明的竞品上）。
+           *
+           * 旧实现只有上面那条行业级 query，于是 CI 的素材里**没有任何一家竞品的
+           * 定位 / 价格带 / 主张** —— Pi 循环失败掉进兜底时，竞品表只能整列写
+           * 「待核验（本轮无竞品情报来源）」；业主的反馈很直接：'没有核验数据给到我
+           * 没有意义，你需要去从社交平台上或者联网去分析'。
+           * 这里按品牌逐个检索（key 带 brand 后缀，synthIntel 兜底与提示词都能按
+           * 品牌取回），命中标题逐字进报告并标「公开报道口径，未经核验」——
+           * 引用而不是编造。成本：volc_web_search 按次计费，N 品牌 = N+1 次。 */
+          for (const brand of (brief.brandIds ?? []).map((b) => b.trim()).filter(Boolean).slice(0, 8)) {
+            await run(`web_search_brand_${brand}`, "web_search", {
+              query: `${brand} ${brief.category} 价格 定位 卖点 评测`,
+              count: this.deps.config.webSearch.defaultCount,
+            });
+          }
         }
         /* 平台内公开内容预采集（可选能力）。**为什么必须在这里预取、而不能等 CI 现调**：
          *   平台采集是分钟级的（起 Playwright 子进程），首次调用只会返回 0 条并在后台排队，
@@ -1421,13 +1436,16 @@ ${describeDepthPolicy(policy)}`;
     }
 
     const schema = SCHEMA_BY_PHASE[phase];
-    try {
-      const parsed = JSON.parse(extractJsonObject(text));
-      const value = schema.validate(parsed);
+    const parseAttempt = (t: string): unknown => schema.validate(JSON.parse(extractJsonObject(t)));
+    const finish = (
+      value: unknown,
+      finalText: string,
+      note: string,
+    ): { ok: true; value: unknown; strategy: "pi-agent"; usage: TokenUsage; cost: Money; note: string } => {
       // Pi 路径的用量与成本由 M14 记账（此处仅估）
       const usage: TokenUsage = {
         inputTokens: Math.ceil(prompt.length / 1.5) + Math.ceil(SYSTEM_PROMPTS[agentCode].length / 1.5),
-        outputTokens: Math.ceil(text.length / 1.5),
+        outputTokens: Math.ceil(finalText.length / 1.5),
         cachedInputTokens: 0,
         calls: 1,
       };
@@ -1440,18 +1458,55 @@ ${describeDepthPolicy(policy)}`;
         tokens: usage,
         cost: { currency: "CNY", amount: 0 },
       });
-      return { ok: true, value, strategy: "pi-agent", usage, cost: noCost, note: "Pi Agent 循环产出" };
-    } catch (e) {
-      // 注意：走到这里说明流式请求本身成功了（有文本产出），失败在解析/校验层，
-      // 不应给熔断器记一笔端点失败 —— 所以这里不调用 noteLlmFailure
-      return {
-        ok: false,
-        strategy: "pi-agent",
-        code: "E-AGENT-001",
-        errors: [e instanceof Error ? e.message : String(e)],
-        usage: zero,
-        cost: noCost,
-      };
+      return { ok: true, value, strategy: "pi-agent" as const, usage, cost: noCost, note };
+    };
+
+    try {
+      const value = parseAttempt(text);
+      return finish(value, text, "Pi Agent 循环产出");
+    } catch (firstError) {
+      /* 追问重试：Pi 循环实测最常见的两种失败形态——
+       * ① 模型只回自然语言前言（"我先取回报告骨架，并…"），一个 JSON 都没吐；
+       * ② 输出了 JSON 但字段是空壳（大 schema 一次填不完）。
+       * 共同点：流式请求本身成功、工具数据已经拿到，差的只是一次「收口」。
+       * 此时向循环里追加一条追问（附上具体失败原因），再等 idle、重解析一次。
+       * 一轮往返的成本，换回整个阶段的模型路径 —— 电脑任务四个阶段 Pi 全灭、
+       * 报告降级到确定性合成，就是没有这一步。追问仍失败才降级。 */
+      const firstMsg = firstError instanceof Error ? firstError.message : String(firstError);
+      try {
+        const followUpBudget = this.deps.config.llm.timeoutMs + 10_000;
+        // 追问解析只看追问**之后**的增量文本：第一轮那个能 JSON.parse 但过不了
+        // schema 的空壳对象，在拼接文本里仍是第一个平衡块，会把新答案挡在后面
+        const deltasBefore = deltas.length;
+        await Promise.race([
+          (async () => {
+            await agent.prompt(
+              `你上一次的输出未能通过校验：${firstMsg.slice(0, 300)}。\n` +
+                `现在只输出一个完整的 ${schema.name} JSON 对象：不要 markdown 代码块、不要解释文字；` +
+                `所有字段都要填，确实没有数据的字段写 null，不要省略。`,
+            );
+            await agent.waitForIdle();
+          })(),
+          new Promise<never>((_, reject) => {
+            const t = setTimeout(() => reject(new Error(`追问超过 ${followUpBudget}ms 未结束`)), followUpBudget);
+            t.unref?.();
+          }),
+        ]);
+        const text2 = deltas.slice(deltasBefore).join("") || this.lastAssistantText(agent);
+        const value2 = parseAttempt(text2);
+        return finish(value2, text2, "Pi Agent 循环产出（追问一次后）");
+      } catch {
+        // 注意：走到这里说明流式请求本身成功了（有文本产出），失败在解析/校验层，
+        // 不应给熔断器记一笔端点失败 —— 所以这里不调用 noteLlmFailure
+        return {
+          ok: false,
+          strategy: "pi-agent",
+          code: "E-AGENT-001",
+          errors: [firstMsg],
+          usage: zero,
+          cost: noCost,
+        };
+      }
     }
   }
 
