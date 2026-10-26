@@ -14,7 +14,7 @@
  *   GET  /tasks            任务列表（含 state=queued 的排队任务）
  *   GET  /tasks/:id        单任务状态（含子进程日志路径）
  *   GET  /tasks/:id/log    该任务的子进程完整日志（尾部 20KB，排障用）
- *   POST /query            {platform, op?, kind?, keyword?, limit?} → 读本地缓存
+ *   POST /query            {platform, op?, kind?, keyword?, limit?, authorIds?} → 读本地缓存
  *   GET  /stats            各平台缓存条数
  *   GET  /env-check        内核自检（跑 run.py --help，验证依赖是否齐）
  */
@@ -33,6 +33,62 @@ export interface ServerDeps {
   config: CollectorConfig;
   store: CollectStore;
   tasks: TaskManager;
+}
+
+/** 缓存行里我们关心的最小形状：只做 authorId / id 的关联 */
+interface AuthorKeyed {
+  authorId?: string;
+  id?: string;
+}
+
+/**
+ * 从**全量**主页资料行里挑出本批要用的那些（纯函数，便于单测）。
+ *
+ * 两种模式，区别只在一件事：要不要"这位作者出现在本批 rows 里"这个前提。
+ *   · 未点名（默认）—— 只取本批内容行的作者。适合工具调用那一刻的"随搜随附"。
+ *   · 点名（`authorIds` 非空）—— 取名册里的人，**不要求**出现在本批 rows 里。
+ *     2026-10-20 加它是因为默认模式有个盲区：rows 被 `limit` 截到前 N 条，
+ *     而报告阶段要的是**整份任务**的人选，问到的多半不在前 N 条里。
+ *     真机：5 位人选的资料行 06:45:09 已落库，report 阶段 06:45:37 才开始，
+ *     却因为"不在本批前 20 条"而全部显示「未采集」。
+ */
+export function matchCreatorRows<T extends AuthorKeyed>(
+  all: readonly T[],
+  rows: readonly AuthorKeyed[],
+  authorIds: readonly string[],
+): T[] {
+  if (authorIds.length > 0) {
+    const want = new Set(authorIds);
+    return all.filter((c) => {
+      const key = c.authorId || c.id || "";
+      return key !== "" && want.has(key);
+    });
+  }
+  const batch = new Set(rows.map((r) => r.authorId || "").filter(Boolean));
+  if (batch.size === 0) return [];
+  return all.filter((c) => {
+    const key = c.authorId || c.id || "";
+    return key !== "" && batch.has(key);
+  });
+}
+
+/**
+ * 从缓存行的 `raw` 里取**平台原始 UID**（不是归一化哈希）。
+ *
+ * 顺序有讲究：`user_id` 最先 —— 抖音它是短数字 id（站内可搜），小红书是 24 位主页 id；
+ * B站只在 `mid` 里；`sec_uid` 放最后（抖音的长串，能用但可读性最差）。
+ * 取不到就返回空串：报告侧会退回主页链接，**不编一个**。
+ */
+function uidOf(row: unknown): string {
+  const raw = (row as { raw?: unknown } | null)?.raw;
+  if (!raw || typeof raw !== "object") return "";
+  const r = raw as Record<string, unknown>;
+  for (const k of ["user_id", "mid", "uid", "sec_uid"]) {
+    const v = r[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+    if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  }
+  return "";
 }
 
 const json = (res: ServerResponse, status: number, body: unknown): void => {
@@ -198,15 +254,22 @@ export function createCollectorServer(deps: ServerDeps) {
            * （见 tasks.ts:enqueueAuthorProfiles），这里按 `authorId`（= 内核的
            * creator_hash，内容行与资料行都带）把它们接到本批内容上。
            * 拼不上（该作者还没补采 / 补采失败 / 平台不给）就不出现 —— 绝不填 0 冒充。
-           */
+           *
+           * `authorIds` 是**点名要**（2026-10-20 新增）：默认行为「只拼本批 rows 的作者」
+           * 有个致命盲区 —— rows 被 `limit` 截到前 N 条，而报告阶段是拿**整份任务**的
+           * 人选来要数据的，问到的多半不在前 N 条里。真机：5 位人选的资料行 06:45:09 落库，
+           * report 阶段 06:45:37 才开始，比数据晚 9 秒仍是「未采集」。
+           * 传了 authorIds 就按名册取，不再要求该账号出现在本批 rows 里。 */
+          const authorIds = Array.isArray(body.authorIds)
+            ? (body.authorIds as unknown[]).map((x) => String(x ?? "").trim()).filter(Boolean)
+            : [];
           const creators =
             op === "search"
-              ? (await store.query(body.platform, { op: "creator", kind: "creator" })).rows
-                  .filter((c) => {
-                    const key = c.authorId || c.id;
-                    return Boolean(key) && out.rows.some((r) => (r.authorId || "") === key);
-                  })
-                  .map((c) => ({ ...c, rowType: "creator" }))
+              ? matchCreatorRows(
+                  (await store.query(body.platform, { op: "creator", kind: "creator" })).rows,
+                  out.rows,
+                  authorIds,
+                ).map((c) => ({ ...c, ...(uidOf(c) ? { uid: uidOf(c) } : {}), rowType: "creator" }))
               : [];
           return json(res, 200, {
             platform: body.platform,

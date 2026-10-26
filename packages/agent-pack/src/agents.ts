@@ -13,6 +13,7 @@ import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
   DEFAULT_DEPTH_POLICY,
   POPULAR_PLATFORMS,
+  autoRepair,
   describeDepthPolicy,
   measureReportDepth,
   validateReportDsl,
@@ -29,6 +30,7 @@ import {
   type ReportDsl,
   type ReportDepthPolicy,
   type SourceCatalog,
+  type SlideSpec,
   type TenantContext,
   type TokenUsage,
 } from "@brandsale/contracts";
@@ -55,6 +57,7 @@ import {
   CreatorCandidatesSchema,
   PlaybookSchema,
   ReportDslSchema,
+  ReportPagePatchSchema,
   type BudgetOutput,
   type CreatorOutput,
   type IntelOutput,
@@ -255,6 +258,26 @@ export function needsPlatformRefresh(entries: readonly EvidenceEntry[]): boolean
   return accounts.length === 0 || accounts.some((a) => a.followers === null);
 }
 
+/**
+ * 哪个阶段值得做一次平台补读（纯函数，便于单测）。
+ *
+ * `report` 是 2026-10-20 补进来的（真机 `job_0mvgany95k7poz73mks`）：作者主页资料行由搜索
+ * 完成后派生、排在采集队列尾，实测比 creator 阶段结束**晚 9 分钟**落库；而 report 阶段
+ * （06:45:37 起，跑了 12 分钟）本来有一次终稿前补读的机会，却被阶段白名单挡在门外 ——
+ * 数据躺在缓存里，报告里 5 位人选照样写着「未采集」。
+ *
+ * 但它不适合无条件跑，所以 report 阶段多两道闸：
+ *   · 台账里**一条平台内容都没有**（采集没开 / 没命中）→ 补也补不出东西，白跑一次闸门；
+ *   · 粉丝量**已经齐了**（没有 `followers === null` 的真实账号）→ 没有可补的。
+ * intel / creator 不受这两闸约束：它们本来就在"数据刚到、必须捞一次"的位置上。
+ */
+export function shouldRefreshPlatform(phase: PhaseName, entries: readonly EvidenceEntry[]): boolean {
+  if (phase !== "intel" && phase !== "creator" && phase !== "report") return false;
+  if (phase !== "report") return true;
+  if (!entries.some((e) => e.op !== "creator")) return false;
+  return needsPlatformRefresh(entries);
+}
+
 export interface PhaseResult extends PhaseRunOutput {
   /** 该阶段的台账 id */
   ledgerId?: string;
@@ -436,6 +459,47 @@ export function createToolCallGuard(usableTools: readonly string[]) {
       return { toolCalls, blockedStreak, distinctCalls: callCounts.size };
     },
   };
+}
+
+/**
+ * 把"按页补丁"返回的页对位替换回原 DSL（P1）。
+ *
+ * 三条硬约束，每条都对应一种"补丁把报告弄坏"的形态：
+ *   ① **只替换同名页**：模型返回不存在的 `index` 一律忽略 —— 否则会多出重复页，
+ *      渲染器按 `index` 出目录/页码，页数一漂就整份错位；
+ *   ② **页序与页数不变**：以原 DSL 的页序为准，补丁只做"换内容"。模型没有增删页的权限，
+ *      因为"页不够"属于深度策略问题，该由整份重写解决，不该由补丁悄悄加页；
+ *   ③ **拒绝掏空**：补丁页的块数少于原页一半时视为"这不是修复而是删内容"，保留原页。
+ *      真机踩过——模型被要求"补 sourceRef"时把整页重写成一句"详见附录"。
+ */
+export function mergePatchedPages(
+  base: ReportDsl,
+  patched: SlideSpec[],
+): { dsl: ReportDsl; replaced: number[]; ignored: number[] } {
+  const byIndex = new Map<number, SlideSpec>();
+  const ignored: number[] = [];
+  for (const s of patched) {
+    if (!base.slides.some((b) => b.index === s.index)) {
+      ignored.push(s.index);
+      continue;
+    }
+    byIndex.set(s.index, s);
+  }
+
+  const replaced: number[] = [];
+  const slides = base.slides.map((b) => {
+    const p = byIndex.get(b.index);
+    if (!p) return b;
+    if (p.blocks.length * 2 < b.blocks.length) {
+      ignored.push(b.index);
+      return b;
+    }
+    replaced.push(b.index);
+    // index 以原页为准：模型就算写错也要被钉回原值，否则页序漂移
+    return { ...p, index: b.index };
+  });
+
+  return { dsl: { ...base, slides }, replaced, ignored };
 }
 
 export class AgentPack {
@@ -652,17 +716,24 @@ export class AgentPack {
     degradedKeys: string[],
   ): Promise<void> {
     if (this.deps.gateway.mocked) return; // E2E 全离线
-    if (phase !== "intel" && phase !== "creator") return;
+    /* 允许的阶段见 `shouldRefreshPlatform`：intel / creator / report。
+     * `report` 是 2026-10-20 补进来的 —— 资料行比 creator 阶段晚到，report 是最后机会。
+     * 补读的代价只是一次**本地缓存查询**（同参数采集会被侧车去重），不重新投递采集。 */
+    if (!shouldRefreshPlatform(phase, this.evidence.list(tc.jobId))) return;
     if (!mediaCrawlerReady(this.deps.config)) return;
     if (!this.registry.get(PLATFORM_DIGEST_TOOL_NAME)) return;
     const args = platformPrefetchArgs(input.job.spec.brief, this.deps.config);
     if (!args) return;
+    /* report 阶段**点名**要这些作者的资料行。
+     * 默认路径只拼「本批 rows 的作者」，而 rows 被 limit 截到前 20 条 —— 报告人选是跨批次
+     * 聚合出来的，问到的多半不在前 20 条里，于是补了也补不上（见 collector server.ts:186）。 */
+    const authorIds = phase === "report" ? this.knownAuthorIds(tc.jobId) : [];
 
     const before = this.evidence.list(tc.jobId).length;
     try {
       const res = await this.registry.invoke(
         PLATFORM_DIGEST_TOOL_NAME,
-        { ...args, tenantId: tc.ctx.tenantId },
+        { ...args, tenantId: tc.ctx.tenantId, ...(authorIds.length > 0 ? { authorIds } : {}) },
         PHASE_AGENT[phase],
         // systemCall：不计入模型的单任务调用上限。实测模型能在 2 分钟内把 8 次额度烧光
         // （每次都是空结果、却各触发一批后台采集），不豁免的话这次补取会被上限挡下，
@@ -694,6 +765,24 @@ export class AgentPack {
       degradedKeys.push(`${PLATFORM_DIGEST_TOOL_NAME}(补取): ${msg}`);
       console.warn(`[agent-pack] ${phase} 补取平台数据失败：${msg}`);
     }
+  }
+
+  /**
+   * 台账里出现过的账号哈希（去重 + 限量）。
+   *
+   * 只用于 report 阶段"点名要资料行"：内容行与资料行都带同一个 `authorId`（内核的
+   * creator_hash），把它传给 `/query` 就能精确取回这批人的主页公开统计，
+   * 不受"本批 rows 被 limit 截断"的影响。不含资料行自身的 authorId（那是同一批人）。
+   * 上限 200 是防参数体积失控 —— 一次补采最多也就几十个作者。
+   */
+  private knownAuthorIds(jobId: string): string[] {
+    const ids = new Set<string>();
+    for (const e of this.evidence.list(jobId)) {
+      if (e.op === "creator") continue;
+      if (e.authorId) ids.add(e.authorId);
+      if (ids.size >= 200) break;
+    }
+    return [...ids];
   }
 
   /**
@@ -1211,18 +1300,183 @@ export class AgentPack {
     const catalog = this.sourceCatalog(tc.ctx, tc.jobId);
     const hasOwnBrand = Boolean((ownBrandId ?? "").trim());
     const enriched = this.enrichProvenance(tc, value, catalog, creators);
-    const first = validateReportDsl(enriched, { catalog, minTraceableRatio: policy.minTraceableRatio, hasOwnBrand });
-    // 只有「不可机械修复」的 error 才值得回喂；可修复项交给渲染期 autoRepair 降级处理
-    const blocking = first.issues.filter((i) => i.level === "error" && !i.repairable);
-    const depth = measureReportDepth(enriched, policy);
+    /**
+     * **P0 自愈（2026-10-17）**：自校验前先走一遍 `autoRepair`，再对**修后 DSL**判阻塞。
+     *
+     * 历史问题：旧顺序（先校验→只把非 repairable 的回喂→渲染期再 autoRepair）让一类事故反复发生：
+     *   · 真机 job_0mv9k0wvg8vvpwmqd9y 的 slides[9] matrix 漏 `sourceRef` + 同页一条误置的
+     *     `phase:budget` 引用 —— 渲染期 `autoRepair` 能确定性地把那条引用回挂到 matrix（归观感级），
+     *     但生成期 R6 没有 `repairable` 标记 → 判阻塞 → 整份回喂（40k token / 23.5 分）→
+     *     模型重写后同一块依旧漏 `sourceRef`，最后还是 partial；
+     *   · R3「引用指向未声明的来源」也会被回喂重写（其实 `isMisplacedLogicalRef` 一秒钟能改挂完）。
+     *
+     * 改后：能用 100% 确定性函数修的事，先修；修完判**真**阻塞再回喂。三天出了三次的 ① 类问题
+     * 整体消失，回喂成本自然降下来。**autoRepair 必须保持确定性**（无模型参与）—— 它本就是
+     * pure function，搬到生成期不动语义。
+     */
+    const firstRepair = autoRepair(enriched, { catalog, hasOwnBrand });
 
-    if (blocking.length === 0 && depth.gaps.length === 0) return { value: enriched };
+    /**
+     * ── 修复回路：P0 自愈（确定性） + P1 按页补丁（模型） ────────────────────────
+     *
+     * 分成两步而不是一步，是因为它们的**代价与风险完全不同**：
+     *   · `autoRepair` 是纯函数：同输入同输出、可离线复放，改的是引用位置与标签，不动事实。
+     *     凡是它修得掉的，一条都不该送去模型（真机为一条 R6 白烧过 23 分钟 / 4 万 token）。
+     *   · 剩下的才是**模型才能改的内容问题**（数字缺来源、口径违规、页太空）。这部分过去是
+     *     "整份重写"，代价是输出 4 万 token、10–20 分钟，而且会**顺手改坏别的页**
+     *     （真机 job_0mv9k0wvg8vvpwmqd9y：为修 slides[9] 重写整份，同一块依旧漏 sourceRef）。
+     *
+     * P1 把第二步换成"只重写出问题的那几页"，按 `index` 对位替换回原 DSL（见 `mergePatchedPages`）：
+     * 没被点名的页**物理上不可能被改坏**，输出量降到 1/20。
+     */
+    const audit = (v: ReportDsl) => {
+      const issues = validateReportDsl(v, {
+        catalog,
+        minTraceableRatio: policy.minTraceableRatio,
+        hasOwnBrand,
+      }).issues;
+      return {
+        // 只有「不可机械修复」的 error 才值得回喂；可修复项已被 autoRepair 收拾掉了
+        blocking: issues.filter((i) => i.level === "error" && !i.repairable),
+        depth: measureReportDepth(v, policy),
+      };
+    };
+    type Audit = ReturnType<typeof audit>;
 
-    const problems = [
-      ...blocking.map((i) => `- ${i.path}: ${i.message}`),
-      ...depth.gaps.map((g) => `- 深度未达标：${g}`),
-    ];
-    const repairPrompt = `${prompt}
+    /** 进度度量：一个阻塞项记 100，一个深度缺口记 1 —— 阻塞项少一条就是真的在变好 */
+    const scoreOf = (s: Audit): number => s.blocking.length * 100 + s.depth.gaps.length;
+
+    /**
+     * 问题归页：`slides[9].blocks[0]` → 9。
+     * `sourceDeclaration.*` 与无页号的 `slides` 返回 undefined —— 那是**全局问题**，
+     * 补丁模式治不了（只换页内容，不动来源声明与页数），必须走整份重写。
+     */
+    const pageOf = (path: string): number | undefined => {
+      const m = /^slides\[(\d+)\]/.exec(path);
+      return m ? Number(m[1]) : undefined;
+    };
+
+    const markDegraded = (dsl: ReportDsl, reason: string, missing: string[]): ReportDsl => ({
+      ...dsl,
+      meta: { ...dsl.meta, degraded: { reason, missingSections: missing } },
+    });
+
+    let current = firstRepair.dsl;
+    let cosmeticTotal = firstRepair.cosmeticActions.length;
+    let state = audit(current);
+    let patchRounds = 0;
+    let fullRounds = 0;
+    let abortCode: string | undefined;
+    /** 本轮之后强制走整份重写（补丁没被模型接受时的退路，见下面 E-AGENT-001 处） */
+    let forceFull = false;
+
+    /**
+     * 上限 2 轮。这不是"省钱"，是**防止打转**：模型在同一处反复改不好时，
+     * 每多一轮就多烧一次整份输出，而问题数不再下降。
+     */
+    const MAX_REPAIR_ROUNDS = 2;
+    /** 补丁模式的页数上限：超过就退回整份 —— 3 页以上的补丁提示词本身也不便宜了 */
+    const MAX_PATCH_PAGES = 3;
+
+    for (let round = 0; round < MAX_REPAIR_ROUNDS; round++) {
+      if (state.blocking.length === 0 && state.depth.gaps.length === 0) break;
+
+      const before = scoreOf(state);
+      const targetPages = [...new Set(state.blocking.map((i) => pageOf(i.path)).filter((n): n is number => n !== undefined))].sort(
+        (a, b) => a - b,
+      );
+      const globalBlocking = state.blocking.filter((i) => pageOf(i.path) === undefined);
+
+      const usePatch =
+        !forceFull && globalBlocking.length === 0 && targetPages.length > 0 && targetPages.length <= MAX_PATCH_PAGES;
+
+      let candidate: ReportDsl;
+
+      if (usePatch) {
+        type PageSlide = ReportDsl["slides"][number];
+        const originals = targetPages
+          .map((i) => current.slides.find((s) => s.index === i))
+          .filter((s): s is PageSlide => Boolean(s));
+        const perPageProblems = originals.map((s) => {
+          const own = state.blocking.filter((i) => pageOf(i.path) === s.index);
+          const lines = own.map((i) => (i.fix ? `  · ${i.path}: ${i.message}\n    → 改法：${i.fix}` : `  · ${i.path}: ${i.message}`));
+          return `- slides[${s.index}]「${s.title}」\n${lines.join("\n")}`;
+        });
+
+        /* 补丁提示词必须带上**原页全文**：不给我们原稿，模型只能凭上下文重写，
+         * 那就退化成"整份重写的局部版"，内容会漂。 */
+        const patchPrompt = `${prompt}
+
+【本轮不重写整份报告，只重写下面这几页】
+上一次输出的其余页面已经通过校验。**不要输出它们，也不要改动页序与页数。**
+
+--- 需要重写的页（原稿，请在这些内容的基础上修改，而不是另起炉灶）---
+${JSON.stringify(originals, null, 2)}
+
+--- 这些页存在的问题 ---
+${perPageProblems.join("\n")}
+${
+  state.depth.gaps.length > 0
+    ? `\n--- 全报告深度约束（改这几页时顺带补上能做到的部分）---\n${state.depth.gaps.map((g) => `- ${g}`).join("\n")}`
+    : ""
+}
+
+【输出要求】
+- 只输出上面列出的页，外层形如 {"slides":[ ... ]}；每页 index 必须与原稿完全一致；
+- **blocks 是整页替换**：原稿里没被点名的块要原样保留，不要删、不要精简、不要合并；
+- 含数字的块必须给 sourceRef（phase:* / meta:* / tool:* 形式）；不要把逻辑引用写进 citations；
+- 不要去"顺便优化"没被点名的地方 —— 改动越少，越不会修好一处弄坏另一处。
+
+${describeDepthPolicy(policy)}`;
+
+        const patched = await this.deps.gateway.completeJson({
+          tier: TIER_BY_PHASE.report,
+          system: SYSTEM_PROMPTS.RG,
+          prompt: patchPrompt,
+          maxTokens: this.maxTokensFor("report"),
+          schemaName: ReportPagePatchSchema.name,
+          parse: (raw) => ReportPagePatchSchema.validate(JSON.parse(raw)),
+          jobId: tc.jobId,
+          phase: "report",
+          attempt: tc.attempt,
+          callId: `patch_${tc.jobId}_report_r${round + 1}`,
+          signal: tc.signal,
+          onDelta: pump ? (d: StreamDelta) => pump.push(d.delta) : undefined,
+        });
+        if (!patched.ok) {
+          abortCode = patched.code;
+          /**
+           * 补丁调用失败 ≠ 放弃修复。
+           *
+           * `E-AGENT-001` 是"模型始终没按补丁 schema 输出"——最常见的原因是它又把整份报告
+           * 写出来了（`ReportDslSchema`）而不是 `{slides:[...]}`。这条路模型是熟的，退回整份
+           * 重写仍有机会修好；`E-AGENT-002` 是传输/超时，再试一次只是再等十分钟，不划算。
+           */
+          if (patched.code === "E-AGENT-001" && round + 1 < MAX_REPAIR_ROUNDS) {
+            forceFull = true;
+            continue;
+          }
+          break;
+        }
+
+        const merged = mergePatchedPages(current, patched.value.slides);
+        if (merged.replaced.length === 0) {
+          // 页号全对不上（或全被掏空保护拒掉）：同样按"没接受补丁约定"处理
+          abortCode = "E-REPAIR-PATCH-NOINDEX";
+          if (round + 1 < MAX_REPAIR_ROUNDS) {
+            forceFull = true;
+            continue;
+          }
+          break;
+        }
+        candidate = merged.dsl;
+        patchRounds++;
+      } else {
+        const problems = [
+          ...state.blocking.map((i) => (i.fix ? `- ${i.path}: ${i.message}\n  → 改法：${i.fix}` : `- ${i.path}: ${i.message}`)),
+          ...state.depth.gaps.map((g) => `- 深度未达标：${g}`),
+        ];
+        const repairPrompt = `${prompt}
 
 【上一次输出被拒绝，必须逐条修正后重新输出完整 JSON】
 ${problems.join("\n")}
@@ -1230,49 +1484,83 @@ ${problems.join("\n")}
 【颗粒度下限 · 违反即需要重做】
 ${describeDepthPolicy(policy)}`;
 
-    const repaired = await this.deps.gateway.completeJson({
-      tier: TIER_BY_PHASE.report,
-      system: SYSTEM_PROMPTS.RG,
-      prompt: repairPrompt,
-      maxTokens: this.maxTokensFor("report"),
-      schemaName: ReportDslSchema.name,
-      parse: (raw) => ReportDslSchema.validate(JSON.parse(raw)),
-      jobId: tc.jobId,
-      phase: "report",
-      attempt: tc.attempt,
-      callId: `repair_${tc.jobId}_report`,
-      signal: tc.signal,
-      // 回喂修复是**又一次整份报告生成**（report 阶段最慢的一段），同样要有流式回显
-      onDelta: pump ? (d: StreamDelta) => pump.push(d.delta) : undefined,
-    });
-
-    const markDegraded = (dsl: ReportDsl, reason: string, missing: string[]): ReportDsl => ({
-      ...dsl,
-      meta: { ...dsl.meta, degraded: { reason, missingSections: missing } },
-    });
-
-    if (repaired.ok) {
-      // 回喂得到的是一份**全新的**模型输出：机械补齐必须再走一遍，否则修好的报告反而丢了溯源
-      const v2 = this.enrichProvenance(tc, repaired.value as ReportDsl, catalog, creators);
-      const stillBlocking = validateReportDsl(v2, { catalog, minTraceableRatio: policy.minTraceableRatio, hasOwnBrand }).issues.filter(
-        (i) => i.level === "error" && !i.repairable,
-      );
-      const depth2 = measureReportDepth(v2, policy);
-      if (stillBlocking.length === 0 && depth2.gaps.length === 0) {
-        return { value: v2, note: `按问题清单回喂修复 1 次后通过（原问题 ${problems.length} 项）` };
+        const repaired = await this.deps.gateway.completeJson({
+          tier: TIER_BY_PHASE.report,
+          system: SYSTEM_PROMPTS.RG,
+          prompt: repairPrompt,
+          maxTokens: this.maxTokensFor("report"),
+          schemaName: ReportDslSchema.name,
+          parse: (raw) => ReportDslSchema.validate(JSON.parse(raw)),
+          jobId: tc.jobId,
+          phase: "report",
+          attempt: tc.attempt,
+          callId: `repair_${tc.jobId}_report_r${round + 1}`,
+          signal: tc.signal,
+          // 回喂修复是又一次报告生成（report 阶段最慢的一段），同样要有流式回显
+          onDelta: pump ? (d: StreamDelta) => pump.push(d.delta) : undefined,
+        });
+        if (!repaired.ok) {
+          abortCode = repaired.code;
+          break;
+        }
+        candidate = repaired.value as ReportDsl;
+        fullRounds++;
       }
-      const missing = [...stillBlocking.map((i) => i.message), ...depth2.gaps];
-      degradedKeys.push(`报告未达深度/校验下限（已回喂 1 次）：${missing.slice(0, 3).join("；")}`);
+
+      // 与首次完全同一条管线：补溯源 → 机械修 → 复核。补丁页也要走，否则它拿不到平台溯源
+      const v = this.enrichProvenance(tc, candidate, catalog, creators);
+      const r = autoRepair(v, { catalog, hasOwnBrand });
+      cosmeticTotal += r.cosmeticActions.length;
+      const next = audit(r.dsl);
+
+      /**
+       * 进度度量：问题数必须**严格下降**才采纳。
+       *
+       * 不下降意味着这一轮白跑 —— 模型没修好，或者把 A 修好了却弄坏了 B。
+       * 直接采纳会把"改好这页弄坏那页"写进最终报告，比不修更糟（这正是整份重写的老毛病）。
+       */
+      if (scoreOf(next) >= before) {
+        // 保留首个中断原因（补丁没被接受 / 调用失败），它比"没有进展"更有诊断价值
+        abortCode ??= "E-REPAIR-NO-PROGRESS";
+        break;
+      }
+      current = r.dsl;
+      state = next;
+    }
+
+    if (state.blocking.length === 0 && state.depth.gaps.length === 0) {
+      const bits: string[] = [];
+      if (patchRounds > 0) bits.push(`按页补丁 ${patchRounds} 轮`);
+      if (fullRounds > 0) bits.push(`整份回喂 ${fullRounds} 次`);
+      const how = bits.length > 0 ? bits.join(" + ") : "免回喂";
       return {
-        value: markDegraded(v2, `报告仍有 ${missing.length} 项未达标（已回喂 1 次，如实标注）`, missing),
-        note: `回喂 1 次后仍有 ${missing.length} 项未达标，已落 meta.degraded 并标 partial`,
+        value: current,
+        note: cosmeticTotal > 0 ? `${how}后通过（机械共修 ${cosmeticTotal} 处观感项）` : `${how}后通过`,
       };
     }
 
-    degradedKeys.push(`报告未达深度/校验下限，且回喂修复调用失败（${repaired.code}）`);
+    /**
+     * **未通过：接受当前版本 + 如实标注**，绝不回退到"未修复的原稿"。
+     *
+     * 旧实现（P0 之前）在回喂失败时返回 `enriched`（未经 autoRepair 的原稿），若原稿含非
+     * repairable error，渲染期 `compile()` 会再次校验 → 抛「拒绝渲染」→ 报告**整份丢失**
+     * （真机 job_0mv7sfn3kh7q2k0h80l）。降级上报永远比丢报告可取。
+     */
+    const missing = [...state.blocking.map((i) => i.message), ...state.depth.gaps];
+    const rounds = patchRounds + fullRounds;
+    const tried =
+      rounds === 0
+        ? "未成功回喂"
+        : fullRounds === 0
+          ? `按页补丁 ${patchRounds} 轮`
+          : patchRounds === 0
+            ? `整份回喂 ${fullRounds} 次`
+            : `按页补丁 ${patchRounds} 轮 + 整份回喂 ${fullRounds} 次`;
+    const why = abortCode ? `，中断于 ${abortCode}` : "";
+    degradedKeys.push(`报告未达深度/校验下限（${tried}）：${missing.slice(0, 3).join("；")}${why}`);
     return {
-      value: markDegraded(enriched, `报告未达深度下限且回喂修复失败（${repaired.code}）`, depth.gaps),
-      note: `回喂修复失败（${repaired.code}），保留原始输出并如实标注降级`,
+      value: markDegraded(current, `报告仍有 ${missing.length} 项未达标（${tried}${why}，如实标注）`, missing),
+      note: `${tried}后仍有 ${missing.length} 项未达标，已落 meta.degraded 并标 partial`,
     };
   }
 

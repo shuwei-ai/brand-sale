@@ -136,3 +136,46 @@ test("引用校验：缺 kind / kind 与 ref 不自洽 / 推断标非 low 都必
   inferredNotLow.slides[0]!.citations = [{ claim: "c", kind: "model_inference", ref: {}, grade: "L3", confidence: 0.9, tier: "high", verifiedBy: "auto" }] as never;
   assert.throws(() => ReportDslSchema.validate(inferredNotLow), /tier=low/, "模型推断必须标 low");
 });
+
+test("块级溯源：**十种块型都必须能把 sourceRef 原样带出来**（matrix 曾整类丢失）", () => {
+  /**
+   * 真机事故链（2026-10-18 查明）：`validateBlock` 的 matrix 分支没带 `...sref`，
+   * 模型写进 matrix 的 `sourceRef` 在**校验层被静默吞掉** →
+   * R6 判「含数字的块无来源」→ 生成期阻塞 → 回喂 → 模型再写一次 → 又被吞掉。
+   * 这就是 job_0mv9k0wvg8vvpwmqd9y 白烧 23 分钟 / 4 万 token 的真正原因：
+   * 不是模型学不会，是**它写的东西被我们自己丢了**。
+   *
+   * 契约（`Block` 类型）里 matrix 早就有 `sourceRef?`，漏的是 schema 这一层。
+   * 这条用例逐个块型验证"写进去 → 读出来还在"，任何一层吞字段都会红。
+   */
+  const withRef: Block[] = [
+    { type: "text", style: "body", content: "市场规模增长 12%", sourceRef: "phase:intel" },
+    { type: "bullets", items: ["声量份额 31%"], sourceRef: "phase:intel" },
+    { type: "kpi", items: [{ label: "GMV", value: "1,234", unit: "万元", sourceRef: "phase:budget" }], sourceRef: "phase:budget" },
+    { type: "table", columns: ["渠道", "金额"], rows: [["抖音", "150 万"]], sourceRef: "phase:budget" },
+    { type: "chart", chartType: "bar", series: [{ name: "预算", points: [{ x: "抖音", y: 150 }] }], sourceRef: "phase:budget" },
+    { type: "matrix", xLabel: "粉丝量", yLabel: "匹配度", cells: [{ x: 128, y: 86, label: "达人A" }], sourceRef: "phase:creator" },
+    { type: "timeline", phases: [{ label: "预热期", from: "2026-05-20", to: "2026-05-31", items: ["预算 20%"] }], sourceRef: "phase:playbook" },
+    { type: "quote", text: "种草占比 45% 时 ROI 最优", sourceRef: "phase:playbook" },
+    { type: "callout", tone: "info", text: "样本量 12 条", sourceRef: "phase:intel" },
+    { type: "image", ref: "https://example.com/a.png", caption: "声量趋势", sourceRef: "phase:intel" },
+  ];
+
+  const parsed = ReportDslSchema.validate({
+    meta: { dslVersion: "1.0", title: "t", brand: { id: "b", name: "b" }, window: { from: "a", to: "b" }, generatedAt: "now" },
+    sourceDeclaration: { grade: "L3", sources: [{ key: "s1", displayName: "s1", grade: "L3", asOf: "now", coverage: "c" }], exclusions: [] },
+    slides: [{ index: 0, pageRole: "data", title: "t", layoutId: "data/x", blocks: withRef, citations: [] }],
+  });
+
+  assert.equal(parsed.slides[0]!.blocks.length, BLOCK_TYPES.length);
+  for (const b of parsed.slides[0]!.blocks) {
+    assert.equal(
+      (b as { sourceRef?: string }).sourceRef,
+      withRef.find((x) => x.type === b.type)!.sourceRef,
+      `块型 ${b.type} 的 sourceRef 被吞了 —— R6 会因此永远判它无来源`,
+    );
+  }
+
+  // 骨架是模型唯一能看到的结构说明：没写 sourceRef，模型就不会给
+  assert.match(ReportDslSchema.skeleton, /"type": "matrix"[\s\S]{0,200}"sourceRef\?": string/, "matrix 的骨架也必须写 sourceRef");
+});

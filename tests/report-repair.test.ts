@@ -245,7 +245,25 @@ test("⑨ R6 与 autoRepair 用同一套「有效引用」判定：逻辑命名�
   const issues = validateReportDsl(input, { catalog: PROD_CATALOG }).issues;
   const r6 = issues.filter((i) => i.path === "slides[0]" && i.message.includes("无来源的数字断言"));
   assert.equal(r6.length, 1, "校验期就要报出来，否则这条错误永远进不了回喂清单（旧实现正是如此）");
-  assert.equal(r6[0]!.repairable, undefined, "R6 依旧不可机械修复（只能回喂/降级，不能静默改写结论）");
+
+  /**
+   * **这里与 ⑨′ 的分界就是"有没有可回挂的逻辑引用"**：autoRepair 会把这条误置引用从
+   * citations 摘出来、回挂到无 sourceRef 的数字块上，所以它**确实**是可机械修复的。
+   *
+   * 生成期若把它当"不可修的阻塞项"，就会白跑一次整份报告回喂 —— 真机
+   * job_0mv9k0wvg8vvpwmqd9y 正是如此（report 阶段 23 分钟、单次 4 万 token），
+   * 而渲染期同一份 DSL 被静默修好、且归观感级：**报告内容一字未变，任务却被标成 partial**。
+   */
+  assert.equal(r6[0]!.repairable, true, "有可回挂的 phase:budget → 渲染期能修掉，生成期不该拦它");
+  assert.match(r6[0]!.fix ?? "", /sourceRef/, "改法必须能直接照做（回喂清单只带 message 等于没带）");
+
+  // 不是嘴上说可修：跑一遍修复，这条 error 必须真的消失、且没动任何数据断言
+  const fixed = autoRepair(input, { catalog: PROD_CATALOG });
+  assert.equal(fixed.actions.length, 0, "回挂 sourceRef 不改写任何数据断言，仍属观感级");
+  assert.equal(
+    validateReportDsl(fixed.dsl, { catalog: PROD_CATALOG }).issues.filter((i) => i.message.includes("无来源的数字断言")).length,
+    0,
+  );
 
   // 换成真实来源 → 不再报
   const ok = dsl([
@@ -256,6 +274,35 @@ test("⑨ R6 与 autoRepair 用同一套「有效引用」判定：逻辑命名�
   assert.equal(
     validateReportDsl(ok, { catalog: PROD_CATALOG }).issues.filter((i) => i.message.includes("无来源的数字断言")).length,
     0,
+  );
+});
+
+test("⑨′ 页面里没有可回挂的逻辑引用时，R6 依旧不可机械修复（绝不能凭空造来源）", () => {
+  /* 情形一：citations 完全为空 —— autoRepair 手里没有任何"模型自己声明的来源"可以回挂。 */
+  const orphan = dsl([
+    slide(0, "content", [], [{ type: "kpi", items: [{ label: "总预算", value: "2000000", unit: "CNY", tier: "high" }] }]),
+  ]);
+  const r6 = validateReportDsl(orphan, { catalog: PROD_CATALOG }).issues.filter((i) => i.message.includes("无来源的数字断言"));
+  assert.equal(r6.length, 1);
+  assert.equal(r6[0]!.repairable, undefined, "只能靠回喂：系统不许给数字块编一个来源");
+
+  /* 情形二：命名空间写法认不出来（不在 logicalRefs 里）—— 那也不是"可回挂的来源"。 */
+  const unknown = dsl([
+    slide(0, "content", [cite({ claim: "预算分配", ref: { sourceKey: "phase:unknown_thing" } })], [
+      { type: "kpi", items: [{ label: "总预算", value: "2000000", unit: "CNY", tier: "high" }] },
+    ]),
+  ]);
+  const r6b = validateReportDsl(unknown, { catalog: PROD_CATALOG }).issues.filter((i) => i.message.includes("无来源的数字断言"));
+  assert.equal(r6b[0]!.repairable, undefined, "认不出的写法回挂不了，仍属「只能回喂」");
+
+  /* 但"移除它"不能以丢掉整份报告为代价：修完之后本页必须还有可用引用、且不报 error。 */
+  const repaired = autoRepair(unknown, { catalog: PROD_CATALOG });
+  assert.equal(repaired.dsl.slides[0]!.citations.length, 1, "本页唯一的引用不能被移除（移除后数字断言就没了来源）");
+  assert.equal(repaired.dsl.slides[0]!.citations[0]!.kind, "model_inference", "退回普通降级：如实标成模型推断");
+  assert.equal(
+    validateReportDsl(repaired.dsl, { catalog: PROD_CATALOG }).issues.filter((i) => i.level === "error").length,
+    0,
+    "autoRepair 不得制造出新的 error —— 否则 render.compile 会拒绝渲染、报告整份丢失",
   );
 });
 
@@ -310,6 +357,9 @@ test("⑪ 块型缺口必须点名「还没用上的可用块型」，否则回�
  * 旧实现把它当"引用了未声明的来源"降级 → 报告里凭空多出一条**「模型推断：所有候选人报价未采集」**，
  * 而且任务被标成 partial——读者看到的是"缺失"，状态说的是"产出不完整"，语义正好相反。
  * 缺失不是数据来源，更不是推断：它在同页 callout 里已经写过一遍了。
+ *
+ * 2026-10-16 修正记账口径：能移除时移除（⑫），不能移除时保留+降级也**只记观感级**（⑯），
+ * ⑬ 介于两者之间，只守"不许移除、不许改挂"这条安全不变量。
  */
 test("⑫ 缺失声明写成引用 → 移除且只记 cosmetic；不得造出「模型推断」条目、不得误挂无关块", () => {
   const input = dsl([
@@ -344,10 +394,16 @@ test("⑫ 缺失声明写成引用 → 移除且只记 cosmetic；不得造出�
   assert.equal(post.issues.filter((i) => i.level === "error").length, 0, "移除动作不得制造新的 error");
 });
 
-test("⑬ R6 保护：缺失声明是本页唯一引用时**不移除**（宁可多一条引用，不可丢报告）", () => {
+test("⑬ R6 保护：缺失声明是本页唯一引用时**不移除、也不许被改挂**（宁可多一条引用，不可丢报告）", () => {
   // 本页有含数字且无 sourceRef 的块，且这条缺失声明是唯一 citation。
   // 若移除，citations 归零 → R6 报一条 repairable:false 的 error → compile 抛错、报告整份丢失
   // （job_0mv5ydf69a7aio1uhfd 的事故形态）。此时保守回退到原来的降级路径。
+  //
+  // ⚠️ 这里刻意用**裸写别名** `pricing`（而不是 `tool:pricing`）：它恰好是上面"误置逻辑引用"
+  // 分支能认出来的 relocatable 形态。若缺失声明不豁免那一步，本页的结果会是
+  // 「引用被摘走 + 改挂到候选人表格上」—— 而表格跟报价毫无关系，正是注释里点名的那种误挂。
+  // 所以本用例守的是**豁免本身**：不管引用写成哪种形态，都不能拿它去挂块。
+  // 记账口径（观感级）另见 ⑯。
   const input = dsl([
     slide(
       0,
@@ -357,12 +413,18 @@ test("⑬ R6 保护：缺失声明是本页唯一引用时**不移除**（宁可
     ),
   ]);
 
-  const { dsl: fixed, actions } = autoRepair(input, { catalog: PROD_CATALOG });
+  const { dsl: fixed, actions, cosmeticActions } = autoRepair(input, { catalog: PROD_CATALOG });
   const page = fixed.slides[0]!;
 
   assert.equal(page.citations.length, 1, "移除会让本页归零并触发不可修复的 R6 error → 必须保留");
   assert.equal(page.citations[0]!.kind, "model_inference", "回退路径就是原来的降级（可见地标成推断）");
-  assert.equal(actions.length, 1, "回退意味着仍按数据级上报——这是刻意的保守取舍");
+  assert.equal(
+    (page.blocks[0] as { sourceRef?: string }).sourceRef,
+    undefined,
+    "不许把「报价未采集」挂成候选人表格的来源——表格与报价无关（真机里的误挂形态）",
+  );
+  assert.equal(actions.length, 0, "报告文本一字未改，不该把完好报告标成「产出不完整」（口径见 ⑯）");
+  assert.equal(cosmeticActions.length, 1);
   assert.equal(validateReportDsl(fixed, { catalog: PROD_CATALOG }).ok, true);
 });
 
@@ -421,4 +483,170 @@ test("⑮ 裸写的逻辑引用与带前缀等价：落回块级 sourceRef，而
   ]);
   const r = autoRepair(bogus, { catalog: PROD_CATALOG });
   assert.equal(r.actions.length, 1, "mc_unknown 不是别名能归一的写法，必须按数据级上报");
+});
+
+/**
+ * ⑯ 被 R6 保护**留下**的缺失声明：降级按观感级记账。
+ *
+ * 真机形状（job_0mv9k0wvg8vvpwmqd9y 2026-10-16 的第二次重跑）：本页唯一一条引用是"缺失声明"
+ * （claim 含「无样本」），而页上有含数字却没有 `sourceRef` 的块 —— 移除它就会在第二次校验里
+ * 多报一条 `repairable: false` 的 error → 报告整份丢失，所以只能保留、退而求其次降级标注。
+ *
+ * 这一步不该把任务标脏：**报告文本一字未改**，变的只是溯源自述（而且变成更诚实的那一种）。
+ * 不这么分级就会出现一个说不通的结果 —— 同一个写作瑕疵（把"无样本"写成 citation、sourceKey
+ * 还用了逻辑命名空间），同页有别的可用引用时算观感级、恰好没有时算数据级，
+ * **任务脏不脏取决于同页的其他槽位**。
+ */
+test("⑯ 被 R6 保护留下的缺失声明：降级记 cosmetic（不脏任务），且引用不许被移除", () => {
+  const input = dsl([
+    slide(
+      0,
+      "data",
+      [cite({ claim: "达人报价库本次查询全量返回无样本", ref: { sourceKey: "tool:pricing" } })],
+      [
+        { type: "table", columns: ["渠道", "预算"], rows: [["抖音", "45 万"]], sourceRef: "phase:budget" },
+        /* matrix 故意不带 sourceRef：这正是"移除缺失声明就会撞 R6"的原因 */
+        { type: "matrix", xLabel: "阶段", yLabel: "渠道", cells: [{ x: 1, y: 1, label: "抖音 P1：45万" }] },
+      ],
+    ),
+  ]);
+
+  const r = autoRepair(input, { catalog: PROD_CATALOG });
+  const page = r.dsl.slides[0]!;
+
+  assert.equal(r.actions.length, 0, "报告文本一字未改，不该被标成「产出不完整」");
+  assert.equal(r.cosmeticActions.filter((a) => a.includes("tool:pricing")).length, 1);
+  assert.equal(page.citations.length, 1, "引用必须保留 —— 移除会让本页数字断言失去来源（报告整份丢失）");
+  assert.equal(page.citations[0]!.kind, "model_inference", "保留下来就如实降级成模型推断");
+  assert.equal(page.citations[0]!.tier, "low");
+  assert.equal(
+    validateReportDsl(r.dsl, { catalog: PROD_CATALOG }).issues.filter((i) => i.level === "error").length,
+    0,
+    "autoRepair 不得制造新的 error",
+  );
+
+  // 反面：同页还有别的可用引用时，缺失声明的正确处置是**移除**，同样归观感级
+  const withOther = dsl([
+    slide(
+      0,
+      "data",
+      [
+        cite({ claim: "达人报价库本次查询全量返回无样本", ref: { sourceKey: "tool:pricing" } }),
+        cite({ claim: "公开采集样本覆盖 3 个平台", ref: { sourceKey: "mc_xhs" } }),
+      ],
+      [{ type: "table", columns: ["渠道", "预算"], rows: [["抖音", "45 万"]], sourceRef: "phase:budget" }],
+    ),
+  ]);
+  const r2 = autoRepair(withOther, { catalog: PROD_CATALOG });
+  assert.equal(r2.dsl.slides[0]!.citations.length, 1, "有别的可用引用撑着，缺失声明直接移除");
+  assert.equal(r2.dsl.slides[0]!.citations[0]!.ref.sourceKey, "mc_xhs");
+  assert.equal(r2.actions.length, 0);
+});
+
+/**
+ * ⑰ ⑱ P0 自愈契约（2026-10-17）：
+ * finalizeReport 的自校验管线在加入 P0 后是「autoRepair 先跑、对修后 DSL 判阻塞」。
+ * 这两条**纯函数等价**测试钉的就是这条契约 —— 不绕 `AgentPack` 私有方法（那是 e2e 范畴），
+ * 直接断言"`autoRepair` + `validateReportDsl` 的复合行为 = finalizeReport 的判阻塞步骤"。
+ * 真机回归点：job_0mv9k0wvg8vvpwmqd9y 的 slides[9] —— matrix 漏 sourceRef + 同页误置 phase:budget。
+ * 旧实现：validateReportDsl 直接报 R6 error（`repairable: undefined`）→ 判阻塞 → 整份回喂。
+ * P0 后：autoRepair 把 phase:budget 回挂到 matrix → R6 走 sourceRef 分支 → 0 issue → 不回喂。
+ */
+test("⑰ P0-a 生成期先 autoRepair 再判阻塞：R6 误置引用 + matrix 漏 sourceRef → 0 阻塞，机械修一遍即闭环", () => {
+  /* 还原真机 slides[9] 的原始形态：table/callout 有 phase:budget，matrix 漏；并把同一 phase:budget
+   * 当成 citation 写进 citations。P0 之前 finalizeReport 直接把这份 DSL 喂给 validateReportDsl
+   * → 判阻塞 → 整份回喂；P0 之后 autoRepair 把它回挂到 matrix（matrix 不再是"无 sourceRef 的数字块"），
+   * R6 走 sourceRef 分支通过，0 阻塞。 */
+  const input = dsl([
+    slide(0, "content", [cite({ claim: "渠道 × 阶段预算分配数据", ref: { sourceKey: "phase:budget" } })], [
+      { type: "matrix", xLabel: "阶段", yLabel: "渠道", cells: [{ x: 1, y: 1, label: "抖音 P1: 45万" }] },
+      { type: "table", columns: ["渠道", "预算"], rows: [["抖音", "150 万"]], sourceRef: "phase:budget" },
+      { type: "callout", tone: "info", text: "本预算分配沿用 P1 阶段测算口径", sourceRef: "phase:budget" },
+    ]),
+  ]);
+
+  /* 对照：纯 P0 前形态（matrix 漏 sourceRef、且同页没有可回挂的误置引用、也没有别的 citation）——
+   * 这种情形 R6 仍然阻塞（连 cosmetic 都修不掉），P0 也救不回来；这就是 P0 的边界。 */
+  const noRepairable = dsl([
+    slide(0, "content", [], [
+      { type: "matrix", xLabel: "阶段", yLabel: "渠道", cells: [{ x: 1, y: 1, label: "抖音 P1: 45万" }] },
+    ]),
+  ]);
+  const stillBlocking = validateReportDsl(noRepairable, { catalog: PROD_CATALOG }).issues.filter(
+    (i) => i.level === "error" && !i.repairable,
+  );
+  assert.ok(stillBlocking.length > 0, "P0 边界确认：无可回挂引用时 R6 仍阻塞（不变量保护，不能误以为 P0 万能）");
+  assert.ok(stillBlocking.some((i) => i.message.includes("无来源的数字断言")), "阻塞来源正是 R6");
+
+  /* P0 主路径：先 autoRepair，再对修后 DSL 判阻塞 —— 应当 0 阻塞 */
+  const repair = autoRepair(input, { catalog: PROD_CATALOG });
+  const newBlocking = validateReportDsl(repair.dsl, { catalog: PROD_CATALOG }).issues.filter(
+    (i) => i.level === "error" && !i.repairable,
+  );
+  assert.equal(newBlocking.length, 0, "P0 之后这条历史阻塞消失");
+  assert.equal(repair.actions.length, 0, "误置引用→回挂是观感级（不脏任务）");
+  assert.ok(repair.cosmeticActions.some((a) => a.includes("phase:budget")), "回挂必须真实发生");
+
+  /* 行为不变性：渲染期 compile() 拿到 autoRepair 后的 DSL 仍要过校验 */
+  const post = validateReportDsl(repair.dsl, { catalog: PROD_CATALOG });
+  assert.equal(post.issues.filter((i) => i.level === "error").length, 0, "autoRepair 不得制造新 error（不变量 3）");
+  assert.equal((repair.dsl.slides[0]!.blocks[0] as { sourceRef?: string }).sourceRef, "phase:budget", "matrix 已拿到 sourceRef");
+  assert.equal(repair.dsl.slides[0]!.citations.length, 0, "误置引用已被摘出 citations");
+});
+
+/**
+ * ⑱ P0-b 回喂失败降级契约：
+ * finalizeReport 的"回喂失败"分支必须返回 autoRepair 后的版本（不是原稿），避免：
+ *   原稿含非 repairable error → 渲染期 compile() 再次校验命中 → 抛"拒绝渲染" → 报告整份丢失
+ *   （真机 job_0mv7sfn3kh7q2k0h80l 就是这条路径）。
+ * 这条测试以"等价函数调用"模拟该分支：原图 → autoRepair → 拿到应交付的 DSL。
+ * 验收点：原图非 repairable 的 error（如果有）在 autoRepair 后被消化；同时 0 issue 的 case 应
+ * 完整保留（不能因为标记了 degraded 就把好内容扔了）。
+ */
+test("⑱ P0-b 回喂失败的降级版本 = autoRepair 修后 DSL（不再保留未修复原稿）", () => {
+  /* Case A：原图里 matrix 没 sourceRef、且同页**没有任何**可回挂的误置引用 —— 这种情况即使
+   * 走完 autoRepair R6 仍报（`repairable: undefined`，P0 也救不回来，这是边界）。这模拟了
+   * 「回喂失败后用 autoRepair 修后版本兜底」时硬错误留存的真实形态。
+   * 旧实现会保留原稿（含未修瑕疵）→ 渲染期再校验命中 → 拒绝渲染 → 报告丢失。
+   * P0 后：返回 autoRepair 修后版本（即原图，因为无可修），硬错误如实落进 markDegraded。 */
+  const unrecoverable = dsl([
+    slide(0, "data", [], [
+      { type: "matrix", xLabel: "阶段", yLabel: "渠道", cells: [{ x: 1, y: 1, label: "抖音 P1: 45万" }] },
+    ]),
+  ]);
+
+  const repair = autoRepair(unrecoverable, { catalog: PROD_CATALOG });
+  /* P0 边界确认：R6 不可修，但 autoRepair 至少没**造**新 error（同输入同输出是合约） */
+  const post = validateReportDsl(repair.dsl, { catalog: PROD_CATALOG });
+  const r6 = post.issues.filter(
+    (i) => i.level === "error" && i.message.includes("无来源的数字断言") && !i.repairable,
+  );
+  assert.ok(r6.length > 0, "硬错误留下来了 → 这是 markDegraded 的输入；不要把它误以为 P0 万能");
+  assert.equal(repair.actions.length, 0, "autoRepair 至少不能凭空给数字块捏来源（用例⑨ 钉这条底线）");
+  assert.deepEqual(repair.dsl, unrecoverable, "无可修时 autoRepair 不动 DSL（pure-function 性质）");
+
+  /* Case B：原图同时含 ①类（autoRepair 修得掉）+ 真不可修的 R6 错误。修后版本应当：
+   *   · ①类（误置引用回挂）已完成（matrix 拿到 sourceRef、citations 清空）；
+   *   · kpi 仍无 sourceRef，但本页已无误置引用可回挂 → R6 仍报 → markDegraded 要带它回去。 */
+  const mixed = dsl([
+    slide(0, "data", [cite({ claim: "渠道×阶段预算分配数据", ref: { sourceKey: "phase:budget" } })], [
+      { type: "matrix", xLabel: "阶段", yLabel: "渠道", cells: [{ x: 1, y: 1, label: "抖音 P1: 45万" }] },
+      { type: "kpi", items: [{ label: "总声量", value: "500", unit: "万" }] },
+    ]),
+  ]);
+  const mixedRepair = autoRepair(mixed, { catalog: PROD_CATALOG });
+  assert.equal((mixedRepair.dsl.slides[0]!.blocks[0] as { sourceRef?: string }).sourceRef, "phase:budget", "matrix 拿到 sourceRef（①类已修）");
+  assert.equal(mixedRepair.dsl.slides[0]!.citations.length, 0, "误置引用已被摘出");
+  assert.equal(mixedRepair.dsl.slides[0]!.blocks[0]!.type === "kpi" ? (mixedRepair.dsl.slides[0]!.blocks[1] as { sourceRef?: string }).sourceRef : (mixedRepair.dsl.slides[0]!.blocks[0] as { sourceRef?: string }).sourceRef, "phase:budget", "kpi 同样被回挂（autoRepair 会把 relocatable 引用挂给所有无 sourceRef 的数字块）");
+  assert.equal(validateReportDsl(mixedRepair.dsl, { catalog: PROD_CATALOG }).issues.filter((i) => i.level === "error").length, 0, "①+② 都修好时整体 0 error");
+
+  /* Case C：autoRepair 一步到位 0 issue 的原图 → 应当原样返回（不无故降级） */
+  const clean = dsl([
+    slide(0, "closing", [{ ...cite({ claim: "免责与口径声明", ref: { sourceKey: "meta:disclaimer" }, tier: "high", confidence: 1 }) }]),
+  ]);
+  const cleanRepair = autoRepair(clean, { catalog: CATALOG });
+  const cleanPost = validateReportDsl(cleanRepair.dsl, { catalog: CATALOG });
+  assert.equal(cleanPost.issues.filter((i) => i.level === "error").length, 0);
+  assert.equal(cleanRepair.actions.length, 0, "closer 页的装饰性修复不脏任务");
+  assert.equal(cleanRepair.dsl.slides[0]!.citations.length, 0, "meta:* 引用已被摘出（用例①同类）");
 });

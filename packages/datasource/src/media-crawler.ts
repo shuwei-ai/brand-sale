@@ -126,10 +126,16 @@ export function createMediaCrawlerAdapter(platform: MediaCrawlerPlatform, config
       }
 
       const limit = query.limit && query.limit > 0 ? query.limit : 20;
+      /* 点名要哪些作者的资料行（`authorIds` = creator_hash 列表）。
+       * 不传就沿用「只拼本批 rows 的作者」—— 那条默认路径在 `limit` 截断面前会漏人，
+       * 见 collector/src/server.ts 的注释与 2026-10-20 真机事故。 */
+      const authorIds = Array.isArray(query.params?.authorIds)
+        ? (query.params.authorIds as unknown[]).map((x) => String(x ?? "").trim()).filter(Boolean)
+        : [];
       const resp = await callCollector(
         collectorBaseUrl,
         "/query",
-        { platform, op, keyword, limit },
+        { platform, op, keyword, limit, ...(authorIds.length > 0 ? { authorIds } : {}) },
         timeoutMs,
       );
       if (!resp.ok) {

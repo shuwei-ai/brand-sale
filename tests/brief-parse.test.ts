@@ -165,3 +165,24 @@ test("WP-C-11 耳机诉求：category 必须是中文词（它会被直接用作
   assert.ok(!d.missing.includes("industry"), "词表命中后 industry 不该再进 missing");
   assert.ok(!d.missing.includes("category"), "词表命中后 category 不该再进 missing");
   assert.ok(d.filled.includes("industry"), "industry 应由规则段命中，而不是留给模型补");});
+
+test("WP-C-12 冬装两类口述都能命中词表（羽绒服 / 保暖内衣），且不落到 LLM 兜底成英文", () => {
+  const down = parseBriefUtterance("波司登、鸭鸭、高梵三个羽绒服品牌，抖音加小红书，预算 200 万", undefined, NOW);
+  assert.equal(down.brief.industry, "服饰鞋包");
+  assert.equal(down.brief.category, "羽绒服");
+  assert.ok(!down.missing.includes("category"), "羽绒服已进词表，不该再追问");
+
+  const thermal = parseBriefUtterance(
+    "蕉内、ubras、优衣库、猫人四个保暖内衣品牌，抖音、小红书投放，预算 100 万",
+    undefined,
+    NOW,
+  );
+  assert.equal(thermal.brief.industry, "服饰鞋包");
+  assert.equal(thermal.brief.category, "保暖内衣");
+  assert.match(thermal.brief.category ?? "", /[\u4e00-\u9fff]/, "category 必须含中文 —— 它会被逐字当平台搜索词");
+  assert.equal(thermal.brief.budget?.amount, 1_000_000);
+  assert.deepEqual(thermal.brief.platforms, ["douyin", "xiaohongshu"]);
+  /* 「秋衣」「打底衫」是同一品类的口语说法，别让它们掉到 LLM 手里变成 `thermal underwear` */
+  assert.equal(parseBriefUtterance("卖秋衣秋裤，抖音投 30 万", undefined, NOW).brief.category, "保暖内衣");
+  assert.equal(parseBriefUtterance("卖打底衫，小红书投 30 万", undefined, NOW).brief.category, "保暖内衣");
+});

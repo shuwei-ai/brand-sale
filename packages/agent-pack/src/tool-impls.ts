@@ -630,6 +630,7 @@ function makePlatformTool(meta: MediaCrawlerPlatformMeta): ToolImpl {
         text: clip(String(r.text ?? "")),
         author: String(r.author ?? ""),
         authorId: String(r.authorId ?? ""),
+        ...(typeof r.uid === "string" && r.uid.trim() ? { uid: r.uid.trim() } : {}),
         url: String(r.url ?? ""),
         publishedAt: String(r.publishedAt ?? ""),
         metrics: (r.metrics as Record<string, number> | undefined) ?? {},
@@ -721,7 +722,12 @@ const SCOPE_BY_OP: Record<CollectOp, "content" | "comment"> = {
 const platformDigest: ToolImpl = {
   policy: policy({
     name: PLATFORM_DIGEST_TOOL_NAME,
-    allowedAgents: ["CI", "CT"],
+    /* `RG` 是 2026-10-20 加的：报告阶段终稿前要补读一次平台数据（作者主页资料行比 creator
+     * 阶段晚到，见 `agents.ts:refreshPlatformData` 的长注释）。不加它，那次补读会撞
+     * 「工具不在 RG 白名单」→ 补读失效 + 报告多一条无意义的降级项（这正是隐藏在
+     * "粉丝量永远未采集"后面的第四层原因）。系统侧补取走 `systemCall`，不计入
+     * `maxCallsPerJob`；模型在 report 阶段即使主动调它也受同一个 8 次上限约束。 */
+    allowedAgents: ["CI", "CT", "RG"],
     governance: ["scope", "source", "authz", "tenant"],
     // 七个源一起绑：任一源已装配即注册，全都没装配才不注册（否则报告会多一条假能力）
     boundSourceIds: MEDIA_CRAWLER_PLATFORMS.map((p) => MEDIA_CRAWLER_PLATFORM_META[p].sourceId),
@@ -754,6 +760,8 @@ const platformDigest: ToolImpl = {
     creatorId: Type.Optional(Str()),
     url: Type.Optional(Str()),
     limit: Type.Optional(Num()),
+    /** 点名要哪些作者的资料行（创作哈希）。内部自愈补读用，模型一般不用传。 */
+    authorIds: Type.Optional(Arr(Str())),
   }),
   async execute(params, tc) {
     const deps = this_deps(tc);
@@ -867,6 +875,9 @@ const platformDigest: ToolImpl = {
               contentId: params.contentId === undefined ? undefined : String(params.contentId),
               creatorId: params.creatorId === undefined ? undefined : String(params.creatorId),
               url: params.url === undefined ? undefined : String(params.url),
+              ...(Array.isArray(params.authorIds) && params.authorIds.length > 0
+                ? { authorIds: (params.authorIds as unknown[]).map((x) => String(x ?? "")).filter(Boolean) }
+                : {}),
             },
           },
           deps.config,
@@ -883,6 +894,8 @@ const platformDigest: ToolImpl = {
               id: String(r.id ?? ""),
               author: String(r.author ?? ""),
               authorId: String(r.authorId ?? ""),
+              // 平台原始 UID：报告里的人选标识列用它（内部哈希对读者无用，喂回采集还会失败）
+              ...(typeof r.uid === "string" && r.uid.trim() ? { uid: r.uid.trim() } : {}),
               url: String(r.url ?? ""),
               text: clip(String(r.text ?? "")),
               metrics: (r.metrics as Record<string, number> | undefined) ?? {},

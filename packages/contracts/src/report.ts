@@ -113,6 +113,22 @@ export interface EvidenceEntry {
   metrics: Record<string, number>;
   /** 采集时点（ISO），即条目级 asOf */
   collectedAt: string;
+  /**
+   * 平台内账号标识的**哈希**（内容行与主页资料行共有）。
+   *
+   * 只做内存关联用：把主页资料行拼到同一作者的内容行上（见
+   * `apps/collector/src/server.ts` 的 `/query`）。**不落报告** —— 它是脱敏哈希，
+   * 对读者没有可操作价值。
+   */
+  authorId?: string;
+  /**
+   * 该账号在平台侧的**原始 UID**（抖音 `user_id`、小红书 `user_id`、B站 `mid`…）。
+   *
+   * 与 `authorId` 的区别很重要：`authorId` 是归一化时算出的哈希（喂回采集必失败），
+   * `uid` 是平台自己认的标识（能直接拿去平台站内检索/打开主页）。
+   * 报告里的人选标识列用它，而不是内部哈希。
+   */
+  uid?: string;
 }
 
 export interface ReportCitation {
@@ -404,6 +420,9 @@ export interface ReportValidationOptions {
  *
  * 为什么**不**纳入「我们」：它在报告里有两义（品牌自称 vs 顾问自称，如"我们建议…"），
  * 机械判定会误伤后者 —— 那一半只由提示词约束（`agent-pack/src/prompts.ts` 的 RG 段）。
+ *
+ * ⚠️ 这是词表的**可读形式**，**不参与匹配** —— 真正的判定/修复一律走 `scanLeaks()`
+ * （中文没有词边界，裸正则会子串误伤，见 `LEAK_EXEMPT`）。改词表请改 `LEAK_DROP` / `LEAK_NEUTRALIZE`。
  */
 export const OWN_BRAND_LEAK_RE = /我方|本品|本方|品牌自诊/;
 
@@ -413,42 +432,170 @@ const OWN_BRAND_NEUTRAL_TITLE = "市场与竞品调研";
 /** 标签类槽位（列名 / 轴标签 / KPI 标签）的兜底：标签是结构骨架，不能整块删掉 */
 const OWN_BRAND_NEUTRAL_LABEL = "指标";
 
+/**
+ * **命中即删**的自我指涉词（按"最长优先"匹配，不是正则交替）。
+ */
+const LEAK_DROP = ["品牌自诊", "我方", "本方", "本品"] as const;
+
+/**
+ * **命中即整词换主语**的长词：形如"中性名词 + 自我指涉限定词"，去掉限定词即可。
+ *
+ * 「本品牌」必须走这条路，不能走删词：`本品` 是它的子串，删词会把两个**字**从词中间挖掉，
+ * 留下「…挤压**牌**声量份额」这种残句（真机 job_0mv9k0wvg8vvpwmqd9y 的
+ * slides[11].blocks[0].rows[3][0]）。要的是**换主语**（本品牌 → 品牌），不是**删断言**。
+ *
+ * 表里两侧都不含数字，所以"纯替换"这条路径天然不碰任何数字（见 `LeakFix.cosmetic`）。
+ */
+const LEAK_NEUTRALIZE: ReadonlyArray<readonly [string, string]> = [["本品牌", "品牌"]];
+
+/**
+ * **中性词豁免表**：形如违禁词、实为普通名词的写法 —— 不检测、也不修复。
+ *
+ * 为什么必须有它：违禁词都是两个汉字，而中文没有词边界可用，子串匹配必然误伤。
+ * 真机 job_0mv9k0wvg8vvpwmqd9y 一天之内踩了两次，都是同一类：
+ *   · 「本品牌」含「本品」→ 被从词中间挖掉两个字，产出「挤压**牌**声量份额」；
+ *   · 「本方案」含「本方」→ 整句「…**这也是本方案把预算重心压在中段的依据。**」被删掉
+ *     （而且还按数据级记了账，把任务标脏）—— 它说的是"本报告提出的方案"，跟"我方"毫无关系。
+ *
+ * 新增误伤词就加在这张表里；**不要**改成"把违禁词表写松"，那会让真正的越界写法溜过去。
+ */
+const LEAK_EXEMPT = ["本方案", "本方略", "本方式", "本方向", "本品类", "本品线"] as const;
+
+/** 一次命中：位置 + 长度 + 原文 + 替换词（无 `to` = 删除） */
+interface LeakSpan {
+  at: number;
+  len: number;
+  word: string;
+  to?: string;
+}
+
+const NEUTRALIZE_FROM = LEAK_NEUTRALIZE.map(([from]) => from);
+
+/**
+ * **R14 的唯一扫描器** —— 判定与修复共用，避免两套实现分叉
+ * （分叉的后果是把违禁词留在报告里 → 修复后二次校验仍报 error → 整份拒绝渲染）。
+ *
+ * 从左到右走一遍，每个位置**先看豁免表、再看替换表、最后看删词表**，各取最长命中 ——
+ * 这就是中文版的"词边界"，也是"本品牌"不会被拆成「本品」+「牌」的原因。
+ */
+function scanLeaks(s: string): LeakSpan[] {
+  const spans: LeakSpan[] = [];
+  const longest = (words: readonly string[]): string | undefined => {
+    let best: string | undefined;
+    for (const w of words) if (s.startsWith(w, i) && (best === undefined || w.length > best.length)) best = w;
+    return best;
+  };
+  let i = 0;
+  while (i < s.length) {
+    /* 豁免词只在此处被"跨过"：它内部的违禁子串永远不算命中 */
+    const exempt = longest(LEAK_EXEMPT);
+    if (exempt) {
+      i += exempt.length;
+      continue;
+    }
+    const neu = longest(NEUTRALIZE_FROM);
+    if (neu) {
+      spans.push({ at: i, len: neu.length, word: neu, to: LEAK_NEUTRALIZE.find(([f]) => f === neu)![1] });
+      i += neu.length;
+      continue;
+    }
+    const drop = longest(LEAK_DROP);
+    if (drop) {
+      spans.push({ at: i, len: drop.length, word: drop });
+      i += drop.length;
+      continue;
+    }
+    i += 1;
+  }
+  return spans;
+}
+
+/** 按扫描结果改写：`neutralize` 只做替换，`drop` 只做删除（未命中该模式的 span 原样保留） */
+function rewriteByLeaks(s: string, spans: LeakSpan[], mode: "neutralize" | "drop"): string {
+  let out = "";
+  let cur = 0;
+  for (const sp of spans) {
+    const wanted = mode === "neutralize" ? sp.to !== undefined : sp.to === undefined;
+    if (!wanted) continue;
+    out += s.slice(cur, sp.at) + (mode === "neutralize" ? sp.to! : "");
+    cur = sp.at + sp.len;
+  }
+  return out + s.slice(cur);
+}
+
+/** 是否需要处置（扫描与修复共用同一遍判定） */
+const hasLeak = (s: string): boolean => scanLeaks(s).length > 0;
+
+/**
+ * 判定一段文本里有没有自我指涉命中 —— 扫描与修复的**唯一入口**，供测试与外部工具使用。
+ *
+ * ⚠️ 别拿 `OWN_BRAND_LEAK_RE` 直接 `.test()` 文本（它是词表的可读形式，会子串误伤）；
+ * 也别把它当成"违规判定"用在整页 JSON 上 —— 中性词（「本方案」）本来就应该原样出现。
+ */
+export const hasOwnBrandLeak = hasLeak;
+
+/** 把长词换成中性主语；`hit` 表示确实替换过 */
+function neutralizeLeakTokens(s: string): { value: string; hit: boolean } {
+  const value = rewriteByLeaks(s, scanLeaks(s), "neutralize");
+  return { value, hit: value !== s };
+}
+
 /** 单个槽位的处置结果 */
 type LeakFix =
   | { kind: "none" }
-  /** `removed` = 被摘掉的原文片段，用于判定该修复是否动了数字（见 autoRepair 的分级） */
-  | { kind: "text"; value: string; removed: string }
+  /**
+   * `removed` = 被摘掉的原文片段，用于判定该修复是否动了数字（见 autoRepair 的分级）。
+   * `cosmetic` = 本次**只做了中性化替换**（本品牌 → 品牌）：没删任何断言、也没引入新事实，
+   *   按分级原则归观感级。**只标"纯替换"这一种情况**，绝不用 `removed` 是否为空去反推 ——
+   *   「我方声量」按词摘掉「我方」同样不含数字，但那把断言变成了悬空的，必须保守标脏。
+   */
+  | { kind: "text"; value: string; removed: string; cosmetic?: true }
   | { kind: "empty"; removed: string };
 
+/** 只做删除型命中的句子判定（替换型命中不算——那类句子中性化之后就干净了） */
+const hasDropLeak = (s: string): boolean => scanLeaks(s).some((sp) => sp.to === undefined);
+
 /** 删掉含违禁词的**句子**；整串都被删光时返回 null */
-function dropLeakSentences(s: string): { value: string | null; removed: string } {
-  const parts = s.split(/(?<=[。；！？!?;\n])/);
-  const kept = parts.filter((p) => !OWN_BRAND_LEAK_RE.test(p));
+function dropLeakSentences(s: string): { value: string | null; removed: string; neutralizedOnly: boolean } {
+  const n = neutralizeLeakTokens(s);
+  const parts = n.value.split(/(?<=[。；！？!?;\n])/);
+  const dropped = parts.filter(hasDropLeak);
+  const kept = parts.filter((p) => !hasDropLeak(p));
   const joined = kept.join("").trim();
-  return { value: joined === "" ? null : joined, removed: parts.filter((p) => OWN_BRAND_LEAK_RE.test(p)).join("").trim() };
+  const value = joined === "" ? null : joined;
+  if (dropped.length === 0) return { value, removed: "", neutralizedOnly: n.hit };
+  return { value, removed: dropped.join("").trim(), neutralizedOnly: false };
 }
 
 /** 只摘掉违禁**词**（用于列名 / 轴标签 / KPI 标签这类短标签）；摘空返回 null */
-function dropLeakTokens(s: string): string | null {
-  const joined = s
-    .replace(new RegExp(OWN_BRAND_LEAK_RE.source, "g"), "")
+function dropLeakTokens(s: string): { value: string | null; removed: string; neutralizedOnly: boolean } {
+  const n = neutralizeLeakTokens(s);
+  /* 长词已经在上面被换掉了，这里剩下的才是真正该摘掉的独立违禁词 */
+  const spans = scanLeaks(n.value);
+  const droppedWords = spans.filter((sp) => sp.to === undefined).map((sp) => sp.word);
+  const out = rewriteByLeaks(n.value, spans, "drop")
     /* 摘掉词以后留下的空引号/空括号（「我方」→「」）要一并清掉，否则报告里会出现残缺标点 */
     .replace(/[「『"'（(]\s*[」』"'）)]/g, "")
     .replace(/\s{2,}/g, " ")
     .trim();
-  return joined === "" ? null : joined;
+  const value = out === "" ? null : out;
+  if (value === null) return { value, removed: s, neutralizedOnly: false };
+  const neutralizedOnly = n.hit && droppedWords.length === 0;
+  return { value, removed: neutralizedOnly ? "" : droppedWords.join(""), neutralizedOnly };
 }
 
 const fixSentence = (s: string): LeakFix => {
-  if (!OWN_BRAND_LEAK_RE.test(s)) return { kind: "none" };
-  const { value, removed } = dropLeakSentences(s);
-  return value === null ? { kind: "empty", removed: s } : { kind: "text", value, removed };
+  if (!hasLeak(s)) return { kind: "none" };
+  const { value, removed, neutralizedOnly } = dropLeakSentences(s);
+  if (value === null) return { kind: "empty", removed: s };
+  return neutralizedOnly ? { kind: "text", value, removed, cosmetic: true } : { kind: "text", value, removed };
 };
 
 const fixLabel = (s: string): LeakFix => {
-  if (!OWN_BRAND_LEAK_RE.test(s)) return { kind: "none" };
-  const v = dropLeakTokens(s);
-  return v === null ? { kind: "empty", removed: s } : { kind: "text", value: v, removed: s };
+  if (!hasLeak(s)) return { kind: "none" };
+  const { value, removed, neutralizedOnly } = dropLeakTokens(s);
+  if (value === null) return { kind: "empty", removed: s };
+  return neutralizedOnly ? { kind: "text", value, removed, cosmetic: true } : { kind: "text", value, removed };
 };
 
 export interface OwnBrandLeakHit {
@@ -458,10 +605,11 @@ export interface OwnBrandLeakHit {
   /** 处置说明，直接拼进 autoRepair 的 action 文案 */
   action: string;
   /**
-   * 该修复是否碰了数字。
-   *   `false` → 观感级（剔除的是"自我指涉"，不承载任何事实），对应 `cosmeticActions`；
-   *   `true`  → 数据级，任务必须标 partial。
-   * 判定口径：**只有能被精确定位到"删掉的那几句"、且那几句不含数字**的句子级修复才算 false；
+   * 该修复是否要按**数据级**记账（`true` → 进 `actions`，任务必须标 partial）。
+   *
+   * 判 false（观感级）只有两种情形，其余一律保守按 true：
+   *   ① **纯中性化替换**（本品牌 → 品牌）：没删任何断言、也没引入新事实（`LeakFix.cosmetic`）；
+   *   ② 句子级删除，且**被删掉的那几句不含数字**（删掉的是一句纯措辞，不承载任何事实）。
    * 标签替换 / 整块删除 / 整列删除一律按 true 保守处理（那类改动动了结构，宁可标脏）。
    */
   digits: boolean;
@@ -484,14 +632,24 @@ export interface OwnBrandLeakHit {
 export function stripOwnBrandLeak(dsl: ReportDsl, opts: { apply?: boolean } = {}): { dsl: ReportDsl; hits: OwnBrandLeakHit[] } {
   const apply = opts.apply !== false;
   const hits: OwnBrandLeakHit[] = [];
-  const record = (path: string, text: string, action: string, removed?: string): void => {
+  const record = (path: string, text: string, action: string, removed?: string, cosmetic = false): void => {
     hits.push({
       path,
       text: text.replace(/\s+/g, " ").slice(0, 60),
       action,
-      digits: removed === undefined ? true : /\d/.test(removed),
+      /* 显式观感级优先；否则"没给出被摘片段"或"摘掉的片段含数字"都按数据级保守处理 */
+      digits: cosmetic ? false : removed === undefined ? true : /\d/.test(removed),
     });
   };
+
+  /**
+   * 摊平一次**短标签级**修复（列名 / 表格单元格 / 轴标签 / KPI 标签）的分级。
+   *
+   * 只有纯中性化替换（本品牌 → 品牌）算观感级；其余（删词、摘空）维持原口径 ——
+   * `record` 收不到 `removed` 就按数据级保守记账，与改动前完全一致。
+   */
+  const grade = (f: LeakFix): { removed?: string; cosmetic: boolean } =>
+    f.kind === "text" && f.cosmetic ? { removed: f.removed, cosmetic: true } : { cosmetic: false };
 
   /* ── 元信息 ── */
   let meta = dsl.meta;
@@ -543,10 +701,11 @@ export function stripOwnBrandLeak(dsl: ReportDsl, opts: { apply?: boolean } = {}
      * `hit=true` 且 `value=undefined` 表示整个槽位该删（可选槽位）或该用中性词补位（必填槽位）。
      */
     const editLabel = (text: string | undefined, path: string, what: string, fallback?: string): { hit: boolean; value?: string } => {
-      if (!text || !OWN_BRAND_LEAK_RE.test(text)) return { hit: false };
+      if (!text || !hasLeak(text)) return { hit: false };
       const f = fixLabel(text);
       const value = f.kind === "text" ? f.value : fallback;
-      record(path, text, value === undefined ? `删除${what}` : `${what}改写为「${value}」`);
+      const g = grade(f);
+      record(path, text, value === undefined ? `删除${what}` : `${what}改写为「${value}」`, g.removed, g.cosmetic);
       return { hit: true, value };
     };
     /** 短标签的通用改写：未命中 → 原值原样返回（含 undefined）；命中且摘空 → 用 fallback，没有 fallback 就删掉该槽位 */
@@ -609,7 +768,8 @@ export function stripOwnBrandLeak(dsl: ReportDsl, opts: { apply?: boolean } = {}
           const label = labelF.kind === "text" ? labelF.value : it.label;
           const value = valueF.kind === "text" ? valueF.value : it.value;
           const unit = relabel(it.unit, `${bp}.items[${i}].unit`, "单位");
-          record(`${bp}.items[${i}]`, `${it.label}:${it.value}`, `KPI 改写为「${label}:${value}」`);
+          const g = grade(labelF);
+          record(`${bp}.items[${i}]`, `${it.label}:${it.value}`, `KPI 改写为「${label}:${value}」`, g.removed, g.cosmetic);
           return [{ ...it, label, value, unit }];
         });
         if (items.length === 0) {
@@ -625,7 +785,8 @@ export function stripOwnBrandLeak(dsl: ReportDsl, opts: { apply?: boolean } = {}
           const f = fixLabel(c);
           if (f.kind === "none") return [c];
           if (f.kind === "text") {
-            record(`${bp}.columns[${i}]`, c, `列名改写为「${f.value}」`);
+            const g = grade(f);
+            record(`${bp}.columns[${i}]`, c, `列名改写为「${f.value}」`, g.removed, g.cosmetic);
             return [f.value];
           }
           record(`${bp}.columns[${i}]`, c, "整列删除（列名与内容都在讲自有品牌）");
@@ -642,7 +803,8 @@ export function stripOwnBrandLeak(dsl: ReportDsl, opts: { apply?: boolean } = {}
             const f = fixLabel(cell);
             if (f.kind === "none") return [cell];
             const value = f.kind === "text" ? f.value : "—";
-            record(`${bp}.rows[${ri}][${ci}]`, cell, `单元格改写为「${value}」`);
+            const g = grade(f);
+            record(`${bp}.rows[${ri}][${ci}]`, cell, `单元格改写为「${value}」`, g.removed, g.cosmetic);
             return [value];
           }),
         );
@@ -930,22 +1092,48 @@ export function validateReportDsl(
     /* R6 无来源数字检查
      * 「有引用」的判定基准与 autoRepair 严格一致：**被误当来源的逻辑引用不算引用**
      * （见 isMisplacedLogicalRef）。两处若不一致，同一份 DSL 会在「修复前算过、修复后不过」，
-     * 而这条 error 不可修复 → render.compile 抛错、报告整份丢失（真机事故 job_0mv5ydf69a7aio1uhfd）。 */
+     * 而这条 error 又拿不到可回挂的来源时不可修复 → render.compile 抛错、报告整份丢失
+     * （真机事故 job_0mv5ydf69a7aio1uhfd）。
+     *
+     * 可修复性**取决于该页有没有可回挂的逻辑引用**，见下面 relocatable 的注释。 */
     const numericBlocks = slide.blocks.filter((b) => numericClaims(b).length > 0);
-    const allDeclared = numericBlocks.every((b) => {
-      const ref = refOf(b);
-      if (!ref) return false;
+    const refIsValid = (ref: string): boolean => {
       const normalized = normalizeRef(ref);
       return logicalRefs.has(normalized) || declaredKeys.has(normalized) || declaredKeys.has(ref);
+    };
+    const undeclared = numericBlocks.filter((b) => {
+      const ref = refOf(b);
+      return ref === undefined || !refIsValid(ref);
     });
     const usableCitations = slide.citations.filter((c) => !isMisplacedLogicalRef(c));
-    if (numericBlocks.length > 0 && usableCitations.length === 0 && !allDeclared) {
+    if (numericBlocks.length > 0 && usableCitations.length === 0 && undeclared.length > 0) {
       const sample = numericBlocks.flatMap((b) => numericClaims(b)).slice(0, 3);
+      /**
+       * **可机械修复的判定**：本页 citations 里有一条"被误当来源的逻辑引用"，且它归一后是
+       * **已知**逻辑来源 —— 那 `autoRepair` 会把它从 citations 摘出来、回挂到所有"含数字且
+       * 自己没有 sourceRef"的块上（见该函数里 `misplacedRefs` 那段），这条 error 随即消失。
+       *
+       * 不这么标就会退化成真机 job_0mv9k0wvg8vvpwmqd9y 那次：生成期把 R6 当成"不可修的阻塞项"
+       * → 整份报告回喂一次（23 分钟 / 单次 4 万 token），而渲染期同一份 DSL 其实被静默修好、
+       * 且归观感级 —— **报告内容一字未变，任务却被标成「产出不完整」**。
+       *
+       * 反过来，页面里**没有可回挂的逻辑引用**时依旧不标 `repairable`：那种情况只能靠回喂，
+       * 系统绝不能凭空给数字块捏一个来源（R6 的底线，测试 ⑨ 钉的就是它）。
+       */
+      const relocatable = slide.citations.some((c) => {
+        const key = c.ref?.sourceKey;
+        return isMisplacedLogicalRef(c) && typeof key === "string" && refIsValid(normalizeRef(key));
+      });
       issues.push({
         level: "error",
         path,
-        message: `页面存在无来源的数字断言（如「${sample.join("」「")}」），且该页既无 citation 也未声明有效 sourceRef`,
-        fix: "为该页补 citations，或给含数字的 block 加 phase:* / meta:* 形式的 sourceRef",
+        message:
+          `页面存在无来源的数字断言（如「${sample.join("」「")}」）：${undeclared.length} 个含数字的块` +
+          `（${[...new Set(undeclared.map((b) => b.type))].join(" / ")}）没有有效 sourceRef，且该页没有可用 citation`,
+        fix:
+          "给这些块补 sourceRef（phase:* / meta:* / tool:* 形式），或把数字改写成不含数字的定性表述；" +
+          `缺 sourceRef 的块序号：${undeclared.map((b) => `blocks[${slide.blocks.indexOf(b)}](${b.type})`).join("、")}`,
+        ...(relocatable ? { repairable: true } : {}),
       });
     }
 
@@ -984,9 +1172,9 @@ export function validateReportDsl(
         level: "error",
         path: leak.hits[0]!.path,
         message:
-          `本轮未指定自有品牌（Brief.ownBrandId 缺省），但报告里出现了以「我方」为主语的文本：${sample.join("；")}` +
+          `本轮未指定自有品牌（Brief.ownBrandId 缺省），但报告里出现了以「我方」为主语（含「本品牌」这类同义的自我指涉）的文本：${sample.join("；")}` +
           `（共 ${leak.hits.length} 处）`,
-        fix: "剔除这些句子 / 条目 / 列。注意「本报告不含任何『我方』或『本品』数据」这类**负面声明也算违规**——声明本身就把词写进了报告",
+        fix: "剔除这些句子 / 条目 / 列（「本品牌」按整词换成中性主语「品牌」，不要挖掉词中间的字）。注意「本报告不含任何『我方』或『本品』数据」这类**负面声明也算违规**——声明本身就把词写进了报告",
         repairable: true,
       });
     }
@@ -1081,6 +1269,11 @@ export function autoRepair(dsl: ReportDsl, opts: ReportValidationOptions = {}): 
      * 的事故形态）。此时退回原来的降级路径，宁可贵一条引用也不丢报告。
      */
     const absence = citations.filter(isAbsenceClaimCitation);
+    /**
+     * 被 R6 保护**留下**（没能移除）的缺失声明 —— 它们会往下走普通的"未声明来源"降级。
+     * 那一步必须按**观感级**记账，理由见下面 R3 降级处的注释。
+     */
+    const keptAbsence = new Set<ReportCitation>();
     if (absence.length > 0) {
       const survivors = citations.filter((c) => !isAbsenceClaimCitation(c));
       const usableSurvivors = survivors.filter((c) => !isMisplacedLogicalRef(c)).length;
@@ -1092,10 +1285,13 @@ export function autoRepair(dsl: ReportDsl, opts: ReportValidationOptions = {}): 
             `slides[${slide.index}].citations: 移除缺失声明「${c.claim.slice(0, 20)}」（"未采集/无样本"不是数据来源，缺失应由 callout 或正文说明）`,
           );
         }
+      } else {
+        for (const c of absence) keptAbsence.add(c);
       }
     }
 
     const misplacedRefs: string[] = [];
+    const beforeMisplaced = citations;
     citations = citations.filter((c) => {
       /* 缺失声明引用走到这里 = 上面的 R6 保护判定"不能删"（删了本页数字断言会失去来源）。
        * 此时必须**豁免**下面的误置处理：它同样会把裸写的 `pricing` 移除，保护就白做了。
@@ -1104,8 +1300,23 @@ export function autoRepair(dsl: ReportDsl, opts: ReportValidationOptions = {}): 
       if (!isMisplacedLogicalRef(c)) return true;
       const raw = c.ref.sourceKey as string;
       const key = normalizeRef(raw);
-      const where = logicalRefs.has(key) ? `已改挂为本页数字块的 sourceRef「${key}」` : "已移除（逻辑引用只用于块级 sourceRef）";
-      if (logicalRefs.has(key)) misplacedRefs.push(key);
+      const relocatable = logicalRefs.has(key);
+      /**
+       * ⚠️ **同一条 R6 保护**（与上面「缺失声明」那段同源）：
+       * 认不出的命名空间写法（`phase:xxx` / `tool:xxx` 里不在 logicalRefs 的那些）会被移除、
+       * 又回挂不了任何块 —— 如果本页就靠它撑着数字断言，移除之后紧接着的第二次校验就会多报
+       * 一条 `repairable: false` 的 error → render.compile 抛「拒绝渲染」、**报告整份丢失**
+       * （与 job_0mv5ydf69a7aio1uhfd 同一形态，实测 `phase:unknown_thing` 可复现）。
+       *
+       * 「认不出的引用留着也是错的」这条判断**孤立看成立**，但不能以丢掉整份报告为代价：
+       * 此时退回普通降级路径（下面的 R3 会把它降成 model_inference/low），
+       * 读者看到的是一条可见的推断标注，而不是什么都看不到。
+       */
+      const otherUsable = beforeMisplaced.some((o) => o !== c && !isMisplacedLogicalRef(o));
+      const everyNumericBlockSourced = blocks.every((b) => numericClaims(b).length === 0 || !!refOf(b));
+      if (!relocatable && !otherUsable && !everyNumericBlockSourced) return true;
+      const where = relocatable ? `已改挂为本页数字块的 sourceRef「${key}」` : "已移除（逻辑引用只用于块级 sourceRef）";
+      if (relocatable) misplacedRefs.push(key);
       cosmeticActions.push(`slides[${slide.index}].citations: 「${c.claim.slice(0, 20)}」把逻辑引用「${raw}」当成了数据来源，${where}`);
       return false;
     });
@@ -1119,15 +1330,24 @@ export function autoRepair(dsl: ReportDsl, opts: ReportValidationOptions = {}): 
 
     /* R3 / R4 / R5：引用降级 */
     citations = citations.map((c) => {
+      /**
+       * 分级口径与"把逻辑引用当成数据来源"保持一致（2026-10-15 的结论：那种改动是**改写写作形式**，
+       * 内容语义零损伤 → 观感级）。被 R6 保护留下的缺失声明走的是同一条路 —— 它只是**没能被移除**、
+       * 于是退而求其次降级标注，报告文本一字未改。不这么标就会出现一个说不通的结果：
+       * 同一个写作瑕疵（把"无样本"写成 citation、且 sourceKey 用了逻辑命名空间），
+       * 页面上还有别的可用引用时算观感级、恰好没有时算数据级 → **任务被标脏与否取决于同页其他槽位**。
+       * 真机 job_0mv9k0wvg8vvpwmqd9y 的第二次重跑正是被这一条标成 partial。
+       */
+      const cosmetic = isCosmeticContext(slide, c.claim) || keptAbsence.has(c);
       if (c.kind === "data_source") {
         const key = c.ref?.sourceKey;
-        if (!key) return downgrade(slide.index, c, "缺少 ref.sourceKey", isCosmeticContext(slide, c.claim));
-        if (!declaredKeys.has(key)) return downgrade(slide.index, c, `引用了未声明的来源 ${key}`, isCosmeticContext(slide, c.claim));
+        if (!key) return downgrade(slide.index, c, "缺少 ref.sourceKey", cosmetic);
+        if (!declaredKeys.has(key)) return downgrade(slide.index, c, `引用了未声明的来源 ${key}`, cosmetic);
       }
       if (c.kind === "kb_chunk") {
         const chunkId = c.ref?.chunkId;
-        if (!chunkId) return downgrade(slide.index, c, "缺少 ref.chunkId", isCosmeticContext(slide, c.claim));
-        if (opts.catalog?.chunkIds && !opts.catalog.chunkIds.includes(chunkId)) return downgrade(slide.index, c, `引用了不存在的片段 ${chunkId}`, isCosmeticContext(slide, c.claim));
+        if (!chunkId) return downgrade(slide.index, c, "缺少 ref.chunkId", cosmetic);
+        if (opts.catalog?.chunkIds && !opts.catalog.chunkIds.includes(chunkId)) return downgrade(slide.index, c, `引用了不存在的片段 ${chunkId}`, cosmetic);
       }
       if (c.kind === "model_inference" && c.tier !== "low") {
         actions.push(`citations: 「${c.claim.slice(0, 20)}」模型推断改标 tier=low`);
@@ -1150,7 +1370,7 @@ export function autoRepair(dsl: ReportDsl, opts: ReportValidationOptions = {}): 
             actions.push(`citations: 「${c.claim.slice(0, 20)}」条目级引用无效（${entryId ?? "缺 entryId"}），降级为来源级引用 ${key}`);
             return { ...c, kind: "data_source", ref: { sourceKey: key }, verifiedBy: "auto" };
           }
-          return downgrade(slide.index, c, `条目级引用无效（${entryId ?? "缺 entryId"}）且无可用来源级出处`, isCosmeticContext(slide, c.claim));
+          return downgrade(slide.index, c, `条目级引用无效（${entryId ?? "缺 entryId"}）且无可用来源级出处`, cosmetic);
         }
       }
       return c;

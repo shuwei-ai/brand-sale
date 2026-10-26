@@ -44,6 +44,10 @@ export interface EvidenceRowInput {
   url?: unknown;
   publishedAt?: unknown;
   metrics?: unknown;
+  /** 账号哈希：把主页资料行拼到内容行上要它（不落报告） */
+  authorId?: unknown;
+  /** 平台原始 UID：报告里给人看的账号标识 */
+  uid?: unknown;
 }
 
 const asStr = (v: unknown): string => (typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "");
@@ -71,6 +75,8 @@ export function toEvidenceEntries(
     if (seen.has(entryId)) continue;
     seen.add(entryId);
     const text = asStr(r.text);
+    const authorId = asStr(r.authorId);
+    const uid = asStr(r.uid);
     out.push({
       entryId,
       platform,
@@ -84,6 +90,9 @@ export function toEvidenceEntries(
       publishedAt: asStr(r.publishedAt),
       metrics: metricsOf(r.metrics),
       collectedAt,
+      // 两个字段都是可选的：老产物里没有它们，读侧必须能接受缺省（不写空串）
+      ...(authorId ? { authorId } : {}),
+      ...(uid ? { uid } : {}),
     });
   }
   return out;

@@ -2,7 +2,7 @@
  * @brandsale/agent-pack —— M9 AgentPack + M10 ToolRegistry
  */
 
-export { AgentPack, BRIEF_PLATFORM_TO_MC, DeltaPump, MOCK_BRIEF, createToolCallGuard, extractJsonObject, needsPlatformRefresh, platformPrefetchArgs, type AgentRuntimeDeps, type PhaseResult, type PhaseStrategy, type ToolCallGuardDecision } from "./agents.ts";
+export { AgentPack, BRIEF_PLATFORM_TO_MC, DeltaPump, MOCK_BRIEF, createToolCallGuard, extractJsonObject, mergePatchedPages, needsPlatformRefresh, platformPrefetchArgs, shouldRefreshPlatform, type AgentRuntimeDeps, type PhaseResult, type PhaseStrategy, type ToolCallGuardDecision } from "./agents.ts";
 export { ToolRegistry, policy, TIER_GOVERNANCE, type ToolCallContext, type ToolCallRecord, type ToolDeps, type ToolImpl } from "./tools.ts";
 export { PHASE_TOOL_HINT, TOOL_IMPLEMENTATIONS, PLATFORM_TOOLS, PLATFORM_TOOL_NAME, PLATFORM_DIGEST_TOOL_NAME, admitTool, registerAllTools, bindDeps } from "./tool-impls.ts";
 export { SYSTEM_PROMPTS, contextBlock } from "./prompts.ts";
@@ -14,12 +14,14 @@ export {
   CreatorCandidatesSchema,
   PlaybookSchema,
   ReportDslSchema,
+  ReportPagePatchSchema,
   SchemaError,
   type BriefOutput,
   type BudgetOutput,
   type CreatorOutput,
   type IntelOutput,
   type PlaybookOutput,
+  type ReportPagePatch,
   type SchemaDef,
 } from "./schemas.ts";
 export {
@@ -34,9 +36,11 @@ export {
   PLATFORM_CREATOR_PREFIX,
   TIER_LABEL,
   aggregatePlatformAccounts,
+  backfillCreatorStatsInTables,
   creatorAccountRows,
   creatorEvidenceCount,
   creatorEvidenceUrl,
+  creatorLiveViews,
   creatorProvenanceBlocks,
   creatorRosterBlocks,
   creatorSourceOf,
@@ -57,6 +61,8 @@ export {
   synthPlaybook,
   synthReport,
   unwrap,
+  withLiveCreatorStats,
+  type CreatorLiveView,
   type PlatformAccountAgg,
   type PrefetchedToolData,
 } from "./synthesis.ts";

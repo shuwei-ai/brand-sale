@@ -1139,7 +1139,7 @@ function validateBlock(b: unknown, issues: string[], path: string): Block {
           ...(size !== undefined ? { size } : {}),
         };
       });
-      return { type: "matrix", xLabel: checkString(o.xLabel, issues, `${path}.xLabel`), yLabel: checkString(o.yLabel, issues, `${path}.yLabel`), cells };
+      return { type: "matrix", xLabel: checkString(o.xLabel, issues, `${path}.xLabel`), yLabel: checkString(o.yLabel, issues, `${path}.yLabel`), cells, ...sref };
     }
     case "timeline": {
       const phases = checkArray(o.phases, issues, `${path}.phases`, 1).map((p, i) => {
@@ -1167,6 +1167,69 @@ function validateBlock(b: unknown, issues: string[], path: string): Block {
       issues.push(`${path}.type 缺失或不是支持的块型，必须是 text|bullets|kpi|table|chart|matrix|timeline|callout|quote|image 之一，实际 ${JSON.stringify(o.type)}`);
       return { type: "text", style: "body", content: "" };
   }
+}
+
+/**
+ * 单页校验。
+ *
+ * 抽出来是为了**两个 schema 共用同一份规则**：
+ *   · `ReportDslSchema`（整份报告）
+ *   · `ReportPagePatchSchema`（P1 按页补丁，只回喂出问题的那几页）
+ *
+ * 两套校验各写一遍必然分叉——补丁页会「生成期过、渲染期不过」或者反过来，这正是
+ * 2026-10-16 那轮事故的形状（生成期判阻塞 / 渲染期能修，口径不一致烧掉 23 分钟）。
+ */
+function validateSlide(raw: unknown, issues: string[], path: string): SlideSpec {
+  const o = checkObject(raw, issues, path);
+  const pageRole = checkEnum(o.pageRole, PAGE_ROLES, issues, `${path}.pageRole`, "content");
+  const blocks = checkArray(o.blocks, issues, `${path}.blocks`, 1).map((b, j) => validateBlock(b, issues, `${path}.blocks[${j}]`));
+  const citations: SlideSpec["citations"] = checkArray(o.citations ?? [], issues, `${path}.citations`).map((c, j) => {
+    const cPath = `${path}.citations[${j}]`;
+    const co = checkObject(c, issues, cPath);
+    // kind 缺失必须报错，不能静默兜底成 model_inference —— 兜底会把「模型漏字段」
+    // 洗成「一条合法的推断引用」，问题被掩盖到渲染期才暴露。
+    if (co.kind === undefined || co.kind === null) {
+      issues.push(`${cPath}.kind 缺失，必须是 data_source|kb_chunk|model_inference`);
+    }
+    const kind = checkEnum(co.kind, CITATION_KINDS, issues, `${cPath}.kind`, "model_inference");
+    const refObj = isObj(co.ref) ? (co.ref as Record<string, unknown>) : {};
+    // kind 与 ref 必须自洽：sourceKey 对应 data_source、chunkId 对应 kb_chunk
+    if (kind === "data_source" && typeof refObj.sourceKey !== "string") {
+      issues.push(`${cPath}：kind=data_source 时 ref.sourceKey 必填`);
+    }
+    if (kind === "kb_chunk" && typeof refObj.chunkId !== "string") {
+      issues.push(`${cPath}：kind=kb_chunk 时 ref.chunkId 必填`);
+    }
+    const tier = checkEnum(co.tier, CONFIDENCE_TIERS, issues, `${cPath}.tier`, kind === "model_inference" ? "low" : "medium");
+    if (kind === "model_inference" && tier !== "low") {
+      issues.push(`${cPath}：kind=model_inference 必须 tier=low（当前 ${tier}）——推断不是引用依据`);
+    }
+    const grade = checkEnum(co.grade, GRADES, issues, `${cPath}.grade`, "L3");
+    return {
+      claim: checkString(co.claim, issues, `${cPath}.claim`),
+      kind,
+      ref: {
+        ...(typeof refObj.sourceKey === "string" ? { sourceKey: refObj.sourceKey } : {}),
+        ...(typeof refObj.chunkId === "string" ? { chunkId: refObj.chunkId } : {}),
+        ...(typeof refObj.runId === "string" ? { runId: refObj.runId } : {}),
+        ...(typeof refObj.fieldPath === "string" ? { fieldPath: refObj.fieldPath } : {}),
+      },
+      grade,
+      confidence: checkNumber(co.confidence, issues, `${cPath}.confidence`, 0, 1),
+      tier,
+      verifiedBy: (co.verifiedBy === "human" ? "human" : "auto") as "auto" | "human",
+    };
+  });
+  const notes = optionalString(o.notes, issues, `${path}.notes`);
+  return {
+    index: checkNumber(o.index, issues, `${path}.index`, 0),
+    pageRole,
+    title: checkString(o.title, issues, `${path}.title`),
+    layoutId: typeof o.layoutId === "string" && o.layoutId ? o.layoutId : "content/default",
+    blocks,
+    citations,
+    ...(notes ? { notes } : {}),
+  };
 }
 
 export const ReportDslSchema: SchemaDef<ReportDsl> = {
@@ -1200,7 +1263,8 @@ export const ReportDslSchema: SchemaDef<ReportDsl> = {
                                        "series": [{ "name": string, "points": [{ "x": string, "y": number }] }],
                                        "axis?": { "xLabel?": string, "yLabel?": string }, "sourceRef?": string },
                  { "type": "matrix",   "xLabel": string, "yLabel": string,
-                                       "cells": [{ "x": number, "y": number, "label": string, "size?": number }] },
+                                       "cells": [{ "x": number, "y": number, "label": string, "size?": number }],
+                                       "sourceRef?": string },
                  { "type": "timeline", "phases": [{ "label": string, "from": "YYYY-MM-DD", "to": "YYYY-MM-DD",
                                                     "items": string[] }], "sourceRef?": string },
                  { "type": "callout",  "tone": "info|warn|risk", "text": string, "sourceRef?": string },
@@ -1229,58 +1293,7 @@ export const ReportDslSchema: SchemaDef<ReportDsl> = {
     const windowTo = checkString(metaWindow.to, issues, "$.meta.window.to");
 
     const slidesRaw = checkArray(root.slides, issues, "$.slides", 1);
-    const slides: SlideSpec[] = slidesRaw.map((s, i) => {
-      const o = checkObject(s, issues, `$.slides[${i}]`);
-      const pageRole = checkEnum(o.pageRole, PAGE_ROLES, issues, `$.slides[${i}].pageRole`, "content");
-      const blocks = checkArray(o.blocks, issues, `$.slides[${i}].blocks`, 1).map((b, j) => validateBlock(b, issues, `$.slides[${i}].blocks[${j}]`));
-      const citations = checkArray(o.citations ?? [], issues, `$.slides[${i}].citations`).map((c, j) => {
-        const cPath = `$.slides[${i}].citations[${j}]`;
-        const co = checkObject(c, issues, cPath);
-        // kind 缺失必须报错，不能静默兜底成 model_inference —— 兜底会把「模型漏字段」
-        // 洗成「一条合法的推断引用」，问题被掩盖到渲染期才暴露。
-        if (co.kind === undefined || co.kind === null) {
-          issues.push(`${cPath}.kind 缺失，必须是 data_source|kb_chunk|model_inference`);
-        }
-        const kind = checkEnum(co.kind, CITATION_KINDS, issues, `${cPath}.kind`, "model_inference");
-        const refObj = isObj(co.ref) ? (co.ref as Record<string, unknown>) : {};
-        // kind 与 ref 必须自洽：sourceKey 对应 data_source、chunkId 对应 kb_chunk
-        if (kind === "data_source" && typeof refObj.sourceKey !== "string") {
-          issues.push(`${cPath}：kind=data_source 时 ref.sourceKey 必填`);
-        }
-        if (kind === "kb_chunk" && typeof refObj.chunkId !== "string") {
-          issues.push(`${cPath}：kind=kb_chunk 时 ref.chunkId 必填`);
-        }
-        const tier = checkEnum(co.tier, CONFIDENCE_TIERS, issues, `${cPath}.tier`, kind === "model_inference" ? "low" : "medium");
-        if (kind === "model_inference" && tier !== "low") {
-          issues.push(`${cPath}：kind=model_inference 必须 tier=low（当前 ${tier}）——推断不是引用依据`);
-        }
-        const grade = checkEnum(co.grade, GRADES, issues, `${cPath}.grade`, "L3");
-        return {
-          claim: checkString(co.claim, issues, `${cPath}.claim`),
-          kind,
-          ref: {
-            ...(typeof refObj.sourceKey === "string" ? { sourceKey: refObj.sourceKey } : {}),
-            ...(typeof refObj.chunkId === "string" ? { chunkId: refObj.chunkId } : {}),
-            ...(typeof refObj.runId === "string" ? { runId: refObj.runId } : {}),
-            ...(typeof refObj.fieldPath === "string" ? { fieldPath: refObj.fieldPath } : {}),
-          },
-          grade,
-          confidence: checkNumber(co.confidence, issues, `${cPath}.confidence`, 0, 1),
-          tier,
-          verifiedBy: (co.verifiedBy === "human" ? "human" : "auto") as "auto" | "human",
-        };
-      });
-      const notes = optionalString(o.notes, issues, `$.slides[${i}].notes`);
-      return {
-        index: checkNumber(o.index, issues, `$.slides[${i}].index`, 0),
-        pageRole,
-        title: checkString(o.title, issues, `$.slides[${i}].title`),
-        layoutId: typeof o.layoutId === "string" && o.layoutId ? o.layoutId : "content/default",
-        blocks,
-        citations,
-        ...(notes ? { notes } : {}),
-      };
-    });
+    const slides: SlideSpec[] = slidesRaw.map((s, i) => validateSlide(s, issues, `$.slides[${i}]`));
 
     const sd = checkObject(root.sourceDeclaration, issues, "$.sourceDeclaration");
     const sources = checkArray(sd.sources, issues, "$.sourceDeclaration.sources", 1).map((s, i) => {
@@ -1321,6 +1334,82 @@ export const ReportDslSchema: SchemaDef<ReportDsl> = {
   }),
 };
 
+/* ── 7. ReportPagePatchSchema（P1 按页补丁回喂） ───────────
+ *
+ * 为什么要有它：整份回喂（`ReportDslSchema`）的代价是 **输出 4 万 token / 10–20 分钟**，
+ * 而且重写有副作用——真机 job_0mv9k0wvg8vvpwmqd9y 里模型为了修 slides[9] 的 matrix，
+ * 把整份重写了一遍，同一块依旧漏 `sourceRef`，别的页面还可能被改坏。
+ *
+ * 补丁模式只让模型输出**出问题的那几页**（通常是 1–2 页），其余页面原样保留：
+ *   · 输出量从 40k 降到 1–2k token；
+ *   · 没被点名的页**物理上不可能被改坏**；
+ *   · 合并时按 `index` 对位替换，页序与页数不变。
+ *
+ * ⚠️ 两处硬约束：
+ *   ① 页结构校验必须**复用** `validateSlide`（与整份 schema 共用一份规则，不许各写一套）；
+ *   ② `blocks` 是**整页替换**而非增量合并——增量语义会让模型只输出"改动的块"，
+ *      然后丢掉原来的图表，这不是修复而是删内容。
+ */
+export interface ReportPagePatch {
+  slides: SlideSpec[];
+}
+
+export const ReportPagePatchSchema: SchemaDef<ReportPagePatch> = {
+  name: "ReportPagePatchSchema",
+  skeleton: `{
+  "slides": [{ "index": number,                     // 必须与「需要重写的页」清单中的 index 完全一致
+               "pageRole": "cover|toc|section|content|data|appendix|closing",   // 保持原值
+               "title": string,                     // 保持原值
+               "layoutId": string,                  // 保持原值
+               "blocks": [                          // **整页完整列表**：没问题的块要原样带上，不是只写改动
+                 { "type": "text",     "style": "h2|h3|body|caption", "content": string, "sourceRef?": string },
+                 { "type": "bullets",  "items": string[], "sourceRef?": string },
+                 { "type": "kpi",      "items": [{ "label": string, "value": string, "unit?": string,
+                                                   "confidence?": number, "tier?": "high|medium|low",
+                                                   "sourceRef?": string }], "sourceRef?": string },
+                 { "type": "table",    "columns": string[], "rows": string[][], "caption?": string, "sourceRef?": string },
+                 { "type": "chart",    "chartType": "bar|line|pie|scatter|funnel",
+                                       "series": [{ "name": string, "points": [{ "x": string, "y": number }] }],
+                                       "axis?": { "xLabel?": string, "yLabel?": string }, "sourceRef?": string },
+                 { "type": "matrix",   "xLabel": string, "yLabel": string,
+                                       "cells": [{ "x": number, "y": number, "label": string, "size?": number }],
+                                       "sourceRef?": string },
+                 { "type": "timeline", "phases": [{ "label": string, "from": "YYYY-MM-DD", "to": "YYYY-MM-DD",
+                                                    "items": string[] }], "sourceRef?": string },
+                 { "type": "callout",  "tone": "info|warn|risk", "text": string, "sourceRef?": string },
+                 { "type": "quote",    "text": string, "attribution?": string, "sourceRef?": string },
+                 { "type": "image",    "ref": string, "caption?": string, "sourceRef?": string }
+               ],
+               "citations": [{ "claim": string,
+                               "kind": "data_source|kb_chunk|platform_entry|model_inference",
+                               "ref": { "sourceKey?": string, "chunkId?": string, "entryId?": string },
+                               "grade": "L2|L3", "confidence": number,
+                               "tier": "high|medium|low", "verifiedBy": "auto|human" }],
+               "notes?": string }]
+}  // 只返回被点名的页；每页 blocks 为完整列表；含数字的块必须给 sourceRef`,
+  validate(input) {
+    const issues: string[] = [];
+    const root = checkObject(input, issues, "$");
+    // 空补丁视为失败：没有任何页被重写却消耗了一轮，不该被当成"修好了"
+    const raw = checkArray(root.slides, issues, "$.slides", 1);
+    const slides = raw.map((s, i) => validateSlide(s, issues, `$.slides[${i}]`));
+    throwIfAny(issues);
+    return { slides };
+  },
+  mock: () => ({
+    slides: [
+      {
+        index: 0,
+        pageRole: "content",
+        title: "占位页",
+        layoutId: "content/default",
+        blocks: [{ type: "text", style: "body", content: "占位" }],
+        citations: [],
+      },
+    ],
+  }),
+};
+
 export const ALL_SCHEMAS = [
   BriefSchema,
   CompetitorIntelSchema,
@@ -1328,6 +1417,7 @@ export const ALL_SCHEMAS = [
   PlaybookSchema,
   BudgetSchema,
   ReportDslSchema,
+  ReportPagePatchSchema,
 ] as const;
 
 export { SchemaError };

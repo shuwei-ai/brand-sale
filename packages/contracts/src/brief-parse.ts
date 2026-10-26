@@ -350,7 +350,18 @@ const INDUSTRY_LEXICON: { industry: string; categories: { re: RegExp; name: stri
     ],
   },
   { industry: "食品饮料", categories: [{ re: /咖啡/, name: "饮料-咖啡" }, { re: /零食/, name: "休闲食品" }, { re: /奶粉|营养品/, name: "营养保健" }] },
-  { industry: "服饰鞋包", categories: [{ re: /女装/, name: "女装" }, { re: /运动鞋|跑鞋/, name: "运动鞋服" }] },
+  {
+    industry: "服饰鞋包",
+    categories: [
+      { re: /女装/, name: "女装" },
+      { re: /运动鞋|跑鞋/, name: "运动鞋服" },
+      /* 冬装两件套：口述里出现「羽绒服」「保暖内衣」时**不要**交给 LLM 补全 ——
+       * LLM 无人约束时会给出英文标识符（实测 `headphones`/`thermal underwear`），
+       * 而 `category` 会被逐字当平台搜索词，英文在中文平台等于 0 条（WP-C-11）。 */
+      { re: /羽绒服|鹅绒|鸭绒/, name: "羽绒服" },
+      { re: /保暖内衣|保暖衣|秋衣|秋裤|打底衫|发热内衣/, name: "保暖内衣" },
+    ],
+  },
   /*
    * 3C 数码。**为什么必须进词表**：`category` 不只是分类标签，它会被
    * `agents.ts:platformPrefetchArgs()` **逐字当作平台内的搜索关键词**（抖音/小红书/B站）。

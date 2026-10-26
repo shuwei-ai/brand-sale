@@ -827,3 +827,26 @@ test("聚合工具：逐源过闸门 —— 单个平台被撤销授权时只跳
   }
 });
 
+/* 报告阶段的补读权限（2026-10-20）：漏掉这条 = 粉丝量永远「未采集」。
+ *
+ * 事故链：作者主页资料行比 creator 阶段晚到 → 只有 report 阶段还有机会补读 →
+ * `refreshPlatformData` 用 `PHASE_AGENT["report"]`（= RG）调 `platform_digest` →
+ * 但白名单只有 CI/CT → `invoke` 第一步就抛 E-GOV-004 → 补读失效。
+ * 这是隐藏在"数据没采到"后面的第四层原因，静默且在日志里只表现为一条降级项。 */
+test("platform_digest 的白名单必须包含 RG（否则报告阶段的终稿前补读被拒）", async () => {
+  const { c, dispose } = await freshContainer(MC_ON);
+  try {
+    const tool = c.agentPack.registry.get("platform_digest");
+    assert.ok(tool, "platform_digest 应注册");
+    assert.ok(
+      tool.policy.allowedAgents.includes("RG"),
+      `RG 必须在白名单里，实际：${tool.policy.allowedAgents.join("/")}。` +
+        "少了它，report 阶段那次补读会撞 E-GOV-004 —— 数据躺在缓存里，报告还是写「未采集」",
+    );
+    assert.ok(tool.policy.allowedAgents.includes("CI") && tool.policy.allowedAgents.includes("CT"), "情报与选人两个角色本来就要有");
+    /* 有界性不受影响：系统侧补取走 systemCall 不计入，模型侧仍受 maxCallsPerJob 约束 */
+    assert.equal(tool.policy.maxCallsPerJob, 8, "外部计费源必须有单任务调用上限");
+  } finally {
+    dispose();
+  }
+});

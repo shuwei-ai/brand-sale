@@ -5,7 +5,7 @@
 >
 > 核对基线：2026-10-13 工作区（`npm test` 210 用例全绿、`npm run check:boundaries` 通过）。
 > 2026-10-14 局部更新：采集浏览器会话改为 `reuse` 常驻复用（§8.5）、删除死配置
-> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **229**（见 §14）。
+> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **253**（见 §14）。
 
 ## 0. 阅读指引
 
@@ -91,7 +91,7 @@
 | `apps/gateway` | 5 | 902 | HTTP + SSE 接入层 |
 | **合计（TS）** | **89** | **≈24 200** | 另有采集内核 Python（内嵌 MediaCrawler） |
 
-测试：**17 个文件 / 229 个用例**，全部离线可跑（§12）。
+测试：**19 个文件 / 253 个用例**，全部离线可跑（§12）。
 
 ---
 
@@ -146,7 +146,7 @@
 
 ```bash
 npm install                 # 一次性
-npm test                    # 全离线自检（229 用例）
+npm test                    # 全离线自检（253 用例）
 npm run migrate             # 建表（dev 模式空库会自动灌种子）
 npm run seed                # 登记内置数据源与演示租户
 npm run web:build           # 构建前端控制台 → apps/web/dist
@@ -447,7 +447,7 @@ ReportDsl {
 
 | 规则 | 内容 |
 |---|---|
-| R6 | 含数字断言的页面：既要"至少一条**可用** citation"，要么该页**所有**含数字的 block 都声明了**有效** `sourceRef`；两者皆无 → **error，`repairable` 未置位，拒绝渲染** |
+| R6 | 含数字断言的页面：既要"至少一条**可用** citation"，要么该页**所有**含数字的 block 都声明了**有效** `sourceRef`；两者皆无 → error。**`repairable` 按该页有没有"可回挂的逻辑引用"条件置位**（2026-10-16）：该页 citations 里存在一条误置的逻辑引用、且它归一后∈`logicalRefs` 时，autoRepair 会把它摘出来回挂到无 `sourceRef` 的数字块上（见 §5.4），此时标 `repairable: true`；没有可回挂的引用则**不置位**（只能靠回喂，系统不许凭空造来源） |
 | R8 | 任何 citation 的 `grade === "L4"` → error（闸门最后一道保险） |
 | R10 | `sourceDeclaration` 缺失或为空 → error |
 | R13 | `kind=platform_entry` 的 `ref.entryId` 不在 `catalog.evidenceEntries` → error（不给该字段=不校验；给空数组=判非法） |
@@ -463,7 +463,7 @@ ReportDsl {
 | R5 | `model_inference` 却 `tier≠low` | 降到 low（warn） |
 | R9 | `tier="low"` 的 KPI 所在页缺 `warn` callout | 补一个 |
 | R11 | `block.sourceRef` 不在 `logicalRefs ∪ 已声明 sources` | 别名归一（warn） |
-| R14 | **未指定自有品牌**（`opts.hasOwnBrand === false`）却在报告渲染文本里出现「我方 / 本品 / 本方 / 品牌自诊」 | 剔除含违禁词的句子 / 条目 / 列 / 标签（见 `stripOwnBrandLeak`） |
+| R14 | **未指定自有品牌**（`opts.hasOwnBrand === false`）却在报告渲染文本里出现「我方 / 本品 / 本方 / 品牌自诊」 | 剔除含违禁词的句子 / 条目 / 列 / 标签（见 `stripOwnBrandLeak`）；「本品牌」按整词换主语（→「品牌」）而不是删词；「本方案」等中性词由 `LEAK_EXEMPT` 豁免 |
 
 **只提示不阻塞**：R7（结构性页面豁免）、R12（可溯源引用占比 < 60% → warn，深度问题交给深度策略）。
 
@@ -477,10 +477,71 @@ ReportDsl {
 - **"负面声明"也算违规**。模型很爱写「由于未指定自有品牌，报告不含任何『我方』或『本品』的自诊数据」——
   它是在守规矩，但**声明本身就把这两个词写进了报告**。规则必须连它一起拦，否则"报告里不得出现我方"
   这条校验形同虚设。要交代口径就描述动作、不复述名词（提示词已给出正例/反例）。
+- **匹配走"扫描器 + 豁免表"，不走裸正则**（2026-10-16）。违禁词都是两个汉字，中文没有词边界，
+  裸正则的子串匹配必然误伤 —— 真机 `job_0mv9k0wvg8vvpwmqd9y` 一天踩两次：「本品牌」含「本品」
+  被挖成「挤压**牌**声量份额」；「本方案」含「本方」导致整句被删。现在 `scanLeaks()` 从左到右
+  扫一遍、每个位置**先豁免（`LEAK_EXEMPT`）、再整词换主语（`LEAK_NEUTRALIZE`）、最后删词（`LEAK_DROP`）**
+  并各取最长命中；判定与修复的唯一入口是 `hasOwnBrandLeak()`（`OWN_BRAND_LEAK_RE` 只是词表的可读形式，
+  **不参与匹配**）。新增误伤词加到 `LEAK_EXEMPT`，不要改松 `LEAK_DROP`。
 
 **降级阶梯**（R13 失效时）：条目级 → 来源级（保留 `sourceKey`）→ `model_inference/low`。
 
 ### 5.4 自动修复（`autoRepair`）与修复分级
+
+**P0 自愈（2026-10-17）**：`finalizeReport` 在自校验前**先 `autoRepair` 一遍**，对**修后 DSL**
+再判阻塞、回喂、失败降级。`autoRepair` 本就是 contracts 导出的 pure function（`packages/contracts/src/report.ts:1182`），
+agent-pack 已重度依赖 contracts → 这一步零边界成本。**P0 把"渲染期才修"与"生成期才判"这两条
+曾经分叉的路径合并成一条**：
+
+```
+旧：finalizeReport → validateReportDsl 判阻塞 → 渲染期 compile 走 autoRepair
+新：finalizeReport → autoRepair 修一遍 → validateReportDsl 对修后判阻塞 → 渲染期 compile 走 autoRepair 兜底
+```
+
+- 历史问题（3 天复现 3 次）：R6 误置引用 + 数字块漏 `sourceRef` 的组合，渲染期 `autoRepair` 顺手能修好
+  且归观感级，但生成期 `validateReportDsl` 把它判成阻塞 → 整份回喂（40k token / 10-20 分钟）→ 重写
+  后同一块依旧漏 `sourceRef` → 标 partial。P0 后这种情况直接走 cosmetic，不进回喂路径。
+- P0 边界：**R6 仍报 `repairable: undefined` 时**（如"无可回挂引用 + 无 citation + matrix 漏 sourceRef"），
+  P0 也救不回来 —— 那种必须回喂或如实标脏，系统**绝不能凭空给数字块捏一个来源**（R6 底线，用例 ⑨ 钉死）。
+- 失败降级也变了：旧实现 `repaired.ok === false` 时返回**未修复原稿**，若含非 repairable error →
+  渲染期 `compile()` 再次校验命中 → 抛"拒绝渲染" → 报告整份丢失（`job_0mv7sfn3kh7q2k0h80l` 即此路径）。
+  P0 后返回 `firstRepair.dsl`（已机械修过），把"机械修不掉"的部分如实落进 `markDegraded`。
+- 与 R14 `keptAbsence`（§5.4 下面"被 R6 保护留下的缺失声明"那段）**不冲突**：`keptAbsence` 在 R3
+  降级这一行把 cosmetic 口径钉住；P0 在 finalizeReport 这一头把"修前判"换成"修后判"，两个动作各管一段。
+
+回归用例 `tests/report-repair.test.ts` ⑰/⑱。
+
+**P1 按页补丁（2026-10-18）**：P0 把"机械可修"的拣出来了，剩下的回喂全是**内容问题**
+（数字缺来源、口径违规、页太空），但代价没变 —— 单次输出 4 万 token / 10–20 分钟，
+而且会**顺手改坏没出问题的页**。P1 把"整份重写"换成"只重写出问题的那几页"：
+
+```
+旧：问题清单 → completeJson(ReportDslSchema)  ← 整份输出 40k token，10-20 分钟
+新：问题清单 → 归页 → completeJson(ReportPagePatchSchema)  ← 只输出 1-3 页，~300 token / 5 秒
+     → mergePatchedPages(index 对位替换) → enrichProvenance → autoRepair → 复核
+```
+
+- **归页**：issue 的 `path` 是 `slides[N].…` 就归到第 N 页；`sourceDeclaration.*` 与无页号的 `slides`
+  属于**全局问题**（补丁动不了来源声明与页数）→ 整份重写。
+- **补丁页数上限 3**：再多，补丁提示词本身也不便宜了，直接整份。
+- **进度度量**：问题数（阻塞项 ×100 + 深度缺口）必须**严格下降**才采纳。不下降就中断 ——
+  这一轮白跑（模型没修好，或把 A 修好了却弄坏 B），直接采纳比不修更糟。
+  上限 **2 轮**，防打转。
+- **掏空保护**：补丁页块数少于原页一半 → 视为"这不是修复而是删内容"，保留原页
+  （真机见过：模型被要求"补 sourceRef"时把整页重写成一句"详见附录"）。
+- **失败退路**：`E-AGENT-001`（模型又按整份 schema 输出）→ 下一轮退回整份重写；
+  `E-AGENT-002`（超时/传输）→ 不退回，免得再等十分钟。
+- **`callId` 必须带轮次**（`patch_<job>_report_r1`）：用量以 `(jobId, phase, attempt, callId)`
+  幂等落库，不带轮次的话第二轮会被当成重放、**用量不记账**。
+
+真实端点探针（同样的 prompt、同样的模型）：补丁 schema **完全被照做**——返回 1 页 / `index=9` /
+2 块完整保留 / 输出 **287 token** / **4.5 秒**；同一份任务整份重写是 ~40k token / 10-20 分钟。
+
+> ⚠️ **顺带查出的真病根**：`validateBlock` 的 `matrix` 分支**没带 `...sref`**，模型写进 matrix 的
+> `sourceRef` 在**校验层被静默吞掉** → R6 判"无来源数字断言" → 回喂 → 模型再写 → 又丢。
+> **模型不是学不会，是它写的东西被我们自己丢了**；"R6 对 matrix 不可修复"是假象。
+> 已在 schema + 两处骨架补回，并用 `schema-coverage.test.ts` 的「十种块型都必须能带 `sourceRef`」
+> 钉死。修完后真机重跑：**一次回喂都没有**（`attempts=1`）、`degraded=[]`、8 分 33 秒。
 
 `autoRepair` 返回 `{ dsl, actions, cosmeticActions }`：
 
@@ -508,6 +569,19 @@ ReportDsl {
   但引用形态判定只对**带前缀**的字符串做正则，别名表没参与 —— 写 `tool:pricing` 会被"降落"到块级
   `sourceRef`，写裸的 `pricing` 却掉进降级路径。同一个东西两种命运，只取决于模型敲没敲那个前缀。
   现在 `isMisplacedLogicalRef` 一并认「别名表能归一」的裸写；**认不出的自造 key（`mc_unknown`）仍降级**。
+- **R6 的条件化 `repairable`（2026-10-16）**：R6 只有在"该页有一条可回挂的逻辑引用"时才是可机械修复的
+  （autoRepair 的下一条路径会把它回挂上去）；没有可回挂引用时不置位。这条改的是**生成期与渲染期的口径**：
+  生成期 `finalizeReport` 只把 `!repairable` 的 error 当阻塞项去回喂，若把可修的 R6 也当阻塞，
+  就会为一件渲染期顺手能修的事白跑一次整份报告回喂（真机 `job_0mv9k0wvg8vvpwmqd9y`：
+  report 阶段 23 分钟、单次 4 万 token，重写后同一块依旧漏 `sourceRef`），任务反被标成 partial。
+- **自我指涉词的判定改成"扫描器 + 豁免表"（2026-10-16）**：违禁词都是两个汉字，而中文没有词边界，
+  裸正则的子串匹配**必然**误伤 —— 同一个真机任务一天踩了两次：「本品牌」含「本品」→ 被从词中间挖掉两个字，
+  产出「挤压**牌**声量份额」；「本方案」含「本方」→ 整句「…这也是本方案把预算重心压在中段的依据。」被删掉
+  （还按数据级记了账、把任务标脏），而它说的是"本报告提出的方案"。现在 `scanLeaks()` 从左到右扫一遍、
+  每个位置**先豁免（`LEAK_EXEMPT`）、再整词换主语（`LEAK_NEUTRALIZE`：本品牌 → 品牌）、最后删词（`LEAK_DROP`）**
+  并各取最长命中 —— 这就是中文版的词边界，也是"本品牌"不会被拆成「本品」+「牌」的原因。
+  判定与修复共用这一份扫描（`hasOwnBrandLeak` 是唯一入口）；**纯中性化替换**（没删断言、没碰数字）记
+  **cosmetic**，删词/删句型仍按 data 级保守记账。
 
 > **历史事故（务必看这段再改 autoRepair）**：R3 的前置特例是"逻辑命名空间被误当数据源"
 > （`meta:*` / `phase:*` / `tool:*` / `degrade:*` 是**块级 sourceRef** 的写法，不是数据源；
@@ -519,7 +593,22 @@ ReportDsl {
 >
 > 现行做法：把这条逻辑引用**改挂到该页含数字断言的 block 上当 `sourceRef`**（最小改动，
 > 溯源还保住了），认不出的写法才退回移除；并且 R6 与 autoRepair **共用唯一判定函数**
-> `isMisplacedLogicalRef`。回归用例：`tests/report-repair.test.ts` ⑧⑨⑩⑪⑫⑬⑭⑮。
+> `isMisplacedLogicalRef`。
+>
+> **2026-10-16 补**：上面的"认不出的写法才退回移除"同样是**有条件的** —— 如果移除会让该页
+> 失去唯一的可用引用、而页上还有含数字却没 `sourceRef` 的块，就**不能移除**（否则同一次 compile 里
+> 又制造出那条不可修复的 error，报告整份丢失；实测 `phase:unknown_thing` / `tool:nope` 可复现）。
+> 此时退回普通降级路径（R3 把它降成 `model_inference/low`）。同一条 R6 保护现在覆盖两处：
+> 「缺失声明型引用」与「认不出的命名空间引用」。
+>
+> **2026-10-16 再补（记账口径）**：被 R6 保护**留下**的缺失声明，降级时按**观感级**记账
+> （`keptAbsence` 参与 `cosmetic` 判定）。不这么改就会出现一个说不通的结果：同一个写作瑕疵
+> （把"无样本"写成 citation、`sourceKey` 还用了逻辑命名空间），同页**有**别的可用引用时算观感级、
+> 恰好**没有**时算数据级 —— **任务脏不脏取决于同页其他槽位**。真机
+> `job_0mv9k0wvg8vvpwmqd9y` 的第二次重跑正是被这一条标成 `partial`（报告文本一字未改）。
+>
+> 回归用例：`tests/report-repair.test.ts` ⑧⑨⑨′⑩⑪⑫⑬⑭⑮⑯⑰⑱。（⑬ 与 ⑯ 同场景但分工不同：
+> ⑬ 用**裸写别名** `pricing` 守"不许移除、不许改挂无关块"，⑯ 用 `tool:pricing` 守"记账口径"。）
 
 ### 5.5 深度策略（`report-depth.ts`）
 
@@ -1276,7 +1365,7 @@ knowledge → model-gateway → agent-pack → render → orchestrator → gatew
 
 ### 12.1 测试体系
 
-`npm test` = **17 个文件 / 229 个用例，全部离线可跑**：
+`npm test` = **19 个文件 / 253 个用例，全部离线可跑**：
 
 ```
 BM_LLM_MODE=mock BM_ALLOW_DEMO_DATA=true BM_MC_ENABLED=false BM_MC_LICENSE_ACK=false \
@@ -1345,7 +1434,7 @@ node --import tsx --test tests/*.test.ts
 
 | # | 位置 | 现状 | 实情 |
 |---|---|---|---|
-| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日多次增补后为 **220**、2026-10-15 为 **227**、2026-10-16 为 **229**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
+| 1 | `README.md`「快速开始」 | 曾写 "npm test # 135 个用例" | 实际 **213**（§12.1，2026-10-14 当日数值；同日多次增补后为 **220**、2026-10-15 为 **227**、2026-10-16 为 **229** → **233**）→ **2026-10-14 已同步**；同段的"不构建则回退内置零构建控制台"也一并改为"返回内置引导页" |
 | 2 | `README.md` 架构图 | `render  M16 渲染` | 渲染是 **M11**；M16 在代码里不存在（`check-boundaries.ts` 的注释也误写为 M16） |
 | 3 | `README.md` | "不构建则回退内置零构建控制台" | 旧控制台（`console.ts` + `/console-legacy`）**已删除**，现在返回引导页（§11.3） |
 | 4 | `README.md` | "七个平台采集已接入…17 个工具" 类表述 | 工具总数 **18**：10 个通用 + `platform_digest` + 7 个 hidden 原语（§7.2） |
@@ -1371,14 +1460,20 @@ node --import tsx --test tests/*.test.ts
 
 | 18 | `contracts/src/report.ts` **autoRepair 的两处分级错位** + `agent-pack/src/prompts.ts` **R9 的术语与契约对不上** | ① `pricing` 这类**裸写**逻辑引用掉进"引用了未声明的来源"降级 —— `REF_ALIASES` 早就把 `pricing` 归一到 `tool:pricing`，但引用形态判定只对**带前缀**的字符串做正则，别名表根本没参与；② 缺失声明（claim=「所有候选人报价未采集」）被降级成 `model_inference/low`，报告里凭空多出一条「模型推断：报价未采集」；③ R9 自动补的 warn callout 记 **data 级**；④ 提示词写「confidence < 0.45 的 KPI」，而 R9 实际判定的是 `tier === "low"`，模型无从遵守 | 真机 `job_0mv86by83ilvbnn0h1a`（2026-10-15）控制台报「降级与缺失（1 项）」→「产出不完整」，拆开看是**模型写作瑕疵被系统纠正**、报告本身并无数据缺失（77 条真实证据、粉丝量 24/24 全为真值）→ **2026-10-15 修**：缺失声明改判为**移除**且判据取 claim 语义（带 R6 保护，见 §5.4）；补 warn callout 与「裸写逻辑引用降落为块级 sourceRef」一并归 **cosmetic**；提示词改用契约的原术语（`tier:"low"`）并新增「**规则 C｜『缺失』不是引用**」+ 规则 A 反例补 `pricing`。修复后同一份真实 DSL 的 **data 级修复 2 → 0**、error 0。回归用例 `report-repair.test.ts` ⑫⑬⑭⑮ |
 
-**其它值得知道的边界**：
+| 19 | `contracts/src/report.ts` **两阶段口径不一致（R6）+ 自我指涉词判定** + `agent-pack/src/agents.ts` **回喂清单缺改法** | ① `validateReportDsl` 把 R6 一律当"不可机械修复"，而 `autoRepair` 手里其实有一条确定性修法（把误置的逻辑引用从 citations 摘出、回挂到无 `sourceRef` 的数字块）；② R14 的违禁词是**裸正则子串**匹配 —— 「本品牌」含「本品」→ 修法变成"挖掉命中的两个字"，产出「…挤压**牌**声量份额」残句；「本方案」含「本方」→ 整句被删；③ 表格单元格的改写一律按 data 级记账（`record()` 没传 `removed` → `digits` 默认 `true`）；④ `finalizeReport` 的回喂清单只带 `issue.message`、**把 `issue.fix` 丢了**，且只给页级 path | 真机 `job_0mv9k0wvg8vvpwmqd9y`（2026-10-16，电瓶车）控制台报「降级与缺失（1 项）」，业主追问成因。离线复放该任务**未修复的**重跑产物实测：blocking 项只有 `slides[9]`（depth.gaps 为 0），而 `autoRepair` 把 `phase:budget` 回挂到 `matrix` 后 **0 issue** —— 生成期为一件渲染期顺手能修、且**归观感级**的事白跑了一次整份报告回喂（report 阶段 00:00:49→00:24:16，单次 4 万 token，重写后同一块依旧漏 `sourceRef`）。→ **2026-10-16 修**：R6 的 `repairable` 改为**按"该页有没有可回挂的逻辑引用"条件置位**；报错文案点名缺 `sourceRef` 的块序号与块型；回喂清单带上 `issue.fix`；自我指涉词改为 `scanLeaks()` 最长匹配扫描 + `LEAK_EXEMPT` 豁免表（本品牌 → 品牌 整词换主语、本方案/本品类 等普通名词不碰），纯替换归 cosmetic；提示词点明「数字断言按**块**判定、矩阵与图表同样要 `sourceRef`」以及「本品牌同样违规」。顺带堵上同源的一个**丢报告**缺口：「认不出的命名空间引用」（`phase:unknown_thing`）被移除后本页失去唯一来源 → 现在带同一条 R6 保护。**真机验证（重跑 report 阶段）**：report 阶段 `succeeded`、`meta.degraded` 为空，耗时 **23.5 → 10 分钟**（不再触发回喂）；同一轮把"本方案"那类误伤也复现并修掉了。**第二次重跑（report 阶段 10:49:30 → 10:57:14，7.7 分钟）暴露出最后一处同源分叉**：被 R6 保护**留下**的缺失声明（真机形态 `slides[6].citations: 「达人报价库（L2）本次查询全量返回无样本」引用了未声明的来源 tool:pricing`），其降级仍按 data 级记账 → 任务又被标成 `partial`（唯一一项，报告文本一字未改）；这属于"同一个写作瑕疵，脏不脏取决于同页有没有别的引用"的口径不一致 → 补 `keptAbsence` 参与 `cosmetic` 判定（见 §5.4）。**第三次重跑（11:02:45 → 11:09:04，6 分 19 秒）闭环**：`job_phases.attempts = 1`（**没有回喂**）、任务 `succeeded`、`degraded_json = []`；把该阶段产物（`output_json` = `autoRepair` 之前的 DSL）离线复放，修复前 **15 条 error 全部 `repairable: true`**（HEAD 版本那条 R6 无 `repairable` 字段 → 阻塞 → 回喂），修复后 **error 0**、`autoRepair` 产出 **data 级 0 / 观感级 13**，slides[9] 的 `matrix` 自动拿到 `sourceRef:phase:budget`。回归用例 `report-repair.test.ts` ⑨/⑨′/⑯、`brand-self.test.ts` WP-B-10′/10″（229 → **235**） |
 
+**其它值得知道的边界**：
 - `apps/gateway` 的优雅关闭对 SSE 长连接无效（§11.3），部署脚本应使用 `kill -9` 或超时兜底；
 - 各平台 `login.py` 的选择器是 DOM 硬编码，平台改版即失效；**除贴吧外六平台仍是上游原样**（§8.5）；
 - 粉丝画像（年龄/性别/地域）在公开 Web 接口层**一个平台都拿不到**，只能走 L1 官方通道（§8.7）；
 - `BM_VECTOR_DRIVER=milvus` 但 `BM_EMBED_URL` 为空时，语义通道**完全关闭且不记降级**
   （装配层只有启动告警），排查"检索怎么变笨了"时要先看这两个变量（§9.3）。
 
+| 20 | `agent-pack/src/agents.ts` **finalizeReport 的两段式口径仍是「生成期判阻塞、渲染期机械修」** | 真机复盘发现 ① 类（机械可修却被判阻塞）才是最大的浪费源：R6 历史 3 天复现 3 次、`meta:disclaimer` 与裸写 `pricing` 同样会触发整份回喂；P0 之前生成期永远在回喂那些**渲染期顺手就能修好、且归观感级**的事 —— 单次 40k token / 10-20 分钟纯烧。同时 ③ 类（回喂失败）的旧降级是返回**未修复的原图**，若含非 repairable error → 渲染期 `compile()` 再次校验命中 → 抛"拒绝渲染" → 报告整份丢失（`job_0mv7sfn3kh7q2k0h80l` 就是这条路径） | → **2026-10-17 P0 自愈**（`finalizeReport`）：① 自校验前**先跑一遍 `autoRepair`**，对**修后 DSL**判阻塞（纯本地迁移，无边界成本，因为 `autoRepair` 本就是 contracts 导出的 pure function）；② 失败降级返回 `firstRepair.dsl`（即已机械修过）+ `markDegraded` 如实标注"回喂失败"原因，**不再保留未修复原稿**；③ 早返回路径若仅有 cosmetic 修复，会在 `note` 里多记一行观感项数（便于观察）。**P0 的边界**：R6 仍报 `repairable: undefined` 时（如"无可回挂引用 + 无 citation + matrix 漏 sourceRef"），P0 也救不回来 —— 这种必须回喂或如实标脏，**系统绝不能凭空给数字块捏一个来源**（R6 底线，用例 ⑨ 钉死）。**与 §5.4 的差异**：R14 的 `keptAbsence` 已经在 R3 降级处把"修复后降级"的 cosmetic 口径钉住了，P0 只是在 finalizeReport 这一头把"修前判阻塞"换成"修后判阻塞"，语义不冲突。回归用例 `report-repair.test.ts` ⑰/⑱（233 → **235**） |
+
+| 21 | `agent-pack/src/agents.ts` **回喂只有"整份重写"一种形态** | P0 之后剩下的回喂全是"模型才能改的内容问题"，但代价没变：单次输出 4 万 token / 10–20 分钟，而且**会顺手改坏没出问题的页**（真机 `job_0mv9k0wvg8vvpwmqd9y`：为修 `slides[9]` 的 matrix 重写整份，同一块依旧漏 `sourceRef`）。业主的原话是「每次出报告都有这种问题，别让我审完再告诉你怎么修」——问题不在"修不修"，在**修的粒度太粗** | → **2026-10-18 P1 按页补丁**：新增 `ReportPagePatchSchema`（`{slides:[...]}`，页结构校验**复用** `validateSlide`，与整份 schema 同一份规则）；`finalizeReport` 的修复回路改成「归页 → 只重写问题页 → 按 `index` 对位合并」。四条硬约束：① 只替换同名页、页序页数不变；② 不认识的 `index` 忽略；③ **补丁把页掏空（块数腰斩）时保留原页**——"这不是修复而是删内容"；④ **进度度量**：问题数必须严格下降才采纳，不降就中断（防打转，也防"改好这页弄坏那页"）。补丁不被接受时（`E-AGENT-001`，模型又整份输出）自动退回整份重写；`E-AGENT-002`（超时/传输）不退回，免得再等十分钟。真机探针（真实端点）：模型**完全照做**——1 页 / `index=9` / 2 块完整 / 输出 **287 token**（整份约 4 万）/ **4.5 秒**；`callId` 带轮次（`..._r1`），否则第二轮会被幂等当成重放、用量不记账。回归用例 `report-patch.test.ts` ⑲⑳㉑㉒㉓（235 → **241**） |
+| 22 | **`agent-pack/src/schemas.ts` 的 `validateBlock` 把 `matrix.sourceRef` 静默吞掉** —— 这才是 R6 反复回喂的**真正病根** | 契约类型 `Block` 里 matrix 早就有 `sourceRef?`（注释还写着"此前只有 matrix 缺这个字段，属于契约缺口而非设计取舍"），但 `validateBlock` 的 matrix 分支**没带 `...sref`**，骨架里也没写 `sourceRef`。后果是一条闭环的死循环：模型写 `matrix.sourceRef` → **校验层丢掉** → R6 判"含数字的块无来源" → 生成期阻塞 → 回喂 → 模型再写一次 → 又丢。**模型不是学不会，是它写的东西被我们自己丢了**；R6 对 matrix 而言"不可修复"是假象。发现方式：P1 的补丁探针打出 `matrix.sourceRef=(无)`，补上 `...sref` 后立刻变成 `phase:budget`（同样的 prompt、同样的模型） | → **2026-10-18 修**：matrix 分支补 `...sref`；两处骨架（`ReportDslSchema` / `ReportPagePatchSchema`）补 `"sourceRef?": string`；`schema-coverage.test.ts` 新增「十种块型都必须能把 `sourceRef` 原样带出来」（逐块型断言写入→读出一致，任何一层吞字段都会红）。**真机验证**（重跑 report 阶段，09:22:08 → 09:30:41，**8 分 33 秒**）：任务 `succeeded`、`degraded_json = []`、`attempts = 1`（**一次回喂都没有**）；产物 14 页里 **matrix/chart 4 个全部带 `sourceRef`**（含 `slides[9] matrix = phase:budget`），`citations` 17 条中**逻辑引用混入 0 条** |
+| 23 | **人选粉丝量永远显示「未采集」** —— 不是没采到，是**读的时刻不对** | 真机 `job_0mvgany95k7poz73mks`：报告里 5 位人选粉丝量全是「未采集」，而缓存里 06:45:09/06:45:28 就已采到 60.1 万 / 13.0 万 / 16.1 万 / 16.9 万 / 43.5 万。三层原因叠在一起：① 作者主页补采由 `enqueueAuthorProfiles` 在 search **完成时**派生并排到队尾，资料行比 creator 阶段结束（06:36:22）晚 9 分钟才落库；② `refreshPlatformData` 的**阶段白名单写死在 intel/creator**，而它在每个阶段终稿前本来就会调一次 —— report 阶段（06:45:37 起，跑了 12 分钟）**被这条 return 挡在门外**，数据躺在缓存里也没人读；③ 读侧取**写时快照**：`platformCreatorCandidates` 把 `followers` 固化成 0，`creatorAccountRows` 只读这个 0。铁证：模型写的「人选建议与分层」与机械块 `platformAccountRows` **两张表同时显示未采集** —— 后者直接读聚合，有数据必出值 | → **2026-10-20 修（三处）**：① 白名单加 `report`，并加两道闸（台账无平台内容不查、粉丝量已齐不查）；② `/query` 新增 `authorIds` 点名取（`matchCreatorRows` 纯函数），绕开「只拼本批前 N 条 rows 作者」的截断；③ 新增 `creatorLiveViews` / `withLiveCreatorStats`，**读时以证据表为准**重算粉丝量与分层（与 `tierOf` 同尺），并同步改写文案里的「未采集」口径；模型生成的表由 `backfillCreatorStatsInTables` 回填（只补空值、且该表必须已有 `sourceRef`，否则会凭空造出一条 R6 阻塞）。顺带修标识列：`pfcre_<平台>_<昵称哈希>` 是内部聚合 id（读者查不到、模型还会误当 `creatorId` 喂回采集 → `stored:0`），证据条目新增 `uid`（平台原始 UID），标识列按 `uid → 主页链接 → 哈希` 回退。详见 `docs/data-provenance-design.md` §16；回归 `tests/creator-stats.test.ts` 9 例 + `platform-collect.test.ts` 白名单 1 例（241 → **252**） |
 ---
 
 ## 附录 A · 模块-文件对照表
@@ -1545,24 +1640,26 @@ node --import tsx --test tests/*.test.ts
 
 | 测试文件 | 用例 | 行数 | 守住什么 |
 |---|---:|---:|---|
-| `brand-self.test.ts` | 12 | 385 | 品牌自诊在"无授权数据"时必须如实写「无数据」，而不是编数字；**未指定自有品牌（`ownBrandId`）时整份报告不做自诊、且不得出现「我方/本品」字样**（R14：任何槽位出现违禁词都要判错，且机械修复后仍要过校验） |
+| `brand-self.test.ts` | 14 | 556 | 品牌自诊在"无授权数据"时必须如实写「无数据」，而不是编数字；**未指定自有品牌（`ownBrandId`）时整份报告不做自诊、且不得出现「我方/本品」字样**（R14：任何槽位出现违禁词都要判错，且机械修复后仍要过校验）；**「本品牌」必须整词换主语（→「品牌」）而不是挖词中间的字**（WP-B-10′）；**「本方案」这类含违禁子串的普通名词必须豁免，不得误判、更不得被删**（WP-B-10″） |
 | `brief-llm-fill.test.ts` | 6 | 151 | 规则抽取结果的权威性：模型只能补空字段，不能改预算/时间窗 |
-| `brief-parse.test.ts` | 12 | 167 | 自然语言解析（规则段）纯函数、中英混合输入；**category 会被逐字当平台搜索词，必须是中文** |
+| `brief-parse.test.ts` | 13 | 188 | 自然语言解析（规则段）纯函数、中英混合输入；**category 会被逐字当平台搜索词，必须是中文** |
 | `collector.test.ts` | 45 | 1320 | sidecar 归一化、落盘目录契约、快照取新增行、ID 闭环、常驻浏览器端口与回收 |
+| `creator-stats.test.ts` | 9 | 244 | 粉丝量**读时解析**（不再是写时快照）：creator 阶段候选人 `followers` 会被固化成 0，report 阶段补读到真值后必须能显示出来；**分层随之从「互动量分位」改成粉丝量口径**；文案里「未采集」同步改写；**拿不到资料行时不得把已知数据降级成 0**；`pfcre_` 内部哈希不得出现在报告的标识列（按 uid → 主页链接回退）；模型生成的表格按 `sourceRef` 有无决定能不能回填数字（避免凭空造 R6 阻塞）；`/query` 的 `authorIds` 点名取 vs 默认模式；**report 阶段必须允许补读**（`shouldRefreshPlatform`）及其两道闸 |
 | `data-provenance.test.ts` | 18 | 655 | 条目级溯源不依赖模型自觉（证据登记 → 引用 → 渲染反查）；含**兜底路径不得写死行业文案**的回归 |
 | `data-realism.test.ts` | 13 | 436 | 不引用本地样例数据；样例达人不得出现在报告里 |
 | `e2e.test.ts` | 13 | 577 | LLD §7.3 强制 E2E 清单（mock 模式，全离线） |
 | `governance-fixes.test.ts` | 6 | 186 | 治理口径的三个不变量（口径错了不会有用例失败，只能专门钉） |
 | `kb-ingest.test.ts` | 15 | 508 | KB 入库通道、来源登记不变量、mutating 工具准入 |
-| `platform-collect.test.ts` | 28 | 829 | 七平台工具与适配器（打桩 fetch，不碰 MediaCrawler）；**预采集覆盖范围 = brief 声明的平台**（`BM_MC_PREFETCH_SCOPE`） |
-| `report-repair.test.ts` | 15 | 424 | 自动修复的分级语义与四条不变量（含"修复不得制造新错误"）；缺失声明须移除不降级、R9 补 callout 只记观感、裸写逻辑引用与带前缀等价 |
+| `platform-collect.test.ts` | 29 | 852 | 七平台工具与适配器（打桩 fetch，不碰 MediaCrawler）；**预采集覆盖范围 = brief 声明的平台**（`BM_MC_PREFETCH_SCOPE`） |
+| `report-repair.test.ts` | 19 | 652 | 自动修复的分级语义与四条不变量（含"修复不得制造新错误"）；缺失声明须移除不降级、R9 补 callout 只记观感、裸写逻辑引用与带前缀等价；**R6 的 `repairable` 按"有没有可回挂的逻辑引用"条件置位**（⑨ / ⑨′）；**被 R6 保护留下的缺失声明：不许移除、不许改挂无关块（⑬），且降级只记观感级（⑯）**；**P0 自愈契约**——生成期先 autoRepair 再判阻塞、R6 误置引用+matrix 漏 sourceRef 一次过（⑰）；**回喂失败降级 = autoRepair 修后版本**而非未修复原稿（⑱，0-issue 形态不得无故降级） |
+| `report-patch.test.ts` | 5 | 173 | **P1 按页补丁回喂**：补丁 schema 与整份 schema **共用同一份页校验**（不许各写一套）；只换被点名的页、页序页数不变；不认识的 `index` 一律忽略；**补丁把页掏空时保留原页**；真机形态（matrix 漏 `sourceRef`）补一页即闭合 |
 | `report-summary.test.ts` | 16 | 500 | 摘要回灌 + 向量落盘 + 模型混用守卫 |
-| `schema-coverage.test.ts` | 4 | 138 | 骨架/块型/页面角色的防漂移（加第 11 种块型时编译器不会提醒） |
+| `schema-coverage.test.ts` | 5 | 181 | 骨架/块型/页面角色的防漂移（加第 11 种块型时编译器不会提醒）；**十种块型都必须能把 `sourceRef` 原样带出来**（matrix 曾在 schema 层被整类吞掉） |
 | `stream-replay.test.ts` | 6 | 251 | 进度实时性与刷新后流式回放 |
 | `tool-call-guard.test.ts` | 5 | 67 | 工具调用风暴闸门（真机曾出现同一工具连续被调 131 次） |
 | `web-console.test.ts` | 5 | 214 | 前端托管契约（含路径穿越守卫） |
 | `web-search.test.ts` | 10 | 313 | 唯一外部计费源（打桩 fetch） |
-| **合计** | **229** | **≈7300** | 17 个文件 |
+| **合计** | **253** | **8024** | 19 个文件 |
 
 ## 附录 C · 环境变量
 

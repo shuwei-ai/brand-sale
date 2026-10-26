@@ -18,8 +18,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_DEPTH_POLICY,
-  OWN_BRAND_LEAK_RE,
   autoRepair,
+  hasOwnBrandLeak,
   measureReportDepth,
   stripOwnBrandLeak,
   validateReportDsl,
@@ -310,7 +310,7 @@ test("WP-B-9 R14：未指定自有品牌时，任何槽位出现「我方」口�
   assert.equal(before.ok, false);
 
   const { dsl: fixed, actions, cosmeticActions } = autoRepair(leakyDsl, { hasOwnBrand: false });
-  assert.equal(OWN_BRAND_LEAK_RE.test(JSON.stringify(fixed)), false, "修复后整份 DSL 不得再出现「我方 / 本品 / 本方 / 品牌自诊」");
+  assert.equal(hasOwnBrandLeak(JSON.stringify(fixed)), false, "修复后整份 DSL 不得再命中「我方 / 本品 / 本方 / 品牌自诊」");
   const post = validateReportDsl(fixed, { hasOwnBrand: false });
   assert.equal(post.ok, true, `修复后必须过校验（否则 compile 抛错、报告丢失）：${JSON.stringify(post.issues)}`);
   assert.ok(actions.length + cosmeticActions.length > 0, "每一处改动都要留下可回溯的 action");
@@ -382,6 +382,104 @@ test("WP-B-10 R14 的分级：负面声明按观感级修复（不脏任务）�
   const r = autoRepair(forge, { hasOwnBrand: false });
   assert.equal(r.actions.filter((a) => a.includes("我方")).length, 1, "带数字的我方断言被删属于数据级改动");
   assert.equal(r.cosmeticActions.filter((a) => a.includes("我方")).length, 0);
+});
+
+/**
+ * 只含一页、区块由调用方给的最小报告 —— 用来把 R14 的槽位行为钉在最小上下文里。
+ * （`leakyDsl` 那种"每种槽位都塞满"的夹具会互相干扰，不适合验证单个槽位的修法。）
+ */
+const onePage = (blocks: unknown[]): ReportDsl => ({
+  meta: {
+    dslVersion: "1.0",
+    title: "两轮电动车市场与竞品调研",
+    brand: { id: "b", name: "未指定" },
+    window: { from: "2026-10-01", to: "2026-12-31" },
+    generatedAt: "2026-10-16T00:00:00.000Z",
+  },
+  sourceDeclaration: {
+    grade: "L3",
+    sources: [{ key: "mc_dy", displayName: "抖音", grade: "L3", asOf: "2026-10-16", coverage: "search/content_detail" }],
+    exclusions: [],
+  },
+  slides: [
+    {
+      index: 0,
+      pageRole: "data",
+      title: "风险登记与应对",
+      layoutId: "content/default",
+      blocks: blocks as ReportDsl["slides"][number]["blocks"],
+      citations: [],
+    },
+  ],
+});
+
+/**
+ * 「本品牌」是**子串**命中的受害者：违禁词表里的「本品」能在它中间匹配到。
+ * 真机 job_0mv9k0wvg8vvpwmqd9y 的 slides[11] 风险表里，
+ * 「竞品在Q4加大投放力度，挤压本品牌声量份额」被**从词中间挖掉两个字** →
+ * 渲染出来是「挤压**牌**声量份额」这种残句：读者看到一个坏掉的句子，任务还被标成「产出不完整」。
+ *
+ * 判定是对的（未指定自有品牌时「本品牌」同样没有指代对象），**修法**错了。
+ * 正确处置是换主语（本品牌 → 品牌）：句子读得通、自我指涉也没了，也不该按数据级标脏
+ * —— 它没删掉任何断言。
+ */
+test("WP-B-10′ R14：「本品牌」按整词中性化，不得留下残句；纯替换归观感级", () => {
+  const cell = "竞品在Q4加大投放力度，挤压本品牌声量份额";
+  const dsl = onePage([
+    { type: "table", columns: ["风险", "应对措施"], rows: [[cell, "监控竞品内容形态"]], caption: "风险登记", sourceRef: "phase:budget" },
+  ]);
+
+  // 仍然要**扫出来**，否则这条校验形同虚设
+  assert.equal(stripOwnBrandLeak(dsl, { apply: false }).hits.length, 1, "「本品牌」必须被扫到");
+  assert.equal(validateReportDsl(dsl, { hasOwnBrand: false }).ok, false);
+  assert.equal(validateReportDsl(dsl, { hasOwnBrand: true }).ok, true, "指定了自有品牌时「本品牌」是合法写法，R14 必须沉默");
+
+  const { dsl: fixed, actions, cosmeticActions } = autoRepair(dsl, { hasOwnBrand: false });
+  const table = fixed.slides[0]!.blocks[0] as { rows: string[][] };
+  assert.equal(table.rows[0]![0], "竞品在Q4加大投放力度，挤压品牌声量份额", "整词换主语：句子读得通，也不再有自我指涉");
+  assert.equal(actions.length, 0, "纯中性化替换没删断言、没碰数字 → 不该把完好报告标成「产出不完整」");
+  assert.equal(cosmeticActions.length, 1);
+  assert.match(cosmeticActions[0]!, /单元格改写为/);
+  assert.equal(validateReportDsl(fixed, { hasOwnBrand: false }).ok, true);
+
+  // 反面：**删词**型（「我方声量」→「声量」）仍然保守按数据级记账 —— 它把断言变成了悬空的
+  const del = onePage([{ type: "table", columns: ["我方声量", "应对措施"], rows: [["偏低", "监控"]], sourceRef: "phase:budget" }]);
+  const r = autoRepair(del, { hasOwnBrand: false });
+  assert.equal(r.actions.length, 1, "摘掉「我方」留下的是没有主语的断言，必须标脏");
+  assert.equal(r.cosmeticActions.length, 0);
+});
+
+/**
+ * 违禁词都是两个汉字，中文没有词边界，子串匹配必然误伤 —— 同一个真机任务一天之内踩了两次：
+ * 「本品牌」被挖成「挤压**牌**声量份额」，「本方案」让整句被删（还按数据级记了账、把任务标脏）。
+ *
+ * `LEAK_EXEMPT` 就是那条边界：形如违禁词、实为普通名词的写法**不检测、也不修复**。
+ * 反面同样要钉：豁免不等于把规则弄松，真正的「我方」必须照旧被抓。
+ */
+test("WP-B-10″ 豁免词：含违禁子串的普通名词（本方案）不得被判错、更不得被删", () => {
+  const item = "置换需求预计更多在促销节点集中释放——这也是本方案把预算重心压在中段的依据。";
+  const dsl = onePage([{ type: "bullets", items: [item], sourceRef: "phase:intel" }]);
+
+  assert.equal(stripOwnBrandLeak(dsl, { apply: false }).hits.length, 0, "「本方案」不是自我指涉，不该被判错");
+  assert.equal(validateReportDsl(dsl, { hasOwnBrand: false }).ok, true);
+
+  const r = autoRepair(dsl, { hasOwnBrand: false });
+  assert.equal(r.actions.length, 0, "更不该把任务标脏");
+  assert.equal(r.cosmeticActions.length, 0);
+  const bullets = r.dsl.slides[0]!.blocks[0] as { items: string[] };
+  assert.equal(bullets.items[0], item, "整句原样保留（旧实现会删掉「…这也是本方案…」那半句）");
+
+  // 反面：豁免表不能把规则弄松 —— 真正的「我方」照旧被抓、被处理
+  const leaky = onePage([{ type: "bullets", items: ["我方声量低于竞品"], sourceRef: "phase:intel" }]);
+  assert.equal(
+    stripOwnBrandLeak(leaky, { apply: false }).hits[0]!.path,
+    "slides[0].blocks[0].items[0]",
+    "「我方」必须照旧被扫出来",
+  );
+  assert.equal(validateReportDsl(leaky, { hasOwnBrand: false }).ok, false);
+  const rl = autoRepair(leaky, { hasOwnBrand: false });
+  assert.equal(hasOwnBrandLeak(JSON.stringify(rl.dsl)), false, "修复后不得再有命中");
+  assert.equal(validateReportDsl(rl.dsl, { hasOwnBrand: false }).ok, true);
 });
 
 /* ── WP-B-11/12 兜底竞品表的真实素材（2026-10-16）─────────────────────────

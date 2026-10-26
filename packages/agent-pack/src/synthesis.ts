@@ -293,6 +293,13 @@ export interface PlatformAccountAgg {
   follows: number | null;
   /** 个人主页链接（可点开核对粉丝数），没有则空串 */
   profileUrl: string;
+  /**
+   * 平台原始 UID（抖音 `user_id` / 小红书 `user_id` / B站 `mid`）。
+   *
+   * 报告里的人选标识列用它 —— `pfcre_<platform>_<hash>` 是内部聚合 id，读者拿去
+   * 任何平台都查不到，模型还会把它误当 `creatorId` 喂回采集（真机 stored:0）。
+   */
+  uid: string;
 }
 
 /** 互动量计入项：只取"越多越热"的计数型指标，避免把时长/评分之类的量纲混进来 */
@@ -336,6 +343,7 @@ export function aggregatePlatformAccounts(entries: readonly EvidenceEntry[]): Pl
         if (followers !== null) cur.followers = Math.max(cur.followers ?? 0, followers);
         if (follows !== null) cur.follows = Math.max(cur.follows ?? 0, follows);
         if (!cur.profileUrl && e.url) cur.profileUrl = e.url;
+        if (!cur.uid && e.uid) cur.uid = e.uid;
         continue;
       }
       map.set(key, {
@@ -352,6 +360,7 @@ export function aggregatePlatformAccounts(entries: readonly EvidenceEntry[]): Pl
         followers,
         follows,
         profileUrl: e.url || "",
+        uid: e.uid || "",
       });
       continue;
     }
@@ -379,6 +388,7 @@ export function aggregatePlatformAccounts(entries: readonly EvidenceEntry[]): Pl
       followers: null,
       follows: null,
       profileUrl: "",
+      uid: "",
     });
   }
   return [...map.values()].sort(
@@ -491,6 +501,202 @@ export function platformCreatorCandidates(
   });
 }
 
+/* ── 粉丝量的"读时解析"（而不是写时快照） ────────────────── */
+
+/** 一个账号在**当前证据表**下的真实状态 */
+export interface CreatorLiveView {
+  talentId: string;
+  /** 个人主页公开统计；没采到是 null（**不是 0**） */
+  followers: number | null;
+  tier: "head" | "mid" | "tail";
+  profileUrl: string;
+  sampleUrl: string;
+  uid: string;
+}
+
+/**
+ * 从证据表实时算出"每位账号现在到底多少粉丝、该归哪层"。
+ *
+ * 为什么需要它（2026-10-20 真机 job_0mvgany95k7poz73mks）：
+ * 候选人池是在 creator 阶段**开头**机械生成的，那一刻作者主页资料行还没落库
+ * （补采任务排在采集队列尾，实测 06:45:09 才写完），于是 `followers` 被固化成 0；
+ * 而 report 阶段（06:45:37 起）运行时数据早就在缓存里，只是没人再去读一次。
+ * 结果是 5 位人选的粉丝量在报告里全是「未采集」，缓存里其实是 60.1 万 / 13.0 万 / …。
+ *
+ * 修法不是在写的时候再猜一次，而是**读的时候以证据表为准**：
+ * 同一份 DSL 在证据表补齐前后渲染出不同（更准）的结果，这是期望行为。
+ */
+export function creatorLiveViews(entries: readonly EvidenceEntry[]): Map<string, CreatorLiveView> {
+  const aggs = aggregatePlatformAccounts(entries);
+  const byPlatform = new Map<string, PlatformAccountAgg[]>();
+  for (const a of aggs) {
+    const list = byPlatform.get(a.platform);
+    if (list) list.push(a);
+    else byPlatform.set(a.platform, [a]);
+  }
+  const out = new Map<string, CreatorLiveView>();
+  for (const a of aggs) {
+    let tier: CreatorLiveView["tier"];
+    if (a.followers !== null) {
+      tier = tierOf(a.followers);
+    } else {
+      /* 没有粉丝量才退回"同平台互动量分位"——与 `platformCreatorCandidates` 同一把尺子，
+       * 两处口径必须一致，否则同一账号在正文与附录里会显示成两个层级。 */
+      const list = byPlatform.get(a.platform) ?? [];
+      const ranked = [...list].sort((x, y) => y.observedInteractions - x.observedInteractions);
+      const idx = ranked.findIndex((x) => x.author === a.author);
+      const rank = idx < 0 ? ranked.length : idx;
+      const share = ranked.length <= 1 ? 0 : rank / (ranked.length - 1);
+      tier = share <= 0.34 ? "head" : share <= 0.67 ? "mid" : "tail";
+    }
+    out.set(platformCandidateId(a.platform, a.author), {
+      talentId: platformCandidateId(a.platform, a.author),
+      followers: a.followers,
+      tier,
+      profileUrl: a.profileUrl,
+      sampleUrl: a.sampleUrl,
+      uid: a.uid,
+    });
+  }
+  return out;
+}
+
+/** 把候选人文案里"未采集"的口径改成真实值（否则同一行会一边写粉丝量一边写未采集） */
+function applyLiveFollowerText(s: string, lv: CreatorLiveView): string {
+  if (lv.followers === null) return s;
+  return s
+    .replace(
+      /粉丝量\*\*未采集\*\*/g,
+      `粉丝量 ${lv.followers}（取自个人主页公开统计${lv.profileUrl ? `，见 ${lv.profileUrl}` : ""}）`,
+    )
+    .replace(/粉丝量与报价未采集/g, "报价未采集")
+    .replace(/粉丝量未采集，投放前/g, "报价未采集，投放前")
+    .replace(/分层依据为同平台互动量分位（粉丝量未采集）/g, "分层依据为粉丝量（个人主页公开统计）");
+}
+
+/**
+ * 用证据表里的实时值刷新候选人池（纯函数）。
+ *
+ * 只改**账号级事实**（粉丝量 / 分层 / 依赖它们的文案），不动模型或机械层选出来的人：
+ * 换人会改变报告结构，属另一件事。`followers` 只在实时值存在时覆盖 —— 实时拿不到就保留原值，
+ * 绝不把已知值降级成 0。
+ */
+export function withLiveCreatorStats(
+  creators: CreatorOutput | undefined,
+  entries: readonly EvidenceEntry[],
+): CreatorOutput | undefined {
+  if (!creators) return creators;
+  const live = creatorLiveViews(entries);
+  if (live.size === 0) return creators;
+  let changed = false;
+  const candidates = creators.candidates.map((c) => {
+    const lv = live.get(c.talentId);
+    if (!lv) return c;
+    const followers = lv.followers ?? c.followers;
+    const tier = lv.followers !== null ? lv.tier : c.tier;
+    if (followers === c.followers && tier === c.tier) return c;
+    changed = true;
+    return {
+      ...c,
+      followers,
+      tier,
+      rationale: applyLiveFollowerText(c.rationale, lv),
+      contentFit: applyLiveFollowerText(c.contentFit, lv),
+      riskFlags: c.riskFlags.map((f) => applyLiveFollowerText(f, lv)),
+      confidence: lv.followers !== null ? Math.max(c.confidence, 0.45) : c.confidence,
+    };
+  });
+  return changed ? { ...creators, candidates } : creators;
+}
+
+/**
+ * 把**模型自己写的表格**里的粉丝量 / 人选标识按证据表回填（纯函数）。
+ *
+ * 为什么要有这一步：`creatorRosterBlocks` 是机械块，改了读侧就自动对；但正文里那张
+ * 「人选建议与分层」是模型生成的，它把 creator 阶段的 `followers=0` 直接写成了「未采集」。
+ * 只修机械块的话，同一份报告里两张表会自相矛盾（一张有粉丝量、一张"未采集"）。
+ *
+ * 两条规则刻意保守：
+ *   · 只在**表格块已有 `sourceRef`** 时回填数字 —— 否则会把一个"无数字、本来不触发 R6"的块
+ *     变成"有数字但无来源"，凭空造出一条阻塞；
+ *   · 只填空值（未采集 / — / 空），**不覆盖**模型写过的具体数字 —— 那可能是它从别处引的，
+ *     覆盖等于替模型改口。
+ */
+export function backfillCreatorStatsInTables(
+  dsl: ReportDsl,
+  creators: CreatorOutput | undefined,
+  entries: readonly EvidenceEntry[],
+): ReportDsl {
+  const live = creatorLiveViews(entries);
+  if (live.size === 0) return dsl;
+  /** 模型偶尔只写昵称不写 id，用它兜底 */
+  const byNickname = new Map<string, CreatorLiveView>();
+  for (const c of creators?.candidates ?? []) {
+    const lv = live.get(c.talentId);
+    if (lv && c.nickname) byNickname.set(c.nickname.trim(), lv);
+  }
+  const EMPTY = new Set(["", "—", "-", "未采集", "未知", "无样本", "N/A", "n/a"]);
+  let touched = false;
+
+  const slides = dsl.slides.map((slide) => {
+    const blocks = slide.blocks.map((b) => {
+      if (b.type !== "table") return b;
+      const cols = b.columns.map((c) => String(c));
+      const fIdx = cols.findIndex((c) => /粉丝量|粉丝数/.test(c));
+      const idIdx = cols.findIndex((c) => /人选\s*ID|达人\s*ID|人选ID/i.test(c));
+      if (fIdx < 0 && idIdx < 0) return b;
+      let blockChanged = false;
+      const rows = b.rows.map((row) => {
+        const cells = row.map((c) => String(c ?? ""));
+        // 定位这一行是哪个人：先看 id 列，其次扫全行，最后用昵称兜底
+        let lv: CreatorLiveView | undefined;
+        const idCell = idIdx >= 0 ? cells[idIdx] ?? "" : "";
+        if (idCell.startsWith(PLATFORM_CREATOR_PREFIX)) lv = live.get(idCell);
+        if (!lv) {
+          for (const cell of cells) {
+            if (cell.startsWith(PLATFORM_CREATOR_PREFIX) && live.has(cell)) {
+              lv = live.get(cell);
+              break;
+            }
+          }
+        }
+        if (!lv) {
+          for (const cell of cells) {
+            const hit = byNickname.get(cell.trim());
+            if (hit) {
+              lv = hit;
+              break;
+            }
+          }
+        }
+        if (!lv) return row;
+        const next = [...cells];
+        let rowChanged = false;
+        // ① 人选标识：内部哈希对读者无用（查不到、喂回采集还会失败），换成平台原始 UID
+        if (idIdx >= 0 && idCell.startsWith(PLATFORM_CREATOR_PREFIX) && (lv.uid || lv.profileUrl)) {
+          next[idIdx] = lv.uid || lv.profileUrl;
+          rowChanged = true;
+        }
+        // ② 粉丝量：只补空值，且该表必须已有来源
+        if (fIdx >= 0 && lv.followers !== null && EMPTY.has(next[fIdx]!.trim()) && b.sourceRef) {
+          next[fIdx] = String(lv.followers);
+          rowChanged = true;
+        }
+        if (!rowChanged) return row;
+        blockChanged = true;
+        return next;
+      });
+      if (!blockChanged) return b;
+      touched = true;
+      return { ...b, rows };
+    });
+    if (blocks.every((b, i) => b === slide.blocks[i])) return slide;
+    return { ...slide, blocks };
+  });
+
+  return touched ? { ...dsl, slides } : dsl;
+}
+
 /** 候选人来源标签：报告逐条标出来源，读者才知道哪一条能点回原帖 */
 export function creatorSourceOf(talentId: string): string {
   if (talentId.startsWith(PLATFORM_CREATOR_PREFIX)) return "平台公开采集（L3，未核验）";
@@ -505,14 +711,21 @@ export function creatorSourceOf(talentId: string): string {
  * 平台采集的人选有真实原帖链接（可点开核对）、账号名完整显示，但没有报价。
  * 两者混在一张表里而不标注，读者只能得出"报告在编数据"这一个结论。
  */
-export function creatorAccountRows(creators: CreatorOutput | undefined, entries: readonly EvidenceEntry[] = []): string[][] {
+export function creatorAccountRows(creatorsIn: CreatorOutput | undefined, entries: readonly EvidenceEntry[] = []): string[][] {
+  /* 粉丝量以**证据表**为准，而不是候选人对象里的快照（见 `creatorLiveViews` 的长注释）。
+   * 放在这里而不是每个调用点：合成路径、模型路径、补丁路径都会经过本函数，
+   * 少一处就是"同一份报告两张表两种数字"。 */
+  const creators = withLiveCreatorStats(creatorsIn, entries);
   const urlByTalent = new Map<string, string>();
   /** 个人主页链接（比原帖更能核验"粉丝量"这一列），有就用它 */
   const profileByTalent = new Map<string, string>();
+  /** 平台原始 UID：标识列优先展示它 */
+  const uidByTalent = new Map<string, string>();
   for (const a of aggregatePlatformAccounts(entries)) {
     const id = platformCandidateId(a.platform, a.author);
     urlByTalent.set(id, a.sampleUrl);
     if (a.profileUrl) profileByTalent.set(id, a.profileUrl);
+    if (a.uid) uidByTalent.set(id, a.uid);
   }
   return (creators?.candidates ?? []).map((c) => {
     const source = creatorSourceOf(c.talentId);
@@ -521,7 +734,11 @@ export function creatorAccountRows(creators: CreatorOutput | undefined, entries:
     const isPlaceholder = c.talentId.startsWith(PLACEHOLDER_CREATOR_PREFIX);
     const credential = profileByTalent.get(c.talentId) || urlByTalent.get(c.talentId) || "";
     return [
-      c.talentId,
+      /* 标识列：**平台原始 UID 优先**（抖音 `67142047882`、小红书 24 位主页 id，站内可查），
+       * 其次主页链接，都没有才回退内部哈希。
+       * `pfcre_<平台>_<昵称哈希>` 对读者没有任何可操作价值 —— 拿去平台搜不到，
+       * 模型还会把它误当 `creatorId` 喂回采集（真机 stored:0 就是这条链）。 */
+      isPlatform ? uidByTalent.get(c.talentId) || profileByTalent.get(c.talentId) || c.talentId : c.talentId,
       c.nickname,
       label,
       source,
@@ -2044,7 +2261,12 @@ export function enrichReportProvenance(
    * 只有降级/合成路径才有链接 —— 同一张表两条路径两种结果，最容易被当成"模型路径数据是假的"。
    * 实测事故（2026-10-11 双十一精华自测第三次重跑）：模型路径产出的报告里，
    * 人选表的凭据列 6 行全是「—」，而平台账号表却有链接（因为那一路本来就传了 entries）。 */
-  const creatorBlocks = creatorRosterBlocks(opts.creators, entries);
+  /* 粉丝量的**读时解析**（2026-10-20）：creator 阶段的候选人池是写时快照，
+   * 那时作者主页资料行往往还没落库；这里按当前证据表刷新一遍，再回填模型写的表。
+   * 顺序不能反 —— 回填要用刷新后的池子，否则用的是旧的 0。 */
+  const liveCreators = withLiveCreatorStats(opts.creators, entries);
+  dsl = backfillCreatorStatsInTables(dsl, liveCreators, entries);
+  const creatorBlocks = creatorRosterBlocks(liveCreators, entries);
   const accountBlocks = platformAccountBlocks(entries);
 
   /* 没有平台证据时不再整段跳过：人选来源标注与证据无关（它回答的是"人名哪来的"），
