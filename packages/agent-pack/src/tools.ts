@@ -296,9 +296,16 @@ export class ToolRegistry {
     }
 
     const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
-    const code = /超时|timeout/i.test(msg) ? "E-DATA-001" : "E-DATA-002";
+    // 三分类：超时 / 阶段中断 / 真·源不可用。中断不能落进 E-DATA-002「授权失效」，
+    // 否则模型会把「阶段被 abort」误读成凭据失效而放弃检索（见 withTimeout 注释）。
+    const code = /超时|timeout/i.test(msg)
+      ? "E-DATA-001"
+      : /中断|abort/i.test(msg)
+        ? "E-AGENT-002"
+        : "E-DATA-002";
     this.log(name, agent, started, false, msg);
-    tc.emit({ type: "data.degraded", seq: 0, at: new Date().toISOString(), source: name, missing: [], reason: code === "E-DATA-001" ? "timeout" : "unavailable" });
+    const reason = code === "E-DATA-001" ? "timeout" : code === "E-AGENT-002" ? "aborted" : "unavailable";
+    tc.emit({ type: "data.degraded", seq: 0, at: new Date().toISOString(), source: name, missing: [], reason });
     return this.degrade(tool, params, tc, code, msg);
   }
 
@@ -358,9 +365,14 @@ async function withTimeout<T>(ms: number, signal: AbortSignal, fn: () => Promise
     const t = setTimeout(() => reject(new Error(`工具执行超时（${ms}ms）`)), ms);
     t.unref?.();
   });
+  // ⚠️ 消息里必须带「中断」字样：下面的错误码映射按关键词判定，
+  //    早期这里只写 "aborted"，会被映射成 E-DATA-002「授权失效」——
+  //    阶段超时/取消被当成凭据问题报给模型，模型于是停止检索、以为基础设施坏了。
+  //    真机表现：web_search 明明 1 秒内就能返回，日志里却全是 E-DATA-002 aborted。
   const aborted = new Promise<never>((_, reject) => {
-    if (signal.aborted) reject(new Error("aborted"));
-    else signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    const fail = (): void => reject(new Error("工具执行被中断（aborted：阶段超时或任务取消）"));
+    if (signal.aborted) fail();
+    else signal.addEventListener("abort", fail, { once: true });
   });
   return Promise.race([fn(), timeout, aborted]);
 }

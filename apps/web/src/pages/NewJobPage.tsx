@@ -47,7 +47,15 @@ interface FormValues {
 const DEFAULTS: FormValues = {
   industry: "美妆",
   category: "护肤品-精华",
-  brandIds: ["brand_A"],
+  /**
+   * 品牌默认**留空**，不要放占位符。
+   *
+   * 曾写成 `["brand_A"]`：必填校验只查"非空"，于是用户不手动删就直接提交，
+   * 任务带着 `brand_A` 跑完采集与检索——`web_search_brand_brand_A`、竞品格局与
+   * 差距矩阵全对着一个不存在的品牌展开，而界面上看不出任何异常。
+   * 采集与报告都按 brandIds 逐个取数，宁可让用户多填一次，也不能埋一个假品牌。
+   */
+  brandIds: [],
   budgetWan: 300,
   awareness: 0.3,
   conversion: 0.5,

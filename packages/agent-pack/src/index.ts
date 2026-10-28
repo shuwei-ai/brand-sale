@@ -27,6 +27,7 @@ export {
 export {
   APPENDIX_ENTRY_LIMIT,
   CREATOR_ROSTER_MARK,
+  STAR_LEAD_MARK,
   PLACEHOLDER_CREATOR_PREFIX,
   PLATFORM_ACCOUNT_LIMIT,
   PLATFORM_ACCOUNT_MARK,
@@ -47,8 +48,13 @@ export {
   enrichReportProvenance,
   ensurePlatformCreators,
   fillCreatorTiers,
+  isPublicFigureCandidate,
+  PUBLIC_FIGURE_SOURCE_LABEL,
   mergePlatformEvidences,
   platformAccountBlocks,
+  starCandidateBlocks,
+  starLeadBlocks,
+  starLeadOf,
   platformAccountRows,
   platformCandidateId,
   platformCreatorCandidates,
@@ -77,4 +83,13 @@ export {
   type EvidenceRecordResult,
   type EvidenceRowInput,
 } from "./evidence.ts";
-export { completeBriefDraft, type BriefParseResult } from "./brief-parse.ts";
+export { completeBriefDraft, hasBrandContext, type BriefParseResult } from "./brief-parse.ts";
+export {
+  coverageOf,
+  enforceRequirementCoverage,
+  extractStarLeads,
+  planSearchQueries,
+  planSearchQuery,
+  taskPlanPromptSection,
+  webSearchRows,
+} from "./task-plan.ts";

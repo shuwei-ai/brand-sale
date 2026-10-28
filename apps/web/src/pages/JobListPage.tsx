@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { App, Button, Card, Empty, Progress, Space, Switch, Table, Tooltip, Typography } from "antd";
+import { App, Button, Card, Empty, Popconfirm, Progress, Space, Switch, Table, Tooltip, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { ReloadOutlined, SafetyCertificateOutlined } from "@ant-design/icons";
+import { DeleteOutlined, ReloadOutlined, SafetyCertificateOutlined } from "@ant-design/icons";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/endpoints.ts";
 import type { JobRecord } from "../api/types.ts";
@@ -32,6 +32,16 @@ export function JobListPage() {
       reload();
     } catch (e) {
       message.error((e as { display?: string })?.display ?? "扫描失败");
+    }
+  };
+
+  const remove = async (jobId: string) => {
+    try {
+      await api.deleteJob(jobId);
+      message.success("任务已删除");
+      reload();
+    } catch (e) {
+      message.error((e as { display?: string })?.display ?? "删除失败");
     }
   };
 
@@ -101,11 +111,23 @@ export function JobListPage() {
     { title: "创建时间", dataIndex: "createdAt", width: 180, render: (v: string) => clock(v) },
     {
       title: "操作",
-      width: 90,
+      width: 130,
       render: (_: unknown, row) => (
-        <Button size="small" type="link" onClick={() => navigate(`/jobs/${row.jobId}`)}>
-          详情
-        </Button>
+        <Space size={0} onClick={(e) => e.stopPropagation()}>
+          <Button size="small" type="link" onClick={() => navigate(`/jobs/${row.jobId}`)}>
+            详情
+          </Button>
+          <Popconfirm
+            title="删除该任务？"
+            description="将一并删除其阶段、产物、用量与事件记录，且不可恢复。"
+            okText="删除"
+            okButtonProps={{ danger: true }}
+            cancelText="取消"
+            onConfirm={() => void remove(row.jobId)}
+          >
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} />
+          </Popconfirm>
+        </Space>
       ),
     },
   ];

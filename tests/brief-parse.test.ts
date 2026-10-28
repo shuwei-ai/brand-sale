@@ -11,6 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { cnToNumber, parseBriefUtterance, parseBudget, parsePlatforms, parseWeights, parseWindow } from "@brandsale/contracts";
+import { hasBrandContext } from "@brandsale/agent-pack";
 
 /** 固定"现在"，否则跨年/跨月运行会得到不同结果（测试不能依赖真实时钟） */
 const NOW = new Date("2026-10-08T10:00:00+08:00");
@@ -185,4 +186,21 @@ test("WP-C-12 冬装两类口述都能命中词表（羽绒服 / 保暖内衣）
   /* 「秋衣」「打底衫」是同一品类的口语说法，别让它们掉到 LLM 手里变成 `thermal underwear` */
   assert.equal(parseBriefUtterance("卖秋衣秋裤，抖音投 30 万", undefined, NOW).brief.category, "保暖内衣");
   assert.equal(parseBriefUtterance("卖打底衫，小红书投 30 万", undefined, NOW).brief.category, "保暖内衣");
+});
+
+/* ── 品牌语境触发（hasBrandContext，agent-pack 侧的补全段判定依据） ── */
+
+test("WP-C-BRAND hasBrandContext：元词 / 明星同款 / 并列名词都能触发，纯品类词不触发", () => {
+  // 元词
+  assert.equal(hasBrandContext("关注欧莱雅、适乐肤品牌"), true);
+  assert.equal(hasBrandContext("竞品有高梵、鸭鸭"), true);
+  // 明星同款 / 代言 —— 与品牌强绑定，即使不点名字也该问模型
+  assert.equal(hasBrandContext("波司登羽绒服的明星同款投放"), true);
+  assert.equal(hasBrandContext("找明星代言人带货"), true);
+  // 并列名词 + 品类词（直接点名但无元词）—— 本次修复的核心场景
+  assert.equal(hasBrandContext("做一波波司登或鸭鸭羽绒服"), true);
+  assert.equal(hasBrandContext("波司登、鸭鸭、高梵三个羽绒服品牌"), true);
+  // 反例：没有品牌语境的纯品类诉求，不该触发（不白烧模型）
+  assert.equal(hasBrandContext("双11 小红书抖音投精华，预算 300 万"), false);
+  assert.equal(hasBrandContext("近90天抖音达人投放，预算 500000"), false);
 });

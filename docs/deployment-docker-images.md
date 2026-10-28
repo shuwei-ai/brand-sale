@@ -97,7 +97,10 @@
 
 `services/embedding-core/Dockerfile` 已经很完整：多阶段式分层（torch CPU 版单独一层 → 依赖 → 权重 → 代码）、
 非 root（uid 10001）、`HEALTHCHECK`、`.dockerignore` 齐备，且**只绑 127.0.0.1**。
-直接 `npm run embedding:up` 即可，无需改动。
+镜像本身无需改动，但**权重已不在仓库里**（2026-10-28 删除 1.4 GB `models/` 与 4.25 GB 镜像）：
+先 `npm run embedding:setup` 重下权重，再 `npm run embedding:up`。
+
+> 现状：嵌入默认走云端 API（BAAI/bge-m3 / 1024 维），这一段只在需要完全离线部署时才用得上。
 
 ---
 

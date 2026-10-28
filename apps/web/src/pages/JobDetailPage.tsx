@@ -55,6 +55,44 @@ export function JobDetailPage() {
   const [rerunPhase, setRerunPhase] = useState<PhaseName>("report");
   const [busy, setBusy] = useState(false);
 
+  /**
+   * 任务拆解（intake 产物里的 `taskPlan`）。
+   *
+   * 只用于展示：让用户能核对"我写的补充说明被拆成了哪几条、归哪个阶段"。
+   * 取不到就静默留空 —— 这是审计信息，不该因为产物还没生成就挡住整个页面。
+   * `artifactTick` 变化时重取（intake 产物落盘会推 `artifact.ready`）。
+   */
+  const [taskPlan, setTaskPlan] = useState<{ id: string; need: string; phase: string; requirement: string }[]>([]);
+  useEffect(() => {
+    let alive = true;
+    setTaskPlan([]);
+    if (!jobId) return;
+    api
+      .getArtifactText(jobId, "brief")
+      .then((text) => {
+        const parsed = JSON.parse(text) as { taskPlan?: unknown };
+        const list = Array.isArray(parsed.taskPlan) ? parsed.taskPlan : [];
+        if (!alive) return;
+        setTaskPlan(
+          list
+            .filter((x): x is Record<string, unknown> => typeof x === "object" && x !== null)
+            .map((x) => ({
+              id: String(x.id ?? "P?"),
+              need: String(x.need ?? ""),
+              phase: String(x.phase ?? "report"),
+              requirement: String(x.requirement ?? ""),
+            }))
+            .filter((x) => x.need.length > 0),
+        );
+      })
+      .catch(() => {
+        if (alive) setTaskPlan([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [jobId, artifactTick]);
+
   const detail = useAsync(
     async () => {
       const [job, phases, usage, ledger] = await Promise.all([
@@ -306,6 +344,29 @@ export function JobDetailPage() {
           <Typography.Paragraph type="secondary" style={{ fontSize: 12.5, marginTop: 8, marginBottom: 0 }}>
             补充说明：{job.spec.brief.notes}
           </Typography.Paragraph>
+        ) : null}
+
+        {/* 拆解结果必须看得见：用户写了一句「达人候选要包含明星」，如果系统把它拆成了什么
+            没人能核对，"响应了没有"就只能靠猜。数据取 intake 产物（kind=brief），
+            失败/未生成时静默不渲染 —— 这块是审计信息，不该挡住主流程。 */}
+        {taskPlan.length > 0 ? (
+          <div style={{ marginTop: 10 }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              任务拆解（{taskPlan.length} 条，来自补充说明）
+            </Typography.Text>
+            <Space direction="vertical" size={4} style={{ width: "100%", marginTop: 4 }}>
+              {taskPlan.map((t) => (
+                <Typography.Text key={t.id} style={{ fontSize: 12, lineHeight: 1.6 }}>
+                  <Tag color="blue" style={{ marginInlineEnd: 6 }}>{t.id}</Tag>
+                  <Tag style={{ marginInlineEnd: 6 }}>{PHASE_LABEL[t.phase as PhaseName] ?? t.phase}</Tag>
+                  {t.need}
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {" "}→ {t.requirement}
+                  </Typography.Text>
+                </Typography.Text>
+              ))}
+            </Space>
+          </div>
         ) : null}
 
         {job.degraded?.length ? (

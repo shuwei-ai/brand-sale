@@ -10,6 +10,7 @@ export * from "./governance.ts";
 export * from "./kb.ts";
 export * from "./job.ts";
 export * from "./brief-parse.ts";
+export * from "./task-plan.ts";
 export * from "./agent.ts";
 export * from "./events.ts";
 export * from "./report.ts";

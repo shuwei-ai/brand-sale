@@ -149,3 +149,74 @@ test("WP-C-LLM-6 表单默认值不会被模型的缺失输出抹掉", async () 
   assert.deepEqual(out.brief.brandIds, ["brand_A"]);
   assert.equal(out.brief.industry, "家居", "模型没给 industry 时，也不该把表单里的默认值弄丢");
 });
+
+test("WP-C-LLM-7 原话里点名品牌时，即使关键字段已齐也要问模型摘录 brandIds", async () => {
+  // 用户原话（历史上真实提过的 case）：品牌名夹在中文里，规则段无品牌解析器，只能靠模型摘录
+  const utterance = "想在抖音与小红书 投放 精华 关注 欧莱雅、适乐肤品牌需要明星代言，你需要挖掘相关信息";
+  // 前端总会带上预算/时间窗默认值，于是 missing 为空 —— 旧实现在这里直接 return，模型一次都不调
+  const defaults: Partial<Brief> = {
+    budget: { currency: "CNY", amount: 3_000_000 },
+    window: { from: "2026-10-27", to: "2026-11-26" },
+  };
+  const draft = parseBriefUtterance(utterance, defaults, NOW);
+  assert.deepEqual(draft.missing, [], "前置条件：关键字段已由默认值补齐");
+
+  const { gateway, calls } = stubGateway({
+    kind: "ok",
+    raw: JSON.stringify({ brief: { brandIds: ["欧莱雅", "适乐肤"] }, clarifications: [] }),
+  });
+  const out = await completeBriefDraft(utterance, draft, { gateway, ...noSignal });
+
+  assert.equal(calls(), 1, "有品牌语境时必须问一次模型");
+  assert.deepEqual(out.brief.brandIds, ["欧莱雅", "适乐肤"], "品牌名要原样摘录");
+  assert.deepEqual(out.filledByModel, ["brandIds"], "让前端知道哪个字段是模型给的");
+  assert.ok(out.filled.includes("brandIds"), "filled 要含 brandIds，前端据此提示『已识别品牌』");
+  assert.deepEqual(out.missing, [], "brandIds 是可选字段，不该把自己算进缺失清单");
+  assert.equal(out.source, "rule+llm");
+});
+
+test("WP-C-LLM-9 直接点名品牌但不写「品牌」元词时，关键字段齐全也要问模型摘录", async () => {
+  // 真实 case：用户只说「波司登或鸭鸭羽绒服的明星同款投放」，一个品牌元词都没有。
+  // 旧实现 BRAND_CONTEXT_RE 只认「品牌/竞品/竞对/对标/牌子」，这里 wantBrands=false，
+  // 叠加 missing 为空 → 直接短路 return，两个品牌被静默丢掉。
+  const utterance = "双11 想在小红书和抖音做一波波司登或鸭鸭羽绒服的明星同款投放，预算 300 万，主要要曝光也要销量";
+  const defaults: Partial<Brief> = {
+    industry: "服饰鞋包",
+    category: "羽绒服",
+    budget: { currency: "CNY", amount: 3_000_000 },
+    window: { from: "2026-11-01", to: "2026-11-11" },
+  };
+  const draft = parseBriefUtterance(utterance, defaults, NOW);
+  assert.deepEqual(draft.missing, [], "前置条件：关键字段已由默认值补齐，模型唯一要补的就是 brandIds");
+
+  const { gateway, calls } = stubGateway({
+    kind: "ok",
+    raw: JSON.stringify({ brief: { brandIds: ["波司登", "鸭鸭"] }, clarifications: [] }),
+  });
+  const out = await completeBriefDraft(utterance, draft, { gateway, ...noSignal });
+
+  assert.equal(calls(), 1, "直接点名品牌（即使无「品牌」元词）时必须问一次模型");
+  assert.deepEqual(out.brief.brandIds, ["波司登", "鸭鸭"], "品牌名要原样摘录");
+  assert.deepEqual(out.filledByModel, ["brandIds"]);
+  assert.ok(out.filled.includes("brandIds"));
+  assert.equal(out.source, "rule+llm");
+});
+
+test("WP-C-LLM-8 原话没提品牌时，模型越权返回的 brandIds 必须被丢弃", async () => {
+  const utterance = "Q4 抖音投放，预算 200 万，要曝光和转化";
+  const draft = parseBriefUtterance(utterance, undefined, NOW);
+  assert.deepEqual(draft.missing, ["industry", "category"]);
+
+  const { gateway } = stubGateway({
+    kind: "ok",
+    raw: JSON.stringify({
+      brief: { industry: "美妆个护", category: "护肤品-精华", brandIds: ["欧莱雅"] },
+      clarifications: [],
+    }),
+  });
+  const out = await completeBriefDraft(utterance, draft, { gateway, ...noSignal });
+
+  assert.equal(out.brief.brandIds, undefined, "没有品牌语境时不得凭空收下品牌（竞品集合会被污染）");
+  assert.deepEqual(out.filledByModel, ["industry", "category"], "只有缺失字段能进 filledByModel");
+  assert.equal(out.brief.industry, "美妆个护", "其余缺失字段的补全不受影响");
+});

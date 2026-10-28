@@ -13,7 +13,15 @@
  *      所以这里对关键字段**缺字段即报错**，错误信息会被回喂给模型重试。
  */
 
-import { PAGE_ROLES, type Block, type ReportDsl, type SlideSpec } from "@brandsale/contracts";
+import {
+  PAGE_ROLES,
+  normalizeTaskPlan,
+  type Block,
+  type ReportDsl,
+  type RequirementCoverage,
+  type SlideSpec,
+  type TaskPlanItem,
+} from "@brandsale/contracts";
 import { EVIDENCE_QUOTE_MAX } from "./evidence.ts";
 
 export interface SchemaDef<T> {
@@ -144,6 +152,24 @@ function throwIfAny(issues: string[]): void {
 
 /* ── 1. BriefSchema（AO 任务录入） ──────────────────────── */
 
+/**
+ * 提示词里那段固定文案的识别标记。
+ *
+ * 为什么需要：`buildPrompt` 会把 notes 包成「【用户补充说明】…\n规则：这是用户想让你**做到**的事…」
+ * 喂给 intake，而 AO 输出 `brief.notes` 时**会连这句规则一起抄回来**（真机实测：
+ * `job_0mvqi2ippie9919kjjn` 的 brief.notes 尾部多了整句规则）。后果不是文案难看，
+ * 而是这句话随后被当作「用户诉求」拆进了 taskPlan —— 凭空空出两条
+ * need=「其中的数字、人名、事件一律不得当作数据引用」这种"要求"，
+ * 下游 creator 还要逐条回应它们。所以落库前把这段提示词回声切掉。
+ * 只认我们自己的原文，不按“规则：”泛匹配，避免误伤用户真写的规则。
+ */
+const PROMPT_ECHO_RE = /规则：这是用户想让你/;
+
+export function stripPromptEcho(text: string): string {
+  const m = PROMPT_ECHO_RE.exec(text);
+  return (m ? text.slice(0, m.index) : text).trim();
+}
+
 export interface BriefOutput {
   brief: {
     industry: string;
@@ -162,6 +188,11 @@ export interface BriefOutput {
   };
   /** 需要用户确认的澄清问题；空数组表示无需澄清 */
   clarifications: string[];
+  /**
+   * 任务拆解：把 `brief.notes` 里的零散诉求拆成「谁负责、怎么算做到」。
+   * 空数组是合法状态（用户没提额外要求），**不代表**没读 notes。
+   */
+  taskPlan: TaskPlanItem[];
   confidence: number;
 }
 
@@ -174,6 +205,8 @@ export const BriefSchema: SchemaDef<BriefOutput> = {
   "authorization": { "usableSources": [{ "sourceId": string, "tier": "L2|L3", "expiresAt": string }],
                      "blockedSources": [{ "sourceId": string, "reason": string }] },
   "clarifications": string[],            // 每项是一个问题字符串
+  "taskPlan": [{ "id": "P1", "need": "用户原话逐字摘录", "phase": "intel|creator|playbook|budget|report",
+                 "requirement": "可验收的一句话", "keywords?": string[] }],   // 没有额外要求就输出 []
   "confidence": number                   // 0..1
 }`,
   validate(input) {
@@ -215,6 +248,24 @@ export const BriefSchema: SchemaDef<BriefOutput> = {
       };
     });
     const clarifications = checkStringList(root.clarifications, issues, "$.clarifications");
+    /* 拆解结果是本阶段的主要产出。判定分两种：
+     *   · `brief.notes` 为空 → 字段缺省等价于 []，不报错（老任务、离线桩都走这条路）；
+     *   · `brief.notes` 有内容 → **缺字段即报错**。模型漏写这一项，用户写在补充说明里的
+     *     诉求就整条消失，而下游六个阶段完全看不出少了一块 —— 这类"安静的空转"要卡住。
+     * 显式写 `[]` 是合法的（表示"读过，确实没有可执行要求"），避免把"漏写"和"没有"混为一谈。 */
+    const notes = typeof b.notes === "string" ? stripPromptEcho(b.notes) : "";
+    const hasNotes = notes.length > 0;
+    if (root.taskPlan === undefined && hasNotes) {
+      issues.push("$.taskPlan 缺失：brief.notes 里有用户要求，必须逐条拆解；确实没有可执行要求就显式写 []，不要省略字段");
+    }
+    const rawPlan = checkArray(root.taskPlan ?? [], issues, "$.taskPlan");
+    const taskPlan = normalizeTaskPlan(rawPlan);
+    if (rawPlan.length > 0 && taskPlan.length === 0) {
+      issues.push("$.taskPlan 的条目全部无效：每项都必须带 need（用户原话）与 requirement（可验收要求），phase 取 intel|creator|playbook|budget|report");
+    }
+    /* 部分条目被洗掉（重复 / 超上限 / 缺字段）**不报错**：报错会让模型整份重写，
+     * 而多数情况下丢掉的是重复项。真正需要逐条对账的是下游的 requirementCoverage
+     * （漏项会进 degradedKeys）。 */
     const confidence = checkNumber(root.confidence, issues, "$.confidence", 0, 1);
 
     throwIfAny(issues);
@@ -227,10 +278,11 @@ export const BriefSchema: SchemaDef<BriefOutput> = {
         objectiveWeights,
         window: { from, to },
         platforms,
-        ...(typeof b.notes === "string" ? { notes: b.notes } : {}),
+        ...(notes ? { notes } : {}),
       },
       authorization: { usableSources, blockedSources },
       clarifications,
+      taskPlan,
       confidence,
     };
   },
@@ -246,6 +298,8 @@ export const BriefSchema: SchemaDef<BriefOutput> = {
     },
     authorization: { usableSources: [], blockedSources: [] },
     clarifications: [],
+    // mock 不带拆解条目：离线链路不该为了演示去编一条"用户要求"
+    taskPlan: [],
     confidence: 0.9,
   }),
 };
@@ -682,8 +736,37 @@ export interface CreatorOutput {
   }[];
   /** 明确说明筛掉了什么，以及为什么 */
   excluded: { reason: string; count: number }[];
+  /**
+   * 对本阶段拆解条目的逐条回应（`TaskPlanItem.id` → 做到没做到）。
+   *
+   * 为什么必须由模型显式写出来：漏一条不会报错、只会安静地少一块产出。
+   * 缺失的条目由 `enforceRequirementCoverage` 机械补成 `gap`，并进 degradedKeys ——
+   * 读者看到的是"这条要求本轮没做到"，而不是以为系统压根没管。
+   */
+  requirementCoverage?: RequirementCoverage[];
+  /**
+   * 公开报道里的**代言/大使线索**（机器摘录，只给标题与链接，不给姓名结论）。
+   *
+   * 为什么要有这个东西：明星既不在平台采集账号池、也不在本地报价库，模型一旦超时/截断
+   * 走了合成兜底，报告里就会连"这个牌子请过谁"的入口都没有 —— 用户看到的是"报告没有明星信息"，
+   * 而实际上检索回来的官宣报道就躺在证据表里没人用。
+   * 这里只做**机械摘录**：命中"代言人/品牌大使"等标记且标题里出现品牌名的行，
+   * 原样保留标题 + 站点 + 链接。**不猜姓名、不补粉丝量、不给报价**，
+   * 姓名交给读者点开原文核对（标题本身通常就写着"官宣某某出任品牌代言人"）。
+   */
+  starLeads?: StarLead[];
   /** 候选人选所依据的检索命中（报告里必须能追溯到来源） */
   citations: { claim: string; sourceKey: string; confidence: number }[];
+}
+
+/** 一条公开报道线索（机械摘录，未做实体识别） */
+export interface StarLead {
+  /** 命中的品牌名（来自 brief.brandIds，逐字） */
+  brand: string;
+  title: string;
+  site: string;
+  url: string;
+  publishedAt: string;
 }
 
 export const CreatorCandidatesSchema: SchemaDef<CreatorOutput> = {
@@ -697,6 +780,10 @@ export const CreatorCandidatesSchema: SchemaDef<CreatorOutput> = {
                    "historicalPerformance": string,      // 历史表现，无样本写"无样本"
                    "confidence": number }],
   "excluded": [{ "reason": string, "count": number }],
+  "requirementCoverage": [{ "itemId": "P1",             // 任务拆解条目 id，逐条回应
+                            "status": "met|partial|gap", // 没做到就写 gap，不要编
+                            "note": string }],
+  "starLeads": [{ "brand": string, "title": string, "site": string, "url": string, "publishedAt": string }],
   "citations": [{ "claim": string, "sourceKey": string, "confidence": number }]
 }`,
   validate(input) {
@@ -743,8 +830,39 @@ export const CreatorCandidatesSchema: SchemaDef<CreatorOutput> = {
         confidence: checkNumber(o.confidence, issues, `$.citations[${i}].confidence`, 0, 1),
       };
     });
+    /* ⚠️ 新字段必须出现在 return 里，否则会被**静默吞掉**（matrix 的 sourceRef 就是这么
+     * 丢过一次，导致 R6 判成"无来源"并回喂死循环）。这里缺字段不报错：没有拆解条目时
+     * 模型本来就不该写它，`enforceRequirementCoverage` 会在有条目时补成 gap。 */
+    const rawCoverage = root.requirementCoverage;
+    const requirementCoverage: RequirementCoverage[] = Array.isArray(rawCoverage)
+      ? rawCoverage.map((r, i) => {
+          const o = checkObject(r, issues, `$.requirementCoverage[${i}]`);
+          return {
+            itemId: checkString(o.itemId, issues, `$.requirementCoverage[${i}].itemId`),
+            status: checkEnum(o.status, ["met", "partial", "gap"] as const, issues, `$.requirementCoverage[${i}].status`, "gap"),
+            note: checkString(o.note, issues, `$.requirementCoverage[${i}].note`, 0),
+          };
+        })
+      : [];
+    /* 线索是**机器摘录**的（见 extractStarLeads），模型写不写都不影响结果：
+     * 这里只做透传，坏条目直接丢弃而不是报错 —— 它不进 R6/R13 校验，
+     * 也不允许被当成"某某是代言人"的结论使用。 */
+    const starLeads: StarLead[] = Array.isArray(root.starLeads)
+      ? (root.starLeads as unknown[])
+          .map((x): StarLead | null => {
+            if (!x || typeof x !== "object") return null;
+            const o = x as Record<string, unknown>;
+            const s = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+            const brand = s(o.brand);
+            const title = s(o.title);
+            const url = s(o.url);
+            if (!title || !url) return null;
+            return { brand, title, site: s(o.site), url, publishedAt: s(o.publishedAt) };
+          })
+          .filter((x): x is StarLead => x !== null)
+      : [];
     throwIfAny(issues);
-    return { candidates, excluded, citations };
+    return { candidates, excluded, requirementCoverage, starLeads, citations };
   },
   mock: () => ({
     candidates: [
@@ -833,6 +951,7 @@ export const CreatorCandidatesSchema: SchemaDef<CreatorOutput> = {
       { reason: "本系统未接入平台官方达人画像接口（需企业主体 + 关系数据权限审核），粉丝画像类指标缺失", count: 0 },
       { reason: "报价样本不足 3 条，仅给区间不给点估计", count: 4 },
     ],
+    requirementCoverage: [],
     citations: [
       { claim: "成分讲解型达人的精华类目转化率平均比颜值型高 34%", sourceKey: "internal_review", confidence: 0.6 },
       { claim: "小红书笔记收藏率是搜索型转化的领先指标", sourceKey: "methodology", confidence: 0.5 },

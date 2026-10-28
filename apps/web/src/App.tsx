@@ -1,11 +1,13 @@
 import { HashRouter, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { Button, Result } from "antd";
 import { AppShell } from "./components/AppShell.tsx";
+import { LandingPage } from "./pages/LandingPage.tsx";
 import { NewJobPage } from "./pages/NewJobPage.tsx";
 import { JobListPage } from "./pages/JobListPage.tsx";
 import { JobDetailPage } from "./pages/JobDetailPage.tsx";
 import { KnowledgePage } from "./pages/KnowledgePage.tsx";
 import { GovernancePage } from "./pages/GovernancePage.tsx";
+import { PlatformsPage } from "./pages/PlatformsPage.tsx";
 
 function NotFound() {
   const navigate = useNavigate();
@@ -13,7 +15,7 @@ function NotFound() {
     <Result
       status="404"
       title="页面不存在"
-      subTitle="控制台只有四个入口：新建任务、任务列表、知识库、数据源与审计。"
+      subTitle="控制台有五个入口：新建任务、任务列表、知识库、数据源与审计、平台绑定；首页是产品介绍。"
       extra={
         <Button type="primary" onClick={() => navigate("/jobs/new")}>
           回到新建任务
@@ -35,13 +37,16 @@ export function App() {
   return (
     <HashRouter>
       <Routes>
+        {/* 落地页在 AppShell 之外：它不带侧栏，是给人第一次打开时看的 */}
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/console" element={<Navigate to="/jobs/new" replace />} />
         <Route element={<AppShell />}>
-          <Route index element={<Navigate to="/jobs/new" replace />} />
           <Route path="/jobs/new" element={<NewJobPage />} />
           <Route path="/jobs" element={<JobListPage />} />
           <Route path="/jobs/:jobId" element={<JobDetailPage />} />
           <Route path="/kb" element={<KnowledgePage />} />
           <Route path="/governance" element={<GovernancePage />} />
+          <Route path="/platforms" element={<PlatformsPage />} />
           <Route path="*" element={<NotFound />} />
         </Route>
       </Routes>

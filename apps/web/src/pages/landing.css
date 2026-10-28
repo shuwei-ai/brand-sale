@@ -1,0 +1,1347 @@
+/* ═══════════════════════════════════════════════════════════════════
+   landing.css — 落地页
+   与控制台共用主题：颜色全部来自 theme.ts 注入的 --lp-* 变量
+   （页面内不出现第二份色值），圆角 8–12px、字体栈与 antd 主题一致。
+   唯一的深色块呼应控制台已有的终端配色（#0f1319），不是另起一套暗色主题。
+   ═══════════════════════════════════════════════════════════════════ */
+
+.lp {
+  --lp-dark: #0f1319;
+  --lp-dark-2: #161c25;
+  --lp-dark-line: rgba(233, 240, 250, 0.12);
+  --lp-dark-text: #e4ebf6;
+  --lp-dark-muted: #93a1b6;
+  --lp-radius: 12px;
+  --lp-mono: var(--bm-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+
+  min-height: 100vh;
+  background: var(--lp-bg);
+  color: var(--lp-ink);
+  font-size: 14px;
+  line-height: 1.75;
+  overflow-x: hidden;
+}
+
+.lp-wrap {
+  width: min(100% - 48px, 1120px);
+  margin-inline: auto;
+}
+
+/* 通用可读性：正文与说明都用 ink2（#4b5364，对浅底 7:1），
+   ink3 只留给装饰性短线与非文字元素。 */
+.lp p {
+  margin: 0;
+  color: var(--lp-ink2);
+}
+
+.lp code {
+  font-family: var(--lp-mono);
+  font-size: 0.86em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--lp-ink) 6%, transparent);
+  color: var(--lp-ink);
+  white-space: nowrap;
+}
+
+.lp .lp-eyebrow {
+  font-family: var(--lp-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.12em;
+  color: var(--lp-ink2);
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.lp-eyebrow::before {
+  content: "";
+  width: 22px;
+  height: 1px;
+  background: var(--lp-primary);
+  flex: 0 0 auto;
+}
+
+.lp-eyebrow--dark {
+  color: var(--lp-dark-muted);
+}
+
+.lp-eyebrow--dark::before {
+  background: #7c82f5;
+}
+
+.lp-h2 {
+  margin: 0 0 12px;
+  font-size: clamp(24px, 3vw, 34px);
+  line-height: 1.25;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  color: var(--lp-ink);
+}
+
+.lp-h2--dark {
+  color: var(--lp-dark-text);
+}
+
+.lp-sub {
+  font-size: 14px;
+  line-height: 1.85;
+  max-width: 68ch;
+  /* 中文段末的孤字（如「起重跑。」）交给浏览器择优断行 */
+  text-wrap: pretty;
+}
+
+.lp-sub--dark {
+  color: var(--lp-dark-muted);
+}
+
+/* ── 顶栏 ─────────────────────────────────────────────────── */
+.lp-bar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  border-bottom: 1px solid color-mix(in srgb, var(--lp-line) 92%, transparent);
+}
+
+.lp-bar__in {
+  width: min(100% - 48px, 1120px);
+  margin-inline: auto;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.lp-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--lp-ink);
+  text-decoration: none;
+  flex: 0 0 auto;
+}
+
+/* 与 AppShell 的 .bm-logo 同一枚标记，尺寸放大一档 */
+.lp-brand__mark {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--lp-primary), #7c3aed);
+  color: #fff;
+  font-weight: 800;
+  font-size: 15px;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--lp-primary) 35%, transparent);
+}
+
+.lp-brand__text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.lp-brand__text strong {
+  font-size: 14.5px;
+  letter-spacing: -0.01em;
+}
+
+.lp-brand__text span {
+  font-size: 11px;
+  color: var(--lp-ink2);
+}
+
+.lp-nav {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.lp-nav__item {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0 12px;
+  min-height: 36px;
+  font-size: 13px;
+  color: var(--lp-ink2);
+  border-radius: 8px;
+  cursor: pointer;
+  position: relative;
+  transition:
+    color 160ms ease-out,
+    background-color 160ms ease-out;
+}
+
+.lp-nav__item::after {
+  content: "";
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 6px;
+  height: 1.5px;
+  background: var(--lp-primary);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 260ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.lp-nav__item:hover {
+  color: var(--lp-primary);
+}
+
+.lp-nav__item:hover::after {
+  transform: scaleX(1);
+}
+
+.lp-nav__item:focus-visible,
+.lp-linkbtn:focus-visible {
+  outline: 2px solid var(--lp-primary);
+  outline-offset: 2px;
+}
+
+/* ── 首屏 ─────────────────────────────────────────────────── */
+.lp-hero {
+  position: relative;
+  padding: 56px 0 0;
+  overflow: hidden;
+}
+
+/* 靛蓝光晕：控制台 body 上那层柔光的放大版 */
+.lp-hero::before {
+  content: "";
+  position: absolute;
+  inset: -180px 0 auto;
+  height: 620px;
+  background:
+    radial-gradient(52rem 30rem at 18% 24%, color-mix(in srgb, var(--lp-primary) 16%, transparent), transparent 62%),
+    radial-gradient(40rem 26rem at 88% 6%, color-mix(in srgb, #7c3aed 12%, transparent), transparent 60%);
+  pointer-events: none;
+}
+
+/* 蓝图网格：只在上半部显出，靠遮罩淡出，避免变成装饰噪声 */
+.lp-hero__grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--lp-primary) 7%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--lp-primary) 7%, transparent) 1px, transparent 1px);
+  background-size: 56px 56px;
+  -webkit-mask-image: radial-gradient(130% 78% at 50% 0%, #000 26%, transparent 76%);
+  mask-image: radial-gradient(130% 78% at 50% 0%, #000 26%, transparent 76%);
+}
+
+.lp-hero__in {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1.06fr) minmax(0, 0.94fr);
+  gap: clamp(28px, 4vw, 56px);
+  align-items: start;
+  padding-bottom: 48px;
+}
+
+.lp-hero__copy {
+  animation: lp-rise 620ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.lp-hero__title {
+  margin: 0 0 18px;
+  font-size: clamp(30px, 4vw, 46px);
+  line-height: 1.16;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--lp-ink);
+}
+
+.lp-hero__title em {
+  font-style: normal;
+  color: var(--lp-primary);
+  /* 半高底的荧光笔，比整段高亮克制 */
+  background: linear-gradient(
+    to top,
+    color-mix(in srgb, var(--lp-primary) 18%, transparent) 34%,
+    transparent 34%
+  );
+  padding: 0 2px;
+}
+
+.lp-hero__lede {
+  font-size: 15px;
+  line-height: 1.9;
+  max-width: 46ch;
+  margin-bottom: 26px;
+}
+
+.lp-hero__lede strong {
+  color: var(--lp-ink);
+  font-weight: 600;
+}
+
+.lp-hero__cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 18px;
+}
+
+.lp-hero__hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--lp-ink2);
+}
+
+.lp-hero__hint > .lp-t {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* antd 图标也渲染成 span，必须显式固定宽度，否则会跟着上面的规则一起被拉伸 */
+.lp-hero__hint > .anticon,
+.lp-note > .anticon {
+  flex: 0 0 auto;
+}
+
+.lp-hero__hint .anticon {
+  color: var(--lp-ok);
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+/* ── 首屏任务卡：照任务详情的真实结构 ─────────────────────── */
+.lp-jobcard {
+  position: relative;
+  background: #fff;
+  border: 1px solid var(--lp-line);
+  border-radius: var(--lp-radius);
+  box-shadow:
+    0 1px 2px rgba(25, 29, 39, 0.04),
+    0 18px 44px -18px color-mix(in srgb, var(--lp-primary) 26%, transparent);
+  overflow: hidden;
+  animation: lp-rise 620ms cubic-bezier(0.16, 1, 0.3, 1) 120ms both;
+}
+
+.lp-jobcard__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--lp-line);
+  background: #fbfcfe;
+}
+
+.lp-jobcard__dots {
+  display: inline-flex;
+  gap: 5px;
+}
+
+.lp-jobcard__dots i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #d8dde8;
+}
+
+.lp-jobcard__dots i:first-child {
+  background: var(--lp-primary);
+  animation: lp-pulse 1.8s ease-in-out infinite;
+}
+
+.lp-jobcard__path {
+  font-family: var(--lp-mono);
+  font-size: 11px;
+  color: var(--lp-ink2);
+  margin-right: auto;
+}
+
+.lp-jobcard__head {
+  padding: 14px 14px 10px;
+}
+
+.lp-jobcard__title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--lp-ink);
+}
+
+.lp-jobcard__meta {
+  font-size: 11.5px;
+  color: var(--lp-ink2);
+  margin-top: 2px;
+}
+
+.lp-jobcard__rows {
+  list-style: none;
+  margin: 0;
+  padding: 0 14px 12px;
+}
+
+.lp-jobcard__rows li {
+  display: grid;
+  grid-template-columns: 8px 62px 52px 1fr auto;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 0;
+  border-top: 1px dashed color-mix(in srgb, var(--lp-line) 88%, transparent);
+  font-size: 12px;
+}
+
+.lp-jobcard__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--lp-ok);
+}
+
+.is-warn .lp-jobcard__dot {
+  background: var(--lp-warn);
+}
+
+.lp-jobcard__en {
+  font-family: var(--lp-mono);
+  font-size: 11.5px;
+  color: var(--lp-ink);
+}
+
+.lp-jobcard__cn {
+  color: var(--lp-ink2);
+}
+
+.lp-jobcard__state {
+  color: var(--lp-ok);
+  font-size: 11.5px;
+}
+
+.is-warn .lp-jobcard__state {
+  color: var(--lp-warn);
+}
+
+.lp-jobcard__time {
+  font-family: var(--lp-mono);
+  font-size: 11px;
+  color: var(--lp-ink2);
+  font-variant-numeric: tabular-nums;
+}
+
+.lp-jobcard__foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--lp-line);
+  background: #fbfcfe;
+  font-size: 11.5px;
+  color: var(--lp-ink2);
+}
+
+.lp-jobcard__ok {
+  margin-left: auto;
+  color: var(--lp-ok);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* ── 阶段轨 ───────────────────────────────────────────────── */
+.lp-rail {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 26px;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  position: relative;
+  z-index: 1;
+}
+
+.lp-rail li {
+  position: relative;
+  padding-top: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+/* 连接线：穿过所有节点的一条 1px 主色线 */
+.lp-rail li::before {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: color-mix(in srgb, var(--lp-primary) 22%, transparent);
+}
+
+.lp-rail li:first-child::before {
+  left: 4px;
+}
+
+.lp-rail__dot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--lp-primary);
+}
+
+.lp-rail__idx {
+  font-family: var(--lp-mono);
+  font-size: 10.5px;
+  color: var(--lp-primary);
+  letter-spacing: 0.08em;
+}
+
+.lp-rail__en {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--lp-ink);
+}
+
+.lp-rail__cn {
+  font-size: 11.5px;
+  color: var(--lp-ink2);
+}
+
+/* ── 数字条 ───────────────────────────────────────────────── */
+.lp-stats {
+  border-block: 1px solid var(--lp-line);
+  background: #fff;
+}
+
+.lp-stats__in {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.lp-stat {
+  padding: 20px 18px;
+  border-left: 1px solid var(--lp-line);
+}
+
+.lp-stat:first-child {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.lp-stat__num {
+  font-family: var(--lp-mono);
+  font-size: 26px;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+  color: var(--lp-ink);
+  margin-right: 7px;
+}
+
+.lp-stat__num.is-accent {
+  color: var(--lp-primary);
+}
+
+.lp-stat__key {
+  font-size: 12px;
+  color: var(--lp-ink);
+  font-weight: 600;
+}
+
+.lp-stat__desc {
+  display: block;
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--lp-ink2);
+  line-height: 1.65;
+  max-width: 20em;
+}
+
+/* ── 区块 ─────────────────────────────────────────────────── */
+.lp-sec {
+  padding: 64px 0;
+}
+
+.lp-sec--tight {
+  padding-top: 24px;
+}
+
+.lp-sec__head {
+  margin-bottom: 28px;
+}
+
+/* ── 流水线 ───────────────────────────────────────────────── */
+.lp-flow {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--lp-line);
+}
+
+.lp-flow__row {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) 280px;
+  gap: 20px;
+  padding: 18px 12px;
+  border-bottom: 1px solid var(--lp-line);
+  position: relative;
+  transition: background-color 220ms ease-out;
+}
+
+/* 悬停：主色从左侧渗入，比整行变色更轻 */
+.lp-flow__row::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--lp-primary) 7%, transparent),
+    transparent 46%
+  );
+  opacity: 0;
+  transition: opacity 220ms ease-out;
+  pointer-events: none;
+}
+
+.lp-flow__row:hover::before {
+  opacity: 1;
+}
+
+.lp-flow__idx {
+  font-family: var(--lp-mono);
+  font-size: 13px;
+  color: var(--lp-ink2);
+  padding-top: 3px;
+  transition: color 220ms ease-out;
+}
+
+.lp-flow__row:hover .lp-flow__idx {
+  color: var(--lp-primary);
+}
+
+.lp-flow__main h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--lp-ink);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.lp-flow__name span {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--lp-ink2);
+  letter-spacing: 0.06em;
+}
+
+.lp-flow__main p {
+  font-size: 13px;
+  line-height: 1.8;
+  max-width: 60ch;
+}
+
+.lp-flow__meta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 8px;
+  align-content: start;
+  font-size: 11.5px;
+}
+
+.lp-flow__meta code {
+  font-size: 11px;
+  white-space: normal;
+  word-break: break-all;
+  background: none;
+  padding: 0;
+  color: var(--lp-ink2);
+}
+
+.lp-chip {
+  font-family: var(--lp-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: var(--lp-ink2);
+  border: 1px solid var(--lp-line);
+  border-radius: 4px;
+  padding: 1px 5px;
+  align-self: start;
+  background: #fff;
+  text-align: center;
+  line-height: 1.6;
+}
+
+.lp-chip--solid {
+  background: var(--lp-primary-soft);
+  border-color: color-mix(in srgb, var(--lp-primary) 24%, transparent);
+  color: var(--lp-primary);
+}
+
+/* ── 治理（唯一的深色块）──────────────────────────────────── */
+.lp-dark {
+  background: var(--lp-dark);
+  color: var(--lp-dark-text);
+  padding: 64px 0;
+  position: relative;
+  overflow: hidden;
+}
+
+/* 极淡的点阵：控制台终端的底色质感，不引入第二种暗色 */
+.lp-dark::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: radial-gradient(
+    color-mix(in srgb, #8b93ff 26%, transparent) 0.7px,
+    transparent 0.7px
+  );
+  background-size: 22px 22px;
+  opacity: 0.5;
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 30%, #000 70%, transparent);
+  mask-image: linear-gradient(180deg, transparent, #000 30%, #000 70%, transparent);
+}
+
+.lp-dark .lp-wrap {
+  position: relative;
+}
+
+.lp-gates {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 22px;
+}
+
+.lp-gate {
+  background: color-mix(in srgb, #ffffff 4%, transparent);
+  border: 1px solid var(--lp-dark-line);
+  border-radius: var(--lp-radius);
+  padding: 18px 18px 20px;
+  transition:
+    border-color 220ms ease-out,
+    transform 220ms ease-out,
+    background-color 220ms ease-out;
+}
+
+.lp-gate:hover {
+  border-color: color-mix(in srgb, #8b93ff 52%, transparent);
+  background: color-mix(in srgb, #ffffff 7%, transparent);
+  transform: translateY(-2px);
+}
+
+.lp-gate__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.lp-gate__icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: color-mix(in srgb, #8b93ff 18%, transparent);
+  color: #b9bfff;
+  font-size: 14px;
+}
+
+.lp-gate__no {
+  font-family: var(--lp-mono);
+  font-size: 12px;
+  color: var(--lp-dark-muted);
+}
+
+.lp-gate h3 {
+  margin: 0 0 6px;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--lp-dark-text);
+}
+
+.lp-gate p {
+  font-size: 12.5px;
+  line-height: 1.85;
+  color: var(--lp-dark-muted);
+}
+
+.lp-dark__foot {
+  font-size: 12.5px;
+  color: var(--lp-dark-text);
+  border-top: 1px solid var(--lp-dark-line);
+  padding-top: 16px;
+  max-width: 80ch;
+}
+
+.lp-dark__foot span {
+  color: var(--lp-dark-muted);
+}
+
+/* ── 溯源 ─────────────────────────────────────────────────── */
+.lp-trace {
+  background: #fff;
+  border: 1px solid var(--lp-line);
+  border-radius: var(--lp-radius);
+  box-shadow: 0 1px 2px rgba(25, 29, 39, 0.04);
+  overflow: hidden;
+}
+
+.lp-trace__head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--lp-line);
+  background: #fbfcfe;
+  flex-wrap: wrap;
+}
+
+.lp-trace__hint {
+  margin-left: auto;
+  font-family: var(--lp-mono);
+  font-size: 11px;
+  color: var(--lp-ink2);
+}
+
+.lp-trace__chain {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr) 28px minmax(0, 1fr);
+  gap: 10px;
+  padding: 18px 16px 20px;
+  align-items: start;
+}
+
+.lp-step {
+  min-width: 0;
+}
+
+.lp-step__no {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  background: var(--lp-primary-soft);
+  color: var(--lp-primary);
+  font-family: var(--lp-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.lp-step h4 {
+  margin: 6px 0 8px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--lp-ink);
+}
+
+.lp-step p {
+  font-size: 11.5px;
+  line-height: 1.75;
+  color: var(--lp-ink2);
+  margin-top: 8px;
+}
+
+.lp-code {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--lp-line);
+  border-radius: 8px;
+  background: #fbfcfe;
+  font-family: var(--lp-mono);
+  font-size: 11px;
+  line-height: 1.8;
+  color: var(--lp-ink2);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.lp-code code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+  color: inherit;
+  white-space: pre;
+}
+
+.lp-step__arrow {
+  display: grid;
+  place-items: center;
+  align-self: stretch;
+  color: color-mix(in srgb, var(--lp-primary) 55%, transparent);
+}
+
+.lp-quote {
+  margin: 0;
+  padding: 8px 12px;
+  border-left: 2px solid var(--lp-primary);
+  background: color-mix(in srgb, var(--lp-primary) 4%, transparent);
+  font-size: 12.5px;
+  line-height: 1.85;
+  color: var(--lp-ink);
+  border-radius: 0 6px 6px 0;
+  text-wrap: pretty;
+}
+
+.lp-step__resolved {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--lp-mono);
+  font-size: 11px;
+  color: var(--lp-ink2);
+  margin-top: 10px !important;
+}
+
+.lp-step__url {
+  color: var(--lp-primary);
+  border-bottom: 1px dashed color-mix(in srgb, var(--lp-primary) 45%, transparent);
+  word-break: break-all;
+}
+
+.lp-step__resolved em {
+  font-style: normal;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  color: var(--lp-ok);
+  border: 1px solid color-mix(in srgb, var(--lp-ok) 34%, transparent);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+/* ── 降级 ─────────────────────────────────────────────────── */
+.lp-cascade {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.lp-cascade__item {
+  position: relative;
+  padding: 22px 18px 18px;
+  background: #fff;
+  border: 1px solid var(--lp-line);
+  border-radius: var(--lp-radius);
+  box-shadow: 0 1px 2px rgba(25, 29, 39, 0.04);
+}
+
+/* 三级链条：顶部虚线 + 节点方块，暗示级联而不是并列 */
+.lp-cascade__item::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 18px;
+  right: 18px;
+  height: 2px;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--lp-primary) 0 8px,
+    transparent 8px 14px
+  );
+  opacity: 0.45;
+}
+
+.lp-cascade__tag {
+  font-family: var(--lp-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--lp-primary);
+  background: var(--lp-primary-soft);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+.lp-cascade__item h3 {
+  margin: 10px 0 6px;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--lp-ink);
+}
+
+.lp-cascade__item p {
+  font-size: 12.5px;
+  line-height: 1.85;
+}
+
+.lp-note {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  text-wrap: pretty;
+  margin-top: 20px !important;
+  font-size: 12.5px;
+  line-height: 1.8;
+  border-left: 2px solid var(--lp-line);
+  padding-left: 12px;
+  max-width: 80ch;
+}
+
+.lp-note > .lp-t {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.lp-note .anticon {
+  color: var(--lp-primary);
+  margin-top: 4px;
+}
+
+/* ── 运行 ─────────────────────────────────────────────────── */
+.lp-run {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: clamp(24px, 4vw, 48px);
+  align-items: center;
+}
+
+.lp-terminal {
+  border: 1px solid #242b37;
+  border-radius: var(--lp-radius);
+  background: var(--lp-dark);
+  overflow: hidden;
+  box-shadow: 0 20px 48px -24px rgba(15, 19, 25, 0.55);
+}
+
+.lp-terminal__bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--lp-dark-2);
+  border-bottom: 1px solid #242b37;
+}
+
+.lp-terminal__bar i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #2f3743;
+}
+
+.lp-terminal__bar i:nth-child(1) {
+  background: #ff5f57;
+}
+.lp-terminal__bar i:nth-child(2) {
+  background: #febc2e;
+}
+.lp-terminal__bar i:nth-child(3) {
+  background: #28c840;
+}
+
+.lp-terminal__bar span {
+  margin-left: 8px;
+  font-family: var(--lp-mono);
+  font-size: 11px;
+  color: #66768a;
+}
+
+.lp-terminal pre {
+  margin: 0;
+  padding: 14px;
+  font-family: var(--lp-mono);
+  font-size: 12px;
+  line-height: 1.9;
+  color: #ccd6e2;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.lp-terminal code {
+  background: none;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+  white-space: pre;
+}
+
+.lp-t-prompt {
+  color: #7fb2ff;
+}
+
+.lp-t-dim {
+  color: #66768a;
+}
+
+/* 许可说明：一条主色左边线，读作「注意事项」而不是警告横幅 */
+.lp-license {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  margin-top: 34px;
+  padding: 16px 18px;
+  background: #fff;
+  border: 1px solid var(--lp-line);
+  border-left: 3px solid var(--lp-primary);
+  border-radius: 4px 8px 8px 4px;
+}
+
+.lp-license__k {
+  color: var(--lp-primary);
+  font-size: 15px;
+  padding-top: 2px;
+}
+
+.lp-license p {
+  font-size: 12.5px;
+  line-height: 1.9;
+  max-width: 96ch;
+}
+
+.lp-license strong {
+  color: var(--lp-ink);
+  font-weight: 600;
+}
+
+/* ── 页脚 ─────────────────────────────────────────────────── */
+.lp-foot {
+  border-top: 1px solid var(--lp-line);
+  background: #fff;
+  padding: 28px 0 32px;
+}
+
+.lp-foot__in {
+  display: grid;
+  grid-template-columns: 1.6fr repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.lp-foot__word {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--lp-ink);
+}
+
+.lp-foot__cn {
+  font-size: 11.5px;
+  color: var(--lp-ink2);
+  margin-top: 2px !important;
+}
+
+.lp-foot__col span {
+  display: block;
+  font-family: var(--lp-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  color: var(--lp-ink2);
+  margin-bottom: 4px;
+}
+
+.lp-foot__col p {
+  font-size: 11.5px;
+  color: var(--lp-ink);
+}
+
+.lp-linkbtn {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--lp-primary);
+  cursor: pointer;
+  min-height: 32px;
+}
+
+.lp-linkbtn:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.lp-foot__fine {
+  margin-top: 20px !important;
+  padding-top: 14px;
+  border-top: 1px dashed var(--lp-line);
+  font-size: 11px;
+  color: var(--lp-ink2);
+}
+
+/* ── 动效 ─────────────────────────────────────────────────── */
+@keyframes lp-rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes lp-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.lp-reveal {
+  opacity: 0;
+  transform: translateY(14px);
+  transition:
+    opacity 460ms cubic-bezier(0.16, 1, 0.3, 1),
+    transform 460ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.lp-reveal.is-in {
+  opacity: 1;
+  transform: none;
+}
+
+/* ── 响应式 ───────────────────────────────────────────────── */
+@media (max-width: 1024px) {
+  .lp-hero__in {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .lp-jobcard {
+    /* 单列时铺满整行：留一半空白会让卡片看起来像没做完 */
+    max-width: none;
+  }
+
+  .lp-flow__row {
+    grid-template-columns: 44px minmax(0, 1fr) 220px;
+    gap: 14px;
+  }
+
+  .lp-trace__chain {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .lp-step__arrow {
+    transform: rotate(90deg);
+    justify-items: start;
+    padding-top: 0;
+    height: 22px;
+  }
+
+  .lp-run {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 860px) {
+  .lp-nav {
+    display: none;
+  }
+
+  .lp-gates,
+  .lp-cascade {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .lp-stats__in {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .lp-stat {
+    border-left: 0;
+    border-top: 1px solid var(--lp-line);
+    padding-left: 0;
+  }
+
+  .lp-stat:nth-child(2) {
+    border-top: 1px solid var(--lp-line);
+  }
+
+  .lp-rail {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    row-gap: 18px;
+  }
+
+  .lp-rail li:nth-child(4)::before {
+    left: 4px;
+  }
+
+  .lp-foot__in {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 680px) {
+  .lp-wrap,
+  .lp-bar__in {
+    width: calc(100% - 32px);
+  }
+
+  .lp-hero {
+    padding-top: 32px;
+  }
+
+  .lp-sec {
+    padding: 44px 0;
+  }
+
+  .lp-dark {
+    padding: 44px 0;
+  }
+
+  .lp-flow__row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .lp-flow__meta {
+    border-top: 1px dashed var(--lp-line);
+    padding-top: 10px;
+  }
+
+  .lp-brand__text span {
+    display: none;
+  }
+
+  .lp-hero__title {
+    font-size: 30px;
+  }
+
+  /* 眉标在 375 档收紧字距，避免「294 个离线用例」被拆出孤字 */
+  .lp-eyebrow {
+    font-size: 11px;
+    letter-spacing: 0.05em;
+  }
+
+  .lp-eyebrow::before {
+    width: 14px;
+  }
+
+  .lp-trace__hint {
+    margin-left: 0;
+  }
+
+  .lp-jobcard__rows li {
+    grid-template-columns: 8px 56px 44px 1fr auto;
+    gap: 6px;
+  }
+}
+
+/* 动效降级：位移与循环全部停掉，内容直接到位 */
+@media (prefers-reduced-motion: reduce) {
+  .lp-hero__copy,
+  .lp-jobcard {
+    animation: none;
+  }
+
+  .lp-jobcard__dots i:first-child {
+    animation: none;
+  }
+
+  .lp-reveal {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+}

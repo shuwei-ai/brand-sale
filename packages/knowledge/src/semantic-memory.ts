@@ -78,6 +78,10 @@ export interface SemanticMemoryOptions {
   dim?: number;
   /** 写入 Milvus 的向量模型标识，用于识别跨模型混用 */
   embedModel?: string;
+  /** 云端嵌入端点的 API Key（本地 embedding-core 留空） */
+  embedApiKey?: string;
+  /** 嵌入服务方言：`auto` = 有 Key 按 openai、无 Key 按本地内核。见 embedding.ts */
+  embedDialect?: EmbedDialectConfig;
   embedTimeoutMs?: number;
   milvusTimeoutMs?: number;
   /** 常规检索用 Bounded；写入后立刻读的场景用 Strong */
@@ -135,6 +139,15 @@ export type SemanticMemoryErrorCode =
   | "milvus_error"
   | "bad_request";
 
+/**
+ * 唯一的内部依赖：请求体/响应解析与方言判定集中在 embedding.ts。
+ *
+ * 为什么不在本文件里再写一份：`embedding.ts`（SQLite 语义通道）与本文件（Milvus 通道）
+ * 打的是**同一个**嵌入端点，两边各写一份请求体，早晚会出现
+ * "查询侧带了 input_type、写入侧没带"这种只影响精度的静默劣化。
+ */
+import { embedRequestInit, fetchWithRetry, parseEmbedResponse, resolveEmbedDialect, type EmbedDialect, type EmbedDialectConfig } from "./embedding.ts";
+
 export class SemanticMemoryError extends Error {
   /** 不要把它写成参数属性（constructor 里的 `readonly cause`）：
    *  `cause` 已经是 ES2022 `Error` 的成员，声明属性会触发 TS4115（需要 override），
@@ -188,6 +201,9 @@ export class SemanticMemory {
   };
   private ensured = false;
 
+  /** 嵌入端点方言（构造时定死，运行期不改）。见 embedding.ts 的 EmbedDialect */
+  private readonly dialect: EmbedDialect;
+
   /** 缓存"最近一次失败"，避免 Milvus 挂掉时每条 chunk 都白等一次超时。
    *  这与项目里重排失败后的冷却纪律是同一种做法。 */
   private milvusCooldownUntil = 0;
@@ -202,6 +218,7 @@ export class SemanticMemory {
       collection: options.collection ?? DEFAULTS.collection,
       dim: options.dim ?? DEFAULTS.dim,
     };
+    this.dialect = resolveEmbedDialect(options.embedDialect, options.embedApiKey ?? "");
   }
 
   /* ── 健康检查 ─────────────────────────────────────────── */
@@ -214,11 +231,17 @@ export class SemanticMemory {
     detail?: string;
   }> {
     const [embed, milvus] = await Promise.all([
-      fetch(`${this.opts.embedUrl.replace(/\/v1\/embeddings$/, "")}/health`, {
-        signal: AbortSignal.timeout(this.opts.embedTimeoutMs),
-      })
-        .then((r) => r.ok)
-        .catch(() => false),
+      // 探活分两种方言：本地内核有 /health；云端没有这个路由（404），
+      // 只能发一次 1 条文本的真实嵌入请求——它顺带验证了 Key 与模型名。
+      this.dialect === "openai"
+        ? this.embed(["health"], "query", undefined)
+            .then(() => true)
+            .catch(() => false)
+        : fetch(`${this.opts.embedUrl.replace(/\/v1\/embeddings$/, "")}/health`, {
+            signal: AbortSignal.timeout(this.opts.embedTimeoutMs),
+          })
+            .then((r) => r.ok)
+            .catch(() => false),
       this.callMilvus("/v2/vectordb/collections/list", { dbName: "default" }, { probe: true })
         .then(() => true)
         .catch(() => false),
@@ -236,6 +259,19 @@ export class SemanticMemory {
       dbName: "default",
     });
     if (Array.isArray(existing) && existing.includes(this.opts.collection)) {
+      // 集合已存在时**必须核对维度**：Milvus 的 dim 是建表属性，改不了。
+      // 换了嵌入模型（768 → 1024）却不重建，写入会以一条 Milvus 的底层报错失败，
+      // 而检索侧只看到"语义通道降级"——看起来像索引坏了，实际是维度对不上。
+      const dim = await this.existingDim();
+      if (dim !== null && dim !== this.opts.dim) {
+        throw new SemanticMemoryError(
+          "bad_request",
+          `collection「${this.opts.collection}」已存在且维度为 ${dim}，与当前配置的 ${this.opts.dim} 不一致。` +
+            `换嵌入模型后必须重建索引：npm run vector:rebuild -- --reset` +
+            `（或把 BM_MILVUS_COLLECTION 改成新名字，例如 ${this.opts.collection}_${this.opts.dim}）。` +
+            `⚠️ 不要只改 BM_EMBED_DIM 就重启，那样每条写入都会失败而检索只是静默降级。`,
+        );
+      }
       this.ensured = true;
       return;
     }
@@ -285,6 +321,39 @@ export class SemanticMemory {
   async dropCollection(): Promise<void> {
     await this.callMilvus("/v2/vectordb/collections/drop", { collectionName: this.opts.collection });
     this.ensured = false;
+  }
+
+  /**
+   * 读出已存在集合的向量维度。
+   *
+   * **刻意做成 best-effort**：Milvus 各版本 describe 的字段形态不同
+   * （`fields[].params[]` / `elementTypeParams`），解析失败一律返回 null 并放行。
+   * 宁可不校验，也不能因为解析不到就把一个正常的写入路径封死。
+   */
+  private async existingDim(): Promise<number | null> {
+    try {
+      const res = await this.callMilvus<{
+        data?: {
+          fields?: {
+            name?: string;
+            type?: string;
+            params?: { key?: string; value?: string }[];
+            elementTypeParams?: Record<string, string>;
+          }[];
+        };
+      }>("/v2/vectordb/collections/describe", { collectionName: this.opts.collection });
+
+      const fields = res.data?.fields ?? [];
+      const vec = fields.find((f) => (f.type ?? "").includes("FloatVector") || f.name === "vector");
+      if (!vec) return null;
+
+      const fromParams = vec.params?.find((p) => p.key === "dim")?.value;
+      const raw = fromParams ?? vec.elementTypeParams?.["dim"];
+      const dim = Number(raw);
+      return Number.isFinite(dim) && dim > 0 ? dim : null;
+    } catch {
+      return null;
+    }
   }
 
   /* ── 写入 ─────────────────────────────────────────────── */
@@ -514,19 +583,24 @@ export class SemanticMemory {
     inputType: "query" | "document",
     title: string | undefined,
   ): Promise<number[][]> {
+    const init = embedRequestInit(
+      {
+        model: this.opts.embedModel ?? "",
+        dialect: this.dialect,
+        ...(this.opts.embedApiKey ? { apiKey: this.opts.embedApiKey } : {}),
+        inputType,
+        ...(title ? { title } : {}),
+        dimensions: this.opts.dim,
+      },
+      texts,
+      AbortSignal.timeout(this.opts.embedTimeoutMs),
+    );
+
     let res: Response;
     try {
-      res = await fetch(this.opts.embedUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          input: texts,
-          input_type: inputType,
-          ...(title ? { title } : {}),
-          dimensions: this.opts.dim,
-        }),
-        signal: AbortSignal.timeout(this.opts.embedTimeoutMs),
-      });
+      res = await fetchWithRetry(() =>
+        fetch(this.opts.embedUrl, { method: "POST", headers: init.headers, body: init.body, signal: init.signal }),
+      );
     } catch (e) {
       throw new SemanticMemoryError(
         "embed_unavailable",
@@ -537,24 +611,16 @@ export class SemanticMemory {
     if (!res.ok) {
       throw new SemanticMemoryError(
         "embed_unavailable",
-        `嵌入服务返回 HTTP ${res.status}：${(await res.text()).slice(0, 200)}`,
+        `嵌入服务返回 HTTP ${res.status}${res.status === 401 || res.status === 403 ? "（API Key 无效或无权限）" : ""}：${(await res.text()).slice(0, 200)}`,
       );
     }
-    const json = (await res.json()) as { data?: { embedding?: number[] }[] };
-    const out = (json.data ?? []).map((d) => d.embedding ?? []);
-    if (out.length === 0) {
-      throw new SemanticMemoryError("embed_unavailable", "嵌入服务返回空结果");
+    const json = await res.json();
+    try {
+      // 维度校验与条数校验都在这里（跨维度比较算出来的分数毫无意义，而且**不报错**）
+      return parseEmbedResponse(json, this.opts.dim, texts.length).map((v) => Array.from(v));
+    } catch (e) {
+      throw new SemanticMemoryError("bad_request", e instanceof Error ? e.message : String(e), e);
     }
-    // 维度不一致必须立刻炸：跨维度比较算出来的分数毫无意义，而且**不报错**。
-    const bad = out.find((v) => v.length !== this.opts.dim);
-    if (bad) {
-      throw new SemanticMemoryError(
-        "bad_request",
-        `嵌入维度不匹配：期望 ${this.opts.dim}，实得 ${bad.length}。` +
-          `查询与文档必须同维度，且 collection 的 dim 一旦建表就不能改（需重建 collection）。`,
-      );
-    }
-    return out;
   }
 
   /* ── 内部：Milvus REST 调用 ───────────────────────────── */
@@ -607,20 +673,26 @@ export class SemanticMemory {
 /**
  * 从环境变量构造（与项目的 `BM_*` 命名保持一致）：
  *   BM_EMBED_URL        http://127.0.0.1:8899/v1/embeddings
+ *   BM_EMBED_MODEL      embeddinggemma-2 / BAAI/bge-m3
+ *   BM_EMBED_API_KEY    云端端点必填（SiliconFlow 等）；本地内核留空
+ *   BM_EMBED_DIALECT    auto | embeddinggemma | openai（auto = 有 Key 即 openai）
  *   BM_MILVUS_URI       http://127.0.0.1:19530
  *   BM_MILVUS_COLLECTION
- *   BM_EMBED_DIM        768 / 512 / 256 / 128
+ *   BM_EMBED_DIM        1024（bge-m3）/ 768（EmbeddingGemma 2）
  *   BM_MILVUS_TOKEN
  */
 export function semanticMemoryFromEnv(
   env: Record<string, string | undefined> = process.env,
 ): SemanticMemory {
+  const dialect = env.BM_EMBED_DIALECT as EmbedDialectConfig | undefined;
   return new SemanticMemory({
     embedUrl: env.BM_EMBED_URL ?? "http://127.0.0.1:8899/v1/embeddings",
     milvusUrl: env.BM_MILVUS_URI ?? "http://127.0.0.1:19530",
     collection: env.BM_MILVUS_COLLECTION,
     dim: env.BM_EMBED_DIM ? Number(env.BM_EMBED_DIM) : undefined,
     embedModel: env.BM_EMBED_MODEL,
+    ...(env.BM_EMBED_API_KEY ? { embedApiKey: env.BM_EMBED_API_KEY } : {}),
+    ...(dialect ? { embedDialect: dialect } : {}),
     milvusToken: env.BM_MILVUS_TOKEN || undefined,
     milvusTimeoutMs: env.BM_MILVUS_TIMEOUT_MS ? Number(env.BM_MILVUS_TIMEOUT_MS) : undefined,
   });

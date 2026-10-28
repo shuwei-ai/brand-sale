@@ -42,6 +42,8 @@ export interface IOrchestratorPort {
   cancelJob(jobId: string, tenantId: string, reason: string): Promise<void>;
   /** 单模块联动重算：只重跑该阶段及其下游 */
   rerunPhase(jobId: string, tenantId: string, phase: PhaseName): Promise<void>;
+  /** 删除任务及其全部关联数据（级联）。任务不存在或不属于该租户时抛 E-AUTH-002 */
+  deleteJob(jobId: string, tenantId: string): Promise<void>;
 }
 
 /** 阶段执行器：由 M9 AgentPack 提供的实际业务逻辑 */

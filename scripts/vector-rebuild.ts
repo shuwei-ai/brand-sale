@@ -62,6 +62,8 @@ async function main(): Promise<void> {
     embedModel: r.embedModel,
     embedDim: r.embedDim,
     embedTimeoutMs: r.embedTimeoutMs,
+    ...(r.embedApiKey ? { embedApiKey: r.embedApiKey } : {}),
+    ...(r.embedDialect ? { embedDialect: r.embedDialect } : {}),
   });
 
   const db = openDb(config.storage.sqlitePath);

@@ -492,6 +492,20 @@ export class Orchestrator implements IOrchestratorPort {
     this.deps.bus.publish(jobId, { type: "job.status", status: "cancelled", progress: job.progress });
   }
 
+  /**
+   * 删除任务及其全部关联数据。
+   *
+   * 运行中的任务先中断（abort 内部控制流），再从库里级联清除。
+   * 与 cancel 不同：cancel 保留任务记录（可追溯、可重跑），delete 是彻底抹除。
+   */
+  async deleteJob(jobId: string, tenantId: string): Promise<void> {
+    const job = await this.getJob(jobId, tenantId);
+    if (!job) throw new AppError({ code: "E-AUTH-002", message: "任务不存在或不属于该租户" });
+    this.controllers.get(jobId)?.abort();
+    const removed = this.deps.repos.jobs.delete(jobId, tenantId);
+    if (!removed) throw new AppError({ code: "E-AUTH-002", message: "任务不存在或不属于该租户" });
+  }
+
   /** 单模块联动重算：只重跑该阶段及其下游（E2E 用例 8） */
   async rerunPhase(jobId: string, tenantId: string, phase: PhaseName): Promise<void> {
     const job = await this.getJob(jobId, tenantId);

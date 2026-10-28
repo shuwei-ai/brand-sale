@@ -88,7 +88,7 @@ npm start                   # 启动网关（8787）
 # 以下两项按需
 npm run collector:setup     # 仅平台采集：建 Python venv + 装依赖 +（可选）chromium
 npm run collector           # 仅平台采集：启动 sidecar（8890）
-npm run stack:up            # 仅语义检索：启 Milvus + 嵌入服务
+npm run stack:up            # 仅语义检索：启 Milvus（嵌入默认云端，不含本地内核）
 ```
 
 ### 3.2 生产环境的关键差异
@@ -269,7 +269,7 @@ KillSignal=SIGKILL      # 或保留 SIGTERM + FinalKillSignal=SIGKILL
 
 **要用语义检索才做**
 
-- [ ] `npm run stack:up`（embedding + Milvus），确认内存余量（各限 3g）
+- [ ] `npm run stack:up`（仅 Milvus；本地嵌入内核 2026-10-28 已移除运行时），Milvus 限 3g
 - [ ] 首次给存量语料补算向量：`npm run embedding:backfill`
 - [ ] 确认 `BM_EMBED_URL` 与 `BM_VECTOR_DRIVER` 一致——二者不匹配时语义通道会**静默关闭**（§14 已列）
 

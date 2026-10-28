@@ -3,6 +3,10 @@ dist/
 *.log
 *.tsbuildinfo
 
+# Python 运行时缓存
+__pycache__/
+*.pyc
+
 # 环境变量（含 BM_LLM_API_KEY / BM_WEB_SEARCH_API_KEY），只提交 .env.example
 # .env.* 覆盖 .env.bak.* / .env.local 等一切变体——本次差点把含真密钥的
 # .env.bak.20261012-* 推上公开仓库（2026-10-14）。!.env.example 负责放行模板。
@@ -22,10 +26,23 @@ infra/milvus/volumes/
 services/embedding-core/.venv/
 services/embedding-core/models/
 
+# Spider_XHS 本地克隆（无上游 LICENSE；按业主个人使用决定保留在本机，不进公开仓库）
+services/spider-xhs/
+
+# DouYin_Spider 本地克隆（无上游 LICENSE；同上）
+services/douyin-spider/
+
 # 生成的报告产物（HTML / Markdown / DSL JSON）
 out/
+output/
+
+# 助手注册命令缓存（本地生成，不进库）
+.wechat-agent/
 
 # 项目内助手工作记忆（本地保留，不公开）
 .workbuddy/
+
+# 发布应用（sites）的本地标记文件
+*.genie
 
 .DS_Store

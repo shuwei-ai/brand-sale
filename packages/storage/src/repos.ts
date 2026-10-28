@@ -160,6 +160,32 @@ export class JobRepo {
   findRunning(): JobRecord[] {
     return this.db.all<JobRow>("SELECT * FROM jobs WHERE status = 'running' ORDER BY created_at ASC").map(toJob);
   }
+
+  /**
+   * 删除任务及其全部关联数据（级联，单事务）。
+   *
+   * 关联表清单：
+   *   - job_phases / artifacts / job_events / usage_records / ledger —— 与任务同生共死；
+   *   - idempotency —— 删掉后允许用户用同一个 Idempotency-Key 重建任务，
+   *     否则幂等表残留会把新任务误判成"已存在"、返回一个已删除的 jobId。
+   *
+   * 刻意**不动** `audit` 表：审计是操作留痕，删除任务本身也是要被记录的操作，
+   * 把历史审计一起删掉会破坏可追溯性。
+   */
+  delete(jobId: string, tenantId: string): boolean {
+    const job = this.get(jobId);
+    if (!job || job.tenantId !== tenantId) return false;
+    this.db.tx(() => {
+      this.db.run("DELETE FROM job_phases WHERE job_id = ?", jobId);
+      this.db.run("DELETE FROM artifacts WHERE job_id = ?", jobId);
+      this.db.run("DELETE FROM job_events WHERE job_id = ?", jobId);
+      this.db.run("DELETE FROM usage_records WHERE job_id = ?", jobId);
+      this.db.run("DELETE FROM ledger WHERE job_id = ?", jobId);
+      this.db.run("DELETE FROM idempotency WHERE job_id = ?", jobId);
+      this.db.run("DELETE FROM jobs WHERE job_id = ? AND tenant_id = ?", jobId, tenantId);
+    });
+    return true;
+  }
 }
 
 /* ── 阶段 ───────────────────────────────────────────────── */

@@ -20,7 +20,7 @@ import { MEDIA_CRAWLER_PLATFORM_META, type MediaCrawlerPlatform } from "@brandsa
 import { WEB_SEARCH_SOURCE_ID } from "@brandsale/datasource";
 import { evidenceIdOf } from "./evidence.ts";
 import { PLATFORM_DIGEST_TOOL_NAME } from "./tool-impls.ts";
-import type { BudgetOutput, CreatorOutput, CreatorTier, IntelOutput, PlaybookOutput } from "./schemas.ts";
+import type { BudgetOutput, CreatorOutput, CreatorTier, IntelOutput, PlaybookOutput, StarLead } from "./schemas.ts";
 
 export interface PrefetchedToolData {
   [toolName: string]: unknown;
@@ -697,11 +697,58 @@ export function backfillCreatorStatsInTables(
   return touched ? { ...dsl, slides } : dsl;
 }
 
+/**
+ * 「这条候选只靠公开报道成立」的机械标记（由 `pruneUnverifiableCreators` 第三条通道打上）。
+ *
+ * ⚠️ **判定必须看风险标记，不能看 talentId 前缀**：明星候选的 id 是**模型自己编的**
+ * （真机 `job_0mvqiisybvto1p5nkf9` 写的是 `celeb_loreal_tianxuning`），代码里根本没有
+ * 这个常量。只按前缀判断 → 明星候选掉进"报价库"分支 → 报告里出现
+ * 「本地达人报价库（L2）」「成本 0.0 万」这类**溯源错误 + 读起来像"免费"**的表述。
+ */
+export const PUBLIC_FIGURE_FLAG = "公开报道口径";
+export const PUBLIC_FIGURE_SOURCE_LABEL = "公开报道线索（L3，未经核验）";
+
+/** 是否"只靠公开报道成立"的公众人物候选（明星/名人） */
+export function isPublicFigureCandidate(c: { talentId: string; riskFlags?: readonly string[] }): boolean {
+  if ((c.riskFlags ?? []).some((f) => f.includes(PUBLIC_FIGURE_FLAG))) return true;
+  // 兜底：模型常用 celeb_ 前缀（不是契约，但出现时按公众人物处理，不要落进报价库分支）
+  return /^celeb[_-]/i.test(c.talentId);
+}
+
 /** 候选人来源标签：报告逐条标出来源，读者才知道哪一条能点回原帖 */
-export function creatorSourceOf(talentId: string): string {
+export function creatorSourceOf(c: string | { talentId: string; riskFlags?: readonly string[] }): string {
+  const talentId = typeof c === "string" ? c : c.talentId;
+  if (typeof c !== "string" && isPublicFigureCandidate(c)) return PUBLIC_FIGURE_SOURCE_LABEL;
   if (talentId.startsWith(PLATFORM_CREATOR_PREFIX)) return "平台公开采集（L3，未核验）";
   if (talentId.startsWith(PLACEHOLDER_CREATOR_PREFIX)) return "无数据（占位）";
   return "本地达人报价库（L2）";
+}
+
+/**
+ * 按姓名在官宣报道里找**出处**（标题含该姓名即算命中）。
+ *
+ * 纯机械子串匹配：不做实体识别、不猜品牌、不合并同名 —— 命不中就如实说没命中。
+ * 这是把用户诉求「给出姓名 + 官宣时间 + 来源链接」落到纸面的唯一不造假做法：
+ * 姓名来自候选人，标题/时间/链接来自已经检索回来的报道原文。
+ */
+export function starLeadOf(leads: readonly StarLead[] | undefined, name: string): StarLead | undefined {
+  const n = name.replace(/\s+/g, "");
+  if (n.length < 2) return undefined;
+  return (leads ?? []).find((l) => l.title.replace(/\s+/g, "").includes(n));
+}
+
+/**
+ * 报道时间显示：`2026-05-06T09:30:00+08:00` → `2026-05-06 09:30`。
+ *
+ * 原样塞 ISO 串进中文表格（真机报告里就是 `2026-02-03T18:39:00+08:00`）读者要自己拆
+ * `T` 和时区后缀才看得懂；这里只做**格式**转换，不改数值、不推算时区 ——
+ * 原文写几点就显示几点（表头注明「原文所示时间」）。
+ */
+export function fmtLeadTime(s: string | undefined): string {
+  const raw = (s ?? "").trim();
+  if (!raw) return "未标注";
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/.exec(raw);
+  return m ? `${m[1]} ${m[2]}` : raw;
 }
 
 /**
@@ -728,10 +775,15 @@ export function creatorAccountRows(creatorsIn: CreatorOutput | undefined, entrie
     if (a.uid) uidByTalent.set(id, a.uid);
   }
   return (creators?.candidates ?? []).map((c) => {
-    const source = creatorSourceOf(c.talentId);
+    const source = creatorSourceOf(c);
     const label = PLATFORM_LABEL_BY_NAME.get(c.platform) ?? c.platform;
     const isPlatform = c.talentId.startsWith(PLATFORM_CREATOR_PREFIX);
     const isPlaceholder = c.talentId.startsWith(PLACEHOLDER_CREATOR_PREFIX);
+    /* 公众人物候选（只靠公开报道成立）单列：凭据是**官宣报道链接**，不是"库内无账号 ID"。
+     * 三处必须一起改，少一处就自相矛盾：来源写"报价库"、凭据写"无账号"、
+     * 成本写"0.0 万"（读起来像免费）、粉丝量写"未知"（看起来像查过但没查到）。 */
+    const isPublicFigure = isPublicFigureCandidate(c);
+    const starLead = isPublicFigure ? starLeadOf(creators?.starLeads, c.nickname) : undefined;
     const credential = profileByTalent.get(c.talentId) || urlByTalent.get(c.talentId) || "";
     return [
       /* 标识列：**平台原始 UID 优先**（抖音 `67142047882`、小红书 24 位主页 id，站内可查），
@@ -742,17 +794,33 @@ export function creatorAccountRows(creatorsIn: CreatorOutput | undefined, entrie
       c.nickname,
       label,
       source,
-      isPlatform ? credential || "—" : isPlaceholder ? "—" : "库内无账号 ID（未核验）",
+      isPlatform
+        ? credential || "—"
+        : isPublicFigure
+          ? starLead?.url || "—（未命中官宣报道，仅检索正文提及姓名）"
+          : isPlaceholder
+            ? "—"
+            : "库内无账号 ID（未核验）",
       // 粉丝量：采到就写真实值（个人主页公开统计），没采到如实写"未采集"
-      c.followers > 0 ? String(c.followers) : isPlatform ? "未采集" : isPlaceholder ? "—" : "未知",
-      isPlatform || isPlaceholder ? "无样本" : `${(c.estimatedCost / 10000).toFixed(1)} 万`,
-      isPlaceholder
-        ? c.rationale.slice(0, 60)
-        : isPlatform
-          ? c.followers > 0
-            ? "粉丝量取自平台个人主页公开统计；报价无样本，投放前须人工核验"
-            : "账号名完整显示；粉丝量未采集，投放前须按原帖人工核验"
-          : "平台上搜不到同名账号属预期，投放前须人工核验",
+      c.followers > 0
+        ? String(c.followers)
+        : isPlatform || isPublicFigure
+          ? "未采集"
+          : isPlaceholder
+            ? "—"
+            : "未知",
+      isPlatform || isPlaceholder || isPublicFigure ? "无样本" : `${(c.estimatedCost / 10000).toFixed(1)} 万`,
+      isPublicFigure
+        ? starLead
+          ? `公开报道口径：点开凭据核对「${fmtLeadTime(starLead.publishedAt)}」的官宣报道；代言有期限，当前是否仍在合作须确认`
+          : "公开报道口径：仅检索正文提及姓名，未命中官宣报道；粉丝量/报价无样本，须人工核验"
+        : isPlaceholder
+          ? c.rationale.slice(0, 60)
+          : isPlatform
+            ? c.followers > 0
+              ? "粉丝量取自平台个人主页公开统计；报价无样本，投放前须人工核验"
+              : "账号名完整显示；粉丝量未采集，投放前须按原帖人工核验"
+            : "平台上搜不到同名账号属预期，投放前须人工核验",
     ];
   });
 }
@@ -816,14 +884,22 @@ export function creatorRosterBlocks(creators: CreatorOutput | undefined, entries
   const rows = creatorAccountRows(creators, entries);
   if (rows.length === 0) return [];
   const anyPlatform = (creators?.candidates ?? []).some((c) => c.talentId.startsWith(PLATFORM_CREATOR_PREFIX));
+  const anyPublicFigure = (creators?.candidates ?? []).some((c) => isPublicFigureCandidate(c));
+  const base = anyPlatform
+    ? "本报告人选**取自本任务真实平台公开采集**（L3、未经人工核验）：账号真实存在、昵称完整显示，逐条附可点开的原帖/个人主页链接；粉丝量取自个人主页公开统计，报价**未采集**，因此成本不做估计。实际执行前必须由商务在平台侧按原帖人工核验并回填报价。"
+    : "本报告人选来自**本地达人报价库**（L2 样本）：库内只存昵称/类目/粉丝量与报价样本，不存平台账号 ID，也未与平台账号核验过。因此这些昵称在平台上搜不到同名账号属预期现象，不代表报价是假的，但也不能当作可直接联系或投放的账号 —— 投放前须由商务在平台侧按昵称+类目人工核验并回填账号 ID。";
+  /* 明星候选是**第三条来源**，与前两条都不一样：它既没有平台账号（明星官方号未采集），
+   * 也不在报价库里，唯一的凭据是公开报道。不单独说明的话，读者会把它当成"报价库样本"
+   * 或"编出来的名字"。代价必须写出来：粉丝量与报价一律按 0 处理（不是 0 元，是没有数据）。 */
+  const starNote = anyPublicFigure
+    ? "其中标注「公开报道线索」的是**明星/公众人物候选**：不在平台采集账号池、也不在报价库，凭据是本次联网检索到的官宣报道链接（姓名命中报道标题）——粉丝量与报价**未采集**，表中一律显示「无样本/未采集」，不代表 0 元；代言有期限，是否仍在合作须点开原文并向品牌确认。"
+    : "";
   return [
     { type: "text", style: "h3", content: CREATOR_ROSTER_MARK, sourceRef: "phase:creator" },
     {
       type: "callout",
       tone: "warn",
-      text: anyPlatform
-        ? "本报告人选**取自本任务真实平台公开采集**（L3、未经人工核验）：账号真实存在、昵称完整显示，逐条附可点开的原帖/个人主页链接；粉丝量取自个人主页公开统计，报价**未采集**，因此成本不做估计。实际执行前必须由商务在平台侧按原帖人工核验并回填报价。"
-        : "本报告人选来自**本地达人报价库**（L2 样本）：库内只存昵称/类目/粉丝量与报价样本，不存平台账号 ID，也未与平台账号核验过。因此这些昵称在平台上搜不到同名账号属预期现象，不代表报价是假的，但也不能当作可直接联系或投放的账号 —— 投放前须由商务在平台侧按昵称+类目人工核验并回填账号 ID。",
+      text: `${base}${starNote}`,
       sourceRef: "phase:creator",
     },
     {
@@ -863,13 +939,107 @@ export function platformAccountBlocks(entries: readonly EvidenceEntry[]): Report
 /** 两块机械内容的判存标记（附录幂等靠它；改文案等于改契约，别只改一处） */
 export const CREATOR_ROSTER_MARK = "人选名单来源与核验状态";
 export const PLATFORM_ACCOUNT_MARK = "平台真实账号（采集所得）";
+export const STAR_LEAD_MARK = "公开报道中的代言/大使线索";
 
-/** 两块合起来（合成路径一次性拼进附录时用） */
-export function creatorProvenanceBlocks(
+/**
+ * 「公开报道中的代言/大使线索」块 —— 让"报告里为什么没有明星"这件事有据可查。
+ *
+ * 场景：用户明确要求"达人候选里必须包含明星"，而明星既不在平台账号池、也不在报价库，
+ * 只能靠公开报道。模型这条路一旦超时走合成兜底，候选表里就只剩普通达人，读者会以为
+ * 系统压根没查过。这里把**已经检索回来的官宣报道**按原文标题列出来：
+ *   · 不做实体识别 —— 姓名通常就写在标题里（"官宣某某出任品牌代言人"），点开即可核对；
+ *   · 不给粉丝量/报价 —— 报道证明不了，任何数字都会变成无源断言；
+ *   · 明确写"未经核验 + 可能过期" —— 代言有期限，旧报道不等于当前仍在合作。
+ */
+export function starLeadBlocks(leads: readonly StarLead[] | undefined): ReportDsl["slides"][number]["blocks"] {
+  if (!leads || leads.length === 0) return [];
+  return [
+    { type: "text", style: "h3", content: STAR_LEAD_MARK, sourceRef: "phase:creator" },
+    {
+      type: "callout",
+      tone: "info",
+      text: "以下为机器摘录的公开报道线索（L3、未经人工核验）：只保留原文标题、站点与链接，未做姓名抽取，也未据此推断粉丝量或报价。代言有期限，旧报道不等于当前仍在合作 —— 是否确为该品牌代言人、是否在合作期、档期与报价，都须点开原文并向品牌/商务确认。",
+      sourceRef: "phase:creator",
+    },
+    {
+      type: "table",
+      columns: ["品牌", "报道标题", "站点", "发布时间（原文所示）", "原文链接"],
+      rows: leads.map((l) => [l.brand || "—", l.title, l.site || "—", fmtLeadTime(l.publishedAt), l.url]),
+      caption: "线索来自本次联网检索（按品牌逐条检索「品牌 代言人」）；本表不构成人选推荐，也不参与成本测算",
+      sourceRef: "phase:creator",
+    },
+  ];
+}
+
+export const STAR_CANDIDATE_MARK = "明星候选与官宣出处";
+/** 同一位艺人最多列几条官宣报道（他可能同时代言多个品牌/品类） */
+const MAX_LEADS_PER_CANDIDATE = 2;
+
+/**
+ * 「明星候选与官宣出处」块 —— 把「姓名 + 官宣时间 + 来源链接」三者**机械**对上。
+ *
+ * 为什么必须有这块：用户诉求原话是「给出姓名、官宣时间与来源链接」。而现状是
+ * 姓名在**人选表**里（来自候选人），官宣报道在**线索表**里（来自检索命中），两张表
+ * 谁也不指谁：读者看到「田栩宁」却没有可点开的依据，看到「肖战官宣欧莱雅」却不知道
+ * 这在候选里算不算数。靠模型去连等于让模型做实体识别 —— 超时走兜底时直接归零。
+ *
+ * 所以连接放在这里，规则只有一条：**姓名出现在报道标题里**就算命中（子串匹配）。
+ * 命中不了就如实写「未命中官宣报道」，绝不从 rationale 里猜品牌、猜时间。
+ */
+export function starCandidateBlocks(creators: CreatorOutput | undefined): ReportDsl["slides"][number]["blocks"] {
+  const celebs = (creators?.candidates ?? []).filter((c) => isPublicFigureCandidate(c));
+  if (celebs.length === 0) return [];
+  const leads = creators?.starLeads ?? [];
+  /* 一位艺人**可能同时代言多个品牌/品类**：真机里张凌赫既有「巴黎欧莱雅美发代言人」
+   * 又有「适乐肤 CeraVe 亚太区品牌代言人」。只取命中的第一条会随机丢掉另一条，
+   * 读者会以为他只为其中一个品牌代言 —— 所以按 (候选 × 命中报道) 展开成多行，
+   * 每人最多 2 条（再多就变成"检索命中堆在这里"，而不是人选依据）。 */
+  let hit = 0;
+  const rows: string[][] = [];
+  for (const c of celebs) {
+    const matched = leads.filter((l) => starLeadOf([l], c.nickname) !== undefined).slice(0, MAX_LEADS_PER_CANDIDATE);
+    if (matched.length === 0) {
+      rows.push([c.nickname, "—", "未命中官宣报道（仅检索正文提及姓名）", "未标注", "—", "无样本（未采集）"]);
+      continue;
+    }
+    hit += 1;
+    for (const l of matched) rows.push([c.nickname, l.brand || "—", l.title, fmtLeadTime(l.publishedAt), l.url, "无样本（未采集）"]);
+  }
+  const dup = celebs.filter((c) => leads.filter((l) => starLeadOf([l], c.nickname) !== undefined).length > 1).length;
+  return [
+    { type: "text", style: "h3", content: STAR_CANDIDATE_MARK, sourceRef: "phase:creator" },
+    {
+      type: "callout",
+      tone: "info",
+      text:
+        `以下 ${celebs.length} 位候选来自「公开报道口径」通道（本次联网检索命中姓名 + 自述为公众人物），` +
+        `其中 ${hit} 位在检索回的官宣报道标题里**逐字命中姓名**，故能给出报道链接与发布时间。` +
+        (dup > 0 ? `有 ${dup} 位命中了**不止一条**官宣（同一艺人可能同时代言多个品牌/品类），已分行列出，未做取舍。` : "") +
+        "姓名↔报道的连接是**标题子串匹配**，不做实体识别、不区分同名同姓；" +
+        "未命中的如实写「未命中官宣报道」——那表示本轮没检索到可点开的官宣原文，**不代表否认该身份**。" +
+        "粉丝量与报价在这条通道上一律未采集（表中显示「无样本」，不是 0 元）；代言有期限，是否仍在合作须点开原文确认。",
+      sourceRef: "phase:creator",
+    },
+    {
+      type: "table",
+      columns: ["代言人（候选）", "品牌", "官宣报道标题", "发布时间（原文所示）", "原文链接", "粉丝量/报价"],
+      rows,
+      caption: "姓名→报道的连接规则：报道标题逐字包含姓名；本表不参与成本测算，也不构成人选推荐",
+      sourceRef: "phase:creator",
+    },
+  ];
+}
+
+/** 两块合起来（合成路径一次性拼进附录时用） */export function creatorProvenanceBlocks(
   creators: CreatorOutput | undefined,
   entries: readonly EvidenceEntry[],
 ): ReportDsl["slides"][number]["blocks"] {
-  return [...creatorRosterBlocks(creators, entries), ...platformAccountBlocks(entries)];
+  return [
+    ...creatorRosterBlocks(creators, entries),
+    ...starCandidateBlocks(creators),
+    ...starLeadBlocks(creators?.starLeads),
+    ...platformAccountBlocks(entries),
+  ];
 }
 
 /** 把 [from,to] 切成周（用于 weeklyCalendar 与内容日历页） */
@@ -1171,7 +1341,21 @@ export interface CreatorPruneResult {
  */
 export function pruneUnverifiableCreators(
   value: CreatorOutput,
-  real: { talentIds?: Iterable<string>; accounts?: readonly { platform: string; platformName: string; author: string }[] },
+  real: {
+    talentIds?: Iterable<string>;
+    accounts?: readonly { platform: string; platformName: string; author: string }[];
+    /**
+     * 本次公开检索命中的正文（标题 + 摘要拼接）。
+     *
+     * 这条通道是为「明星 / 名人候选」开的，而不是给普通达人放宽门槛：明星既不在
+     * 平台采集账号池、也不在本地报价库，前两条路都走不通时，**唯一**能证明"这个人
+     * 确实存在且与本次话题相关"的证据就是公开报道里出现过该姓名。
+     * 代价必须显式：走这条路的候选，粉丝量、报价一律强制归零（未采集就是未采集），
+     * 并追加一条"公开报道口径、未经核验"的风险标记 —— 不能因为名字是真的，
+     * 就默认它旁边那些数字也是真的。
+     */
+    publicText?: string;
+  },
 ): CreatorPruneResult {
   const ids = new Set(real.talentIds ?? []);
   const keys = new Set<string>();
@@ -1179,6 +1363,10 @@ export function pruneUnverifiableCreators(
     keys.add(`${a.platform}|${a.author}`);
     keys.add(`${a.platformName}|${a.author}`);
   }
+  const haystack = (real.publicText ?? "").replace(/\s+/g, "").toLowerCase();
+  /* `known` **只**看前两条强证据（报价库 / 采集账号），公开报道不算：
+   * 它只用来"捞回"本该被剔除的人，不用来新增剔除面 —— 在没有任何强证据可比对的
+   * 任务里，"全放行"是刻意的（否则离线链路与空采集任务的人选页会整片空白）。 */
   const known = ids.size > 0 || keys.size > 0;
   // 没有任何真实数据可比对时不做剔除：闸门缺输入时"全放行"和"全拦下"都错，
   // 前者让报告可能引用编造人选，后者会让离线 mock 全链路直接空掉。
@@ -1186,25 +1374,56 @@ export function pruneUnverifiableCreators(
   if (!known) return { value, dropped: [] };
 
   const dropped: CreatorPruneResult["dropped"] = [];
-  const kept = value.candidates.filter((c) => {
-    if (c.talentId.startsWith(PLACEHOLDER_CREATOR_PREFIX)) return true;
-    if (ids.has(c.talentId)) return true;
+  let publicBacked = 0;
+  const kept = value.candidates.map((c) => {
+    if (c.talentId.startsWith(PLACEHOLDER_CREATOR_PREFIX)) return c;
+    if (ids.has(c.talentId)) return c;
     const label = PLATFORM_LABEL_BY_NAME.get(c.platform) ?? c.platform;
-    if (keys.has(`${c.platform}|${c.nickname}`) || keys.has(`${label}|${c.nickname}`)) return true;
+    if (keys.has(`${c.platform}|${c.nickname}`) || keys.has(`${label}|${c.nickname}`)) return c;
     // 平台采集账号的 id 是确定性推导的：即便模型改写了昵称格式，只要 id 对得上就放行
     if (keys.size > 0) {
       for (const k of keys) {
         const [p, author] = k.split("|");
-        if (p && author && platformCandidateId(p, author) === c.talentId) return true;
+        if (p && author && platformCandidateId(p, author) === c.talentId) return c;
       }
     }
-    dropped.push({ talentId: c.talentId, nickname: c.nickname, reason: "无法在真实数据源中溯源（本地报价库无此记录、平台采集结果中无此账号）" });
-    return false;
-  });
+    // ③ 公开报道通道：姓名（≥2 字，打码不算）在本次检索命中里出现过，**且该候选自述是公众人物**
+    /* 为什么要后者：这条通道只该服务"明星/名人"这一类人。若对所有候选都放开，
+     * 「小美」这种两字昵称撞上正文里的同名词就会把一条无源候选洗成"公开报道可溯源"，
+     * 反造假闸等于被一句话绕开。自述里没有明星/代言/艺人字样的，仍走严格通道。 */
+    const claimsPublicFigure = /明星|艺人|名人|代言人|顶流|偶像/.test(`${c.rationale} ${c.contentFit} ${c.category}`);
+    const name = c.nickname.replace(/\s+/g, "").replace(/\*/g, "").toLowerCase();
+    if (claimsPublicFigure && haystack.length > 0 && name.length >= 2 && haystack.includes(name)) {
+      publicBacked += 1;
+      return {
+        ...c,
+        followers: 0,
+        estimatedCost: 0,
+        costRange: { low: 0, high: 0 },
+        confidence: Math.min(c.confidence, 0.4),
+        riskFlags: [
+          ...c.riskFlags.filter((f) => !f.includes("公开报道")),
+          "公开报道口径（联网检索命中姓名），未经人工核验；粉丝量与报价无样本",
+        ],
+      } satisfies CreatorOutput["candidates"][number];
+    }
+    dropped.push({
+      talentId: c.talentId,
+      nickname: c.nickname,
+      reason: "无法在真实数据源中溯源（本地报价库无此记录、平台采集结果中无此账号、公开检索也未提及该姓名）",
+    });
+    return null;
+  }).filter((c): c is CreatorOutput["candidates"][number] => c !== null);
 
   const excluded = [...value.excluded];
+  if (publicBacked > 0) {
+    excluded.push({
+      reason: "部分人选只来自公开报道（联网检索命中姓名）：粉丝量与报价未采集，一律按 0 处理，投放前须人工核验",
+      count: publicBacked,
+    });
+  }
   if (dropped.length > 0) {
-    excluded.push({ reason: "剔除无法溯源的候选人选（禁止编造达人）：本地报价库与平台采集结果中均无此账号", count: dropped.length });
+    excluded.push({ reason: "剔除无法溯源的候选人选（禁止编造达人）：本地报价库、平台采集结果与公开检索中均无此账号", count: dropped.length });
   }
   return { value: { ...value, candidates: fillCreatorTiers(kept, {}), excluded }, dropped };
 }
@@ -1339,6 +1558,9 @@ export function synthCreators(brief: { platforms: string[]; category?: string },
       { reason: "样本量 < 3 的达人只给区间不给点估计", count: Math.max(0, (pq?.candidates?.length ?? 0) - fromPricing.filter((c) => c.confidence >= 0.5).length) },
     ],
     citations: (kb?.hits ?? []).slice(0, 3).map((h) => ({ claim: h.text.slice(0, 40), sourceKey: h.citation.sourceId, confidence: 0.5 })),
+    // 兜底合成不读拆解条目：留空由 enforceRequirementCoverage 统一补成 gap
+    // （"没做到"必须显式，不能让兜底路径看起来像"没有这项要求"）
+    requirementCoverage: [],
   };
 }
 
@@ -1900,21 +2122,28 @@ export function synthReport(
             rows: creator.candidates.map((c) => {
               const isPlatform = c.talentId.startsWith(PLATFORM_CREATOR_PREFIX);
               const isPlaceholder = c.talentId.startsWith(PLACEHOLDER_CREATOR_PREFIX);
+              const isPublicFigure = isPublicFigureCandidate(c);
+              const starLead = isPublicFigure ? starLeadOf(creator.starLeads, c.nickname) : undefined;
               return [
                 TIER_LABEL[c.tier] ?? c.tier,
                 c.nickname,
                 PLATFORM_LABEL_BY_NAME.get(c.platform) ?? c.platform,
-                creatorSourceOf(c.talentId),
+                creatorSourceOf(c),
                 c.followers > 0 ? String(c.followers) : "未采集",
                 c.matchScore.toFixed(2),
                 c.estimatedCost > 0 ? c.estimatedCost.toFixed(0) : isPlaceholder ? "—" : "无样本",
-                isPlatform ? creatorEvidenceUrl(evidenceEntries, c.talentId) || "—" : "—",
+                isPlatform
+                  ? creatorEvidenceUrl(evidenceEntries, c.talentId) || "—"
+                  : isPublicFigure
+                    ? starLead?.url || "—（未命中官宣报道）"
+                    : "—",
               ];
             }),
             caption:
               "来源列逐条标注数据出处：「平台公开采集」的账号名完整显示、可点开凭据列原帖/个人主页核对（粉丝量取自个人主页公开统计、报价无样本，故成本不做估计）；" +
-              "「本地达人报价库」为商务录入样本，库内无平台账号 ID，平台上搜不到同名账号属预期。" +
-              "详见附录「人选名单来源与核验状态」与「平台真实账号（采集所得）」",
+              "「本地达人报价库」为商务录入样本，库内无平台账号 ID，平台上搜不到同名账号属预期；" +
+              "「公开报道线索」为明星/公众人物候选，凭据是本次检索到的官宣报道链接（姓名命中标题），粉丝量与报价未采集 —— 「无样本」不是 0 元。" +
+              "详见附录「人选名单来源与核验状态」「明星候选与官宣出处」与「平台真实账号（采集所得）」",
             sourceRef: "phase:creator",
           },
           /* 散点图要两个**真实**量纲。粉丝量在平台采集路径下根本不存在，
@@ -2268,12 +2497,19 @@ export function enrichReportProvenance(
   dsl = backfillCreatorStatsInTables(dsl, liveCreators, entries);
   const creatorBlocks = creatorRosterBlocks(liveCreators, entries);
   const accountBlocks = platformAccountBlocks(entries);
+  const starBlocks = starLeadBlocks(liveCreators?.starLeads);
+  const starCandidateBlockList = starCandidateBlocks(liveCreators);
 
   /* 没有平台证据时不再整段跳过：人选来源标注与证据无关（它回答的是"人名哪来的"），
    * 缺了它，读者仍会把本地报价库的样例昵称当成真实平台账号。 */
   if (entries.length === 0) {
-    if (creatorBlocks.length === 0) return dsl;
-    return appendToAppendix(dsl, [{ present: (t) => t.includes(CREATOR_ROSTER_MARK), blocks: creatorBlocks }], []);
+    const groups = [
+      { present: (t: string) => t.includes(CREATOR_ROSTER_MARK), blocks: creatorBlocks },
+      { present: (t: string) => t.includes(STAR_CANDIDATE_MARK), blocks: starCandidateBlockList },
+      { present: (t: string) => t.includes(STAR_LEAD_MARK), blocks: starBlocks },
+    ].filter((g) => g.blocks.length > 0);
+    if (groups.length === 0) return dsl;
+    return appendToAppendix(dsl, groups, []);
   }
 
   // ① 来源声明：把"真的有证据"的平台补进去
@@ -2379,6 +2615,12 @@ export function enrichReportProvenance(
        * 合在一组时"人选块缺失"会把账号块一起再拼一遍 —— 附录里出现两张一模一样的表。 */
       { present: (t) => t.includes(CREATOR_ROSTER_MARK), blocks: creatorBlocks },
       { present: (t) => t.includes(PLATFORM_ACCOUNT_MARK), blocks: accountBlocks },
+      /* 明星候选↔官宣出处**单独一组**（先于线索表）：它回答"这些人名的依据在哪"，
+       * 而线索表回答"这一轮检索到了哪些官宣报道"。合成路径两块都会写，彼此不能互相顶替。 */
+      { present: (t) => t.includes(STAR_CANDIDATE_MARK), blocks: starCandidateBlockList },
+      /* 代言线索**单独一组**：它既不依赖平台证据、也不依赖人选，缺它时读者会以为
+       * "系统压根没查过明星"。合成路径已经写过（present 命中）时这里不会重复追加。 */
+      { present: (t) => t.includes(STAR_LEAD_MARK), blocks: starBlocks },
     ],
     newCites,
   );

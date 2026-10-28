@@ -3,7 +3,9 @@ import {
   ApartmentOutlined,
   DatabaseOutlined,
   FileTextOutlined,
+  HomeOutlined,
   PlusSquareOutlined,
+  QrcodeOutlined,
   UnorderedListOutlined,
 } from "@ant-design/icons";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
@@ -13,18 +15,22 @@ import { TokenBox } from "./TokenBox.tsx";
 const { Header, Sider, Content } = Layout;
 
 const MENU = [
+  { key: "/", icon: <HomeOutlined />, label: "首页" },
   { key: "/jobs/new", icon: <PlusSquareOutlined />, label: "新建任务" },
   { key: "/jobs", icon: <UnorderedListOutlined />, label: "任务列表" },
   { key: "/kb", icon: <DatabaseOutlined />, label: "知识库" },
   { key: "/governance", icon: <ApartmentOutlined />, label: "数据源与审计" },
+  { key: "/platforms", icon: <QrcodeOutlined />, label: "平台绑定" },
 ];
 
 /** 侧栏高亮键：/jobs/xxx 详情页也要把「任务列表」点亮 */
 function selectedKey(pathname: string): string {
+  if (pathname === "/") return "/";
   if (pathname.startsWith("/jobs/new")) return "/jobs/new";
   if (pathname.startsWith("/jobs")) return "/jobs";
   if (pathname.startsWith("/kb")) return "/kb";
   if (pathname.startsWith("/governance")) return "/governance";
+  if (pathname.startsWith("/platforms")) return "/platforms";
   return "/jobs/new";
 }
 

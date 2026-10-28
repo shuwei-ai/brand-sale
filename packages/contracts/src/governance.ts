@@ -96,6 +96,7 @@ export type AuditKind =
   | "authz.revoke"
   | "kb.ingest"
   | "kb.ingest.rejected"
+  | "job.delete"
   | "security.alert";
 
 export interface AuditRecord {

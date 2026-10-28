@@ -168,3 +168,63 @@ export interface EventPayloadMap {
   "job.done": { artifacts: Artifact[]; usage: UsageSummary };
   "view.snapshot": { jobId: string; status: JobStatus };
 }
+
+/* ── 平台绑定（服务端无头扫码，方案 A）──────────────────
+ *
+ * `state` 的语义严格区分「验证过」与「只看到 cookie」：
+ *   bound       探活通过（接口/页面确认已登录）
+ *   unbound     探活确认未登录，或 profile 里没有该平台的 cookie
+ *   unverified  有 cookie 但无法确认（平台无稳定探活接口 / 探活被风控挡住）
+ *   error       浏览器或网络故障
+ *   unavailable 采集 sidecar 未接入
+ * 不要把它简化成"已绑定/未绑定"两态 —— 那会把「cookie 可能过期」谎报成已绑定。
+ */
+export type PlatformBindingState = "bound" | "unbound" | "unverified" | "error" | "unavailable";
+
+export interface PlatformBinding {
+  platform: string;
+  name: string;
+  sourceId?: string;
+  state: PlatformBindingState;
+  /** verified = 有可信探活；cookie = 只看了 cookie 存在性 */
+  confidence?: "verified" | "cookie";
+  detail: string;
+}
+
+export interface PlatformsResponse {
+  ok: boolean;
+  configured: boolean;
+  reason?: string;
+  checkedAt: string | null;
+  probing: boolean;
+  mcEnabled?: boolean;
+  platforms: PlatformBinding[];
+}
+
+export type PlatformLoginState =
+  | "starting"
+  | "waiting_scan"
+  | "succeeded"
+  | "failed"
+  | "timeout"
+  | "cancelled";
+
+export interface PlatformLoginSession {
+  id: string;
+  platform: string;
+  name: string;
+  state: PlatformLoginState;
+  /** `data:image/png;base64,...`，只在内存里，二维码过期后需重新开一个会话 */
+  qrDataUrl?: string;
+  qrAt?: string;
+  qrExpiresAt?: string;
+  expiresAt: string;
+  startedAt: string;
+  finishedAt?: string;
+  message?: string;
+}
+
+export interface PlatformLoginResponse {
+  ok: boolean;
+  session: PlatformLoginSession;
+}

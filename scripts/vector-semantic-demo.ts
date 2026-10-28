@@ -20,7 +20,15 @@ const EMBED_URL = process.env.BM_EMBED_URL || "http://127.0.0.1:8899/v1/embeddin
 const MILVUS_URL = process.env.BM_MILVUS_URI || "http://127.0.0.1:19530";
 const COLLECTION = `brandsale_demo_${Date.now().toString(36)}`; // 独立集合，跑完即删，不污染线上语料
 const TENANT = "tenant_demo";
-const DIM = 768;
+const DIM = Number(process.env.BM_EMBED_DIM ?? 768);
+const EMBED_API_KEY = process.env.BM_EMBED_API_KEY ?? "";
+/** auto：有 Key 按云端 openai 方言（只发 model+input），无 Key 按本地内核（带 input_type） */
+const EMBED_DIALECT: "embeddinggemma" | "openai" =
+  process.env.BM_EMBED_DIALECT === "openai" || process.env.BM_EMBED_DIALECT === "embeddinggemma"
+    ? process.env.BM_EMBED_DIALECT
+    : EMBED_API_KEY
+      ? "openai"
+      : "embeddinggemma";
 
 const line = (s = ""): void => console.log(s);
 const head = (s: string): void => console.log(`\n${"─".repeat(4)} ${s} ${"─".repeat(Math.max(0, 56 - s.length))}`);
@@ -92,8 +100,16 @@ async function main(): Promise<void> {
   const t0 = Date.now();
   const res = await fetch(EMBED_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ input: [probe], input_type: "query", dimensions: DIM }),
+    headers: {
+      "Content-Type": "application/json",
+      ...(EMBED_API_KEY ? { Authorization: `Bearer ${EMBED_API_KEY}` } : {}),
+    },
+    // 云端 openai 方言不认 input_type / dimensions（严格网关会 400）
+    body: JSON.stringify(
+      EMBED_DIALECT === "openai"
+        ? { model: process.env.BM_EMBED_MODEL ?? undefined, input: [probe] }
+        : { input: [probe], input_type: "query", dimensions: DIM },
+    ),
   });
   if (!res.ok) throw new Error(`嵌入服务返回 HTTP ${res.status}`);
   const body = (await res.json()) as { data: { embedding: number[] }[]; model?: string; meta?: Record<string, unknown> };
@@ -112,7 +128,9 @@ async function main(): Promise<void> {
     milvusUrl: MILVUS_URL,
     collection: COLLECTION,
     dim: DIM,
-    embedModel: "embeddinggemma-2",
+    embedModel: process.env.BM_EMBED_MODEL ?? "embeddinggemma-2",
+    ...(process.env.BM_EMBED_API_KEY ? { embedApiKey: process.env.BM_EMBED_API_KEY } : {}),
+    ...(process.env.BM_EMBED_DIALECT ? { embedDialect: process.env.BM_EMBED_DIALECT as "auto" | "openai" | "embeddinggemma" } : {}),
     milvusTimeoutMs: 10_000,
   });
   const health = await mem.health();

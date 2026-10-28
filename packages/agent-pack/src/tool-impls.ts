@@ -227,7 +227,10 @@ const webSearch: ToolImpl = {
     allowedAgents: ["AO", "CI", "CT", "PL", "BR", "RG"],
     governance: ["scope", "source", "authz", "tenant"],
     boundSourceId: WEB_SEARCH_SOURCE_ID,
-    timeoutMs: 12_000,
+    // ⚠️ 必须**大于** `BM_WEB_SEARCH_TIMEOUT_MS`（默认 20000），否则工具层先超时，
+    //    env 里把检索超时调大完全不生效（适配器还没走到自己的 AbortController 就被掐断）。
+    //    真机实测检索耗时 0.4–1.7s，这里是给长尾兜底，不是常态等待。
+    timeoutMs: 22_000,
     retry: { attempts: 1, backoff: "fixed", baseMs: 400 },
     fallback: "none",
     // 单次可检索 20 条（BM_WEB_SEARCH_COUNT），模型一轮内还会换多个关键词；

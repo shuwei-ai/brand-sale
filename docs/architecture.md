@@ -5,7 +5,7 @@
 >
 > 核对基线：2026-10-13 工作区（`npm test` 210 用例全绿、`npm run check:boundaries` 通过）。
 > 2026-10-14 局部更新：采集浏览器会话改为 `reuse` 常驻复用（§8.5）、删除死配置
-> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **253**（见 §14）。
+> `BM_PARSER_FALLBACK`、补上从未被调用的 `crawler.close()`；用例数 **294**（见 §14）。
 
 ## 0. 阅读指引
 
@@ -91,7 +91,7 @@
 | `apps/gateway` | 5 | 902 | HTTP + SSE 接入层 |
 | **合计（TS）** | **89** | **≈24 200** | 另有采集内核 Python（内嵌 MediaCrawler） |
 
-测试：**19 个文件 / 253 个用例**，全部离线可跑（§12）。
+测试：**22 个文件 / 295 个用例**，全部离线可跑（§12）。
 
 ---
 
@@ -131,8 +131,9 @@
 └─────────────────────────────────────────────────────────────────────┘
 
 可选的旁路组件（缺席只导致降级，不阻塞）：
-  Docker: embedding-core  127.0.0.1:8899   EmbeddingGemma 2 嵌入服务
-  Docker: Milvus          127.0.0.1:19530  向量索引（+ etcd + MinIO）
+  云端:  OpenAI 兼容嵌入 API   默认 SiliconFlow · BAAI/bge-m3（1024 维，无需自建）
+  本地:  embedding-core        127.0.0.1:8899   EmbeddingGemma 2（768 维，可选路径）
+  Docker: Milvus               127.0.0.1:19530  向量索引（+ etcd + MinIO），仅大语料需要
 ```
 
 要点：
@@ -146,14 +147,14 @@
 
 ```bash
 npm install                 # 一次性
-npm test                    # 全离线自检（253 用例）
+npm test                    # 全离线自检（295 用例）
 npm run migrate             # 建表（dev 模式空库会自动灌种子）
 npm run seed                # 登记内置数据源与演示租户
 npm run web:build           # 构建前端控制台 → apps/web/dist
 npm start                   # 启动网关（8787）
 npm run collector:setup     # 仅当要用平台采集：建 Python venv + 装依赖 + 下载浏览器
 npm run collector           # 仅当要用平台采集：启动 sidecar（8890）
-npm run stack:up            # 仅当要用语义检索：起 Milvus + 嵌入服务
+npm run stack:up            # 仅当要用语义检索：起 Milvus（嵌入默认在云端，不含本地内核）
 ```
 
 **渐进式可用**：不装 Python 就没有平台数据；不起 Docker 就没有语义检索（退化为 BM25 + 关键词）；
@@ -306,6 +307,36 @@ POST /api/v1/jobs
 不做超时控制 —— 超时在 `agents.ts` 的 `PHASE_TIMEOUT_MS`（§7.1）。
 
 **同一个 job 不会并发跑**：`runJob` 开头检查 `this.running.has(jobId)` 并直接返回（`running` 是 Set）。
+
+#### 4.1.1 `brief.notes` → 任务拆解（`taskPlan`，2026-10-27）
+
+**问题**：`notes`（前端「补充说明」）原来只被拼进提示词，标题还是「客户输入 Brief（事实基准，
+直接采用）」，**六个阶段没有任何一处对它负责**。用户写「达人候选必须包含明星代言人」，
+报告照样跑完、人选页全是普通达人，界面看不出异常；同时它又是一条绕过反造假闸的旁路——
+其中的人名/数字没有任何 citation 义务。
+
+**做法**（阶段拓扑不变，只让诉求有主）：
+
+| 环节 | 位置 | 行为 |
+|---|---|---|
+| 拆解 | AO 提示词 + `BriefSchema.validate` | `notes` 有内容时必须输出 `taskPlan`（`id/need/phase/requirement/keywords`）；显式 `[]` 合法，**漏字段即报错** |
+| 归一 | `contracts/src/task-plan.ts` | 洗数据：未知 phase→`report`、重复 id 去重、缺 need/requirement 丢弃、上限 8 条 |
+| 传递 | `agents.ts:buildPrompt` | `notes` **从事实块里摘出**单独成段（「意图与约束，不是事实数据」）；`taskPlan` 单独一段，**只列本阶段条目**，并明示"逐条回应、不得改动 Brief" |
+| 取数 | `agents.ts:prefetch` | intel：关键词拼进行业 query（**不加调用**）；creator：有本阶段条目时**额外**联网检索，**明星条目按品牌各一条** `{品牌} 代言人`（最多 3 个品牌） |
+| 兜底 | `agents.ts:attachStarLeads` | 检索命中的**代言/大使报道**机械摘录成 `starLeads`（标题+站点+链接，标记须在**标题**里、品牌按标题归属），报告附录固定出一页「公开报道中的代言/大使线索」——模型超时走合成兜底时，这一页仍然在 |
+| 校验 | `agent-pack/src/task-plan.ts` | `requirementCoverage` 漏项→机械补 `gap` 并进 `degradedKeys`；明星条目的 `met` 必须有公开报道撑腰，否则降级 `gap` |
+| 溯源 | `synthesis.ts:pruneUnverifiableCreators` | 新增**第三条通道**：姓名在本次公开检索命中里出现过即放行，但 `followers/estimatedCost/costRange` **强制归零**并追加「公开报道口径、未经核验」风险标记 |
+
+三条不许放宽的边界：① `notes` 是**意图不是事实**，其中数字/人名不得当结论引用；
+② 拆解不得改 Brief 结构化字段（预算/时间窗/平台/权重/品牌）、不得增删阶段；
+③ 明星既不在平台采集账号池也不在报价库时，**正确产出是 `gap`**（"本轮未取得"），
+不是编一个名字 —— 一条 gap 比一个假名字有用。
+
+**检索词为什么按品牌拆（2026-10-27 实测）**：`欧莱雅 适乐肤 护肤品-精华 明星代言人 品牌代言人`
+在火山联网检索里返回的 20 条**全是类目测评**（0 个代言人姓名），而 `适乐肤 代言人` 直接命中
+「官宣张凌赫」「官宣樊振东」。词越多越像"类目检索"，代言报道被稀释 —— 品牌名是最强锚点，
+故明星条目改为**每品牌一条**（上限 3 条，按次计费）。同时 `publicMentions` 改为聚合
+`web_search_plan*` 全部键，否则"第二个品牌请过谁"永远进不了溯源通道。
 
 ### 4.2 状态机与终态判定
 
@@ -727,17 +758,24 @@ validateReportDsl()     仍不通过且 error 不可修复 → 抛 E-RENDER-001�
 
 | 码 | 阶段 | 中文名 | 产出 Schema | 模型档 | 输出上限 | 上下文上限 | 阶段超时 | 工具白名单 |
 |---|---|---|---|---|---:|---:|---:|---|
-| AO | intake | 任务录入 | `BriefSchema` | light | 4 096 | 8 000 | 120s | `validate_brief` `resolve_authorization` |
-| CI | intel | 竞品情报 | `CompetitorIntelSchema` | strong | 8 192 | 16 000 | 180s | `kb_retrieve` `web_search` `platform_digest` |
-| CT | creator | 人选匹配 | `CreatorCandidatesSchema` | medium | 8 192 | 16 000 | 150s | `kb_retrieve` `pricing_query` `risk_screen` `platform_digest` |
-| PL | playbook | 打法排期 | `PlaybookSchema` | medium | 10 240 | 24 000 | 150s | `kb_retrieve` `calendar_plan` |
-| BR | budget | 预算风控 | `BudgetSchema` | medium | 8 192 | 16 000 | 150s | `kb_retrieve` `pricing_query` `scenario_simulate` |
-| RG | report | 研报生成 | `ReportDslSchema` | strong | **32 768** | **48 000** | 240s | `render_outline` `cite_fact` |
+| AO | intake | 任务录入 | `BriefSchema` | light | 65 536 | 8 000 | 120s | `validate_brief` `resolve_authorization` |
+| CI | intel | 竞品情报 | `CompetitorIntelSchema` | strong | 65 536 | 16 000 | 180s | `kb_retrieve` `web_search` `platform_digest` |
+| CT | creator | 人选匹配 | `CreatorCandidatesSchema` | medium | 65 536 | 16 000 | 150s | `kb_retrieve` `pricing_query` `risk_screen` `platform_digest` |
+| PL | playbook | 打法排期 | `PlaybookSchema` | medium | 65 536 | 24 000 | 150s | `kb_retrieve` `calendar_plan` |
+| BR | budget | 预算风控 | `BudgetSchema` | medium | 65 536 | 16 000 | 150s | `kb_retrieve` `pricing_query` `scenario_simulate` |
+| RG | report | 研报生成 | `ReportDslSchema` | strong | **307 200** | **48 000** | 240s | `render_outline` `cite_fact` |
 
 **为什么要分档**（`agents.ts` 注释）：输出预算给少了，模型每轮恰好截在 max_tokens
 （`finish_reason=length`），解析全失败 → 走合成兜底 → 报告顶部出现误导性的「模型不可用」——
 实际模型一直是好的。一份 13 页含真表格的 DSL 约 40–60KB JSON（≈2 万+ token），
 所以 report 必须显著高于其它阶段。上下文同理：全局 24 000 装不下「竞品 + 人选 + 排期 + 预算」四份表格。
+
+**🔴 2026-10-27 全线上调到 65 536 / report 307 200**（原 4 096 / 8 192 / 10 240 / 32 768）。
+强制 thinking 的端点下，reasoning token 与正文**共用**这份预算，而 Pi 循环是**逐轮**套用该值
+（`tryPiAgent: model.maxTokens = phaseMaxTokens`）。真机证据 `job_0mvqi2ippie9919kjjn`：
+intel 的 Pi 循环走到 `assistant[thinking + 4×toolCall]` 就再没有正文，日志
+`Agent 循环未产出任何文本`；随后直连兜底两次 `output_tokens=0`。**只把 report 调大不解决问题** ——
+非 report 阶段吃的是本表，不是 `BM_LLM_MAX_OUTPUT_TOKENS`（也不吃 `BM_REPORT_MAX_TOKENS`）。
 
 **阶段超时是"下限"**：实际取 `max(本表, BM_LLM_TIMEOUT_MS + 60_000)`。
 自建端点有冷启动（连上但不吐 token 好几分钟），若阶段预算小于单次请求超时，
@@ -921,7 +959,7 @@ SYSTEM_PROMPTS[code] = PER_AGENT[code] + "\n\n" + COMMON_RULES
 | 源 id | 显示名 | 算子 | 外部 HTTP | 计费 | 备注 |
 |---|---|---|---|---|---|
 | `volc_web_search` | 火山引擎「联网搜索 Lite」 | `search` | ✅ | **按次计费** | 全系统**唯一**真正打外部 HTTP 的通道 |
-| `mc_xhs` | 小红书公开内容 | `search` / `content_detail` / `comments` / `creator` | ✅（经 collector） | 否 | 复用 MediaCrawler 内核 |
+| `mc_xhs` | 小红书公开内容 | `search` / `content_detail` / `comments` / `creator` | ✅（经 collector） | 否 | MediaCrawler 内核；可选 Spider_XHS 纯 HTTP 后端（`BM_XHS_DRIVER=spider`） |
 | `mc_dy` | 抖音公开内容 | 同上 | 同上 | 否 | |
 | `mc_ks` | 快手公开内容 | 同上 | 同上 | 否 | |
 | `mc_bili` | B站公开内容 | 同上 | 同上 | 否 | 唯一有弹幕/投币 |
@@ -1070,6 +1108,83 @@ Chrome。collector 串行执行，于是一次报告 = 几十次"窗口弹出 �
 `SystemExit` 不被 `except Exception` 捕获、子进程静默死。已修，**其余六平台仍是上游原样**。
 诊断方法：用内核自己的 profile + `libs/stealth.min.js` 起 headless 探针抓 DOM——
 一次性新 profile 直连会触发平台安全验证，得到假结论。
+
+
+### 8.5.1 服务端扫码登录（方案 A：无头 + 二维码下发）
+
+本地开发时扫码靠内核的 `show_qrcode()` 打开看图器；服务器上没有 DISPLAY，那一步必然失败
+（而且它在 `run_in_executor` 里跑，异常会被吞掉，表现为「卡住不动、日志无异常」）。方案 A 把它
+换成**二维码回传给前端**，登录仍然在服务器上完成：
+
+```
+前端「平台绑定」页
+  POST /api/v1/platforms/:p/login      （网关只做代理，不自己起浏览器）
+    apps/gateway  →  apps/collector  POST /login/start
+      python apps/collector/py/login_runner.py --mode login --platform xhs
+        headless chromium（与内核同一份 profile）
+          → stdout: {"event":"qr","dataUrl":"data:image/png;base64,…"}
+          → 轮询登录态（marker cookie 换发 / localStorage）
+          → stdout: {"event":"logged_in"}
+  GET /api/v1/platforms/login/:id  →  { state, qrDataUrl, qrExpiresAt }
+```
+
+四条设计约束：
+
+| 约束 | 原因 |
+|---|---|
+| **同一时刻只允许一个登录/探测进程** | 七平台并发扫码 = 七个 chromium（0.5–0.8 GB/个）；且内核采集本身串行，并发无收益 |
+| **profile 与内核完全共用**（`<coreDir>/browser_data/cdp_<platform>_user_data_dir`） | 扫完码采集子进程直接复用；另建目录等于扫了不生效 |
+| **登录执行器是独立脚本，不改内核 `login.py`** | 内核的是交互式流程（`show_qrcode` + `sys.exit`），改它会把许可敏感代码与产品逻辑缠在一起 |
+| **二维码只在内存** | 它是 2 分钟内可换一个账号会话的短时效凭据；日志只记「已获取/已登录」，不记 base64 |
+
+**登录态判定必须分两档**（这是这套方案最容易说谎的地方）：
+
+| 状态 | 含义 | 判定 |
+|---|---|---|
+| `bound` | 已确认登录 | 有 marker cookie **且**接口/页面探活通过（B站 `nav`、知乎 `/api/v4/me`、微博 `m.weibo.cn/api/config`、贴吧 `dc/common/tbs`、小红书页面 DOM） |
+| `unbound` | 确认未登录 | 没有 marker cookie，或探活明确返回未登录 |
+| `unverified` | **无法确认** | 有 cookie 但该平台没有稳定探活手段（快手；抖音只有 localStorage 标记），或探活被风控挡住 |
+
+`unverified` **不许**显示成「已绑定」：真机小红书 profile 里就有过期的 `web_session`，
+只看 cookie 会得到「已登录」，用户白等一次采集才发现 0 条数据。同理，`--mode login` 启动时
+也会先验一次：cookie 在但探活不过 → 照样走二维码，不谎报「无需扫码」。
+
+**抖音没有可用的探活手段**：`SPECS["dy"]` 只有 `localstorage: ("HasUserLogin", "1")`、
+没有 `probe`。真机 profile 里 `sessionid` / `LOGIN_STATUS` 全空，而 `HasUserLogin` 常年是
+`"1"` —— 凭它判「已登录」是纯假阳性（界面显示已绑定、采集拿到 0 条）。所以：
+
+| 信号 | 能否单独判 `bound` |
+|---|---|
+| marker cookie（`sessionid` / `SESSDATA` / `passToken` …） | 可以；但 `--mode login` 的预判必须再过一次 probe |
+| localStorage 标记 | **不行**。只能当「变化证据」（扫码前→扫码后变了），不能当「存在证据」 |
+
+⚠️ 四个真机踩过的坑：
+1. **必须先导航再读 cookie**。persistent context 启动时不会把 profile 里的 cookie 灌进内存，
+   直接 `context.cookies()` 返回空数组 —— 会把「已登录的小红书」判成「未绑定」。
+2. **headless 的浏览器可执行文件有三种可能**：`chromium`（完整，new headless）、
+   `chromium_headless_shell`（默认产物，常与完整版分开安装）、系统 Chrome。
+   只装了一个时 `launch_persistent_context` 会报 "Executable doesn't exist"，
+   所以执行器按这三档依次尝试（`LAUNCH_STRATEGIES`）。
+3. **localStorage 残留会让扫码循环第一轮就误报成功**：`HasUserLogin` 在扫码前已经是 `"1"`，
+   只判 `got == want` 会在 2 秒内 emit `logged_in`（用户根本没扫，采集侧却只有空会话）。
+   现在 `is_logged_in()` 的 localStorage 分支只在 `require_change` 且值相对扫码前**变化**时才命中。
+4. **扫码成功必须同步「状态快照」**：`snapshot` 原来只在 `check()` 里写，于是弹层写着
+   「登录态仍然有效 / 无需扫码」、卡片却还是上一次探测的「未绑定」、计数停在 `0/7`。
+   现在 `logged_in` / `already_logged_in` 都走 `markPlatformBound()` 就地改该平台并落盘。
+
+**服务端无头扫码的可用性（真机实测 2026-10-28）**：
+
+| 平台 | 无头出码 | 说明 |
+|---|---|---|
+| B站 / 微博 / 贴吧 / 知乎 / 快手 | ✅ | 快手弹层无 class/id、码是 data URL —— 必须按 `naturalWidth` 取最大那张，否则抓到骨架图（base64 仅 298 字符，扫不出来）；入口文案是「立即登录」不是「登录」 |
+| 小红书 | ⚠️ | 能出码，但会偶发整站重定向到 `website-login/error?error_code=300012`（IP 风险），换账号无效、得换出口 IP |
+| 抖音 | ❌ | 无头 + 空 profile 打开首页直接弹拼图滑块（`rmc.bytedance.com/verifycenter/captcha`），页面上根本没有登录按钮。只能本机有头登录（`BM_MC_LOGIN_HEADLESS=false`）后复用 profile |
+
+出码失败会给出**可读原因**（`detect_block()` 区分人机验证 / IP 风控），不再是裸的
+`Page.wait_for_selector: Timeout`。
+
+浏览器进程与采集共用同一份 profile ⇒ **登录/探测与采集互斥**：采集忙时开登录会话会被拒
+（`409`），反之亦然。运维口径：先停采集再扫码。
 
 ### 8.6 许可红线：三道门
 
@@ -1365,7 +1480,7 @@ knowledge → model-gateway → agent-pack → render → orchestrator → gatew
 
 ### 12.1 测试体系
 
-`npm test` = **19 个文件 / 253 个用例，全部离线可跑**：
+`npm test` = **22 个文件 / 295 个用例，全部离线可跑**：
 
 ```
 BM_LLM_MODE=mock BM_ALLOW_DEMO_DATA=true BM_MC_ENABLED=false BM_MC_LICENSE_ACK=false \
@@ -1462,6 +1577,8 @@ node --import tsx --test tests/*.test.ts
 
 | 19 | `contracts/src/report.ts` **两阶段口径不一致（R6）+ 自我指涉词判定** + `agent-pack/src/agents.ts` **回喂清单缺改法** | ① `validateReportDsl` 把 R6 一律当"不可机械修复"，而 `autoRepair` 手里其实有一条确定性修法（把误置的逻辑引用从 citations 摘出、回挂到无 `sourceRef` 的数字块）；② R14 的违禁词是**裸正则子串**匹配 —— 「本品牌」含「本品」→ 修法变成"挖掉命中的两个字"，产出「…挤压**牌**声量份额」残句；「本方案」含「本方」→ 整句被删；③ 表格单元格的改写一律按 data 级记账（`record()` 没传 `removed` → `digits` 默认 `true`）；④ `finalizeReport` 的回喂清单只带 `issue.message`、**把 `issue.fix` 丢了**，且只给页级 path | 真机 `job_0mv9k0wvg8vvpwmqd9y`（2026-10-16，电瓶车）控制台报「降级与缺失（1 项）」，业主追问成因。离线复放该任务**未修复的**重跑产物实测：blocking 项只有 `slides[9]`（depth.gaps 为 0），而 `autoRepair` 把 `phase:budget` 回挂到 `matrix` 后 **0 issue** —— 生成期为一件渲染期顺手能修、且**归观感级**的事白跑了一次整份报告回喂（report 阶段 00:00:49→00:24:16，单次 4 万 token，重写后同一块依旧漏 `sourceRef`）。→ **2026-10-16 修**：R6 的 `repairable` 改为**按"该页有没有可回挂的逻辑引用"条件置位**；报错文案点名缺 `sourceRef` 的块序号与块型；回喂清单带上 `issue.fix`；自我指涉词改为 `scanLeaks()` 最长匹配扫描 + `LEAK_EXEMPT` 豁免表（本品牌 → 品牌 整词换主语、本方案/本品类 等普通名词不碰），纯替换归 cosmetic；提示词点明「数字断言按**块**判定、矩阵与图表同样要 `sourceRef`」以及「本品牌同样违规」。顺带堵上同源的一个**丢报告**缺口：「认不出的命名空间引用」（`phase:unknown_thing`）被移除后本页失去唯一来源 → 现在带同一条 R6 保护。**真机验证（重跑 report 阶段）**：report 阶段 `succeeded`、`meta.degraded` 为空，耗时 **23.5 → 10 分钟**（不再触发回喂）；同一轮把"本方案"那类误伤也复现并修掉了。**第二次重跑（report 阶段 10:49:30 → 10:57:14，7.7 分钟）暴露出最后一处同源分叉**：被 R6 保护**留下**的缺失声明（真机形态 `slides[6].citations: 「达人报价库（L2）本次查询全量返回无样本」引用了未声明的来源 tool:pricing`），其降级仍按 data 级记账 → 任务又被标成 `partial`（唯一一项，报告文本一字未改）；这属于"同一个写作瑕疵，脏不脏取决于同页有没有别的引用"的口径不一致 → 补 `keptAbsence` 参与 `cosmetic` 判定（见 §5.4）。**第三次重跑（11:02:45 → 11:09:04，6 分 19 秒）闭环**：`job_phases.attempts = 1`（**没有回喂**）、任务 `succeeded`、`degraded_json = []`；把该阶段产物（`output_json` = `autoRepair` 之前的 DSL）离线复放，修复前 **15 条 error 全部 `repairable: true`**（HEAD 版本那条 R6 无 `repairable` 字段 → 阻塞 → 回喂），修复后 **error 0**、`autoRepair` 产出 **data 级 0 / 观感级 13**，slides[9] 的 `matrix` 自动拿到 `sourceRef:phase:budget`。回归用例 `report-repair.test.ts` ⑨/⑨′/⑯、`brand-self.test.ts` WP-B-10′/10″（229 → **235**） |
 
+| 20 | `brief.notes`（前端「补充说明」）+ `agents.ts:buildPrompt` | `notes` 只被拼进提示词，标题还写着「客户输入 Brief（**事实基准，直接采用**）」；六个阶段**没有任何一处对它负责**：用户写「达人候选必须包含明星代言人」，报告照常跑完、人选全是普通达人，界面看不出异常。它同时是一条**绕过反造假闸的旁路** —— 其中的数字/人名既没有 citation 义务，也不在 R6/R13 的判定范围内（`JSON.stringify` 直接进 prompt，且不走 `contextBlock` 截断） | → **2026-10-27 新增任务拆解**（§4.1.1）：AO 输出 `taskPlan`（洗数据在 `contracts/src/task-plan.ts`）；`buildPrompt` 把 `notes` 从事实块里**摘出**单独成段（「意图与约束，不是事实数据」），并只注入**本阶段**条目；creator 阶段在有本阶段条目时**额外一次** `web_search` 取公开报道（明星条目没给词时兜底「品牌+类目+明星+代言」），`requirementCoverage` 漏项机械补 `gap` 并进 `degradedKeys`，明星条目的 `met` 必须有公开检索命中兜底否则降级；`pruneUnverifiableCreators` 增加**第三条溯源通道**（公开报道出现姓名即放行，但仅限自述含明星/代言/艺人字样者，且 `followers/estimatedCost/costRange` 强制归零 + 追「未经核验」风险标记），TP-14 钉住"普通达人撞同名不蒙混"。**仍未做机械校验的**：report 阶段（以及 intel/playbook/budget）的拆解条目只有提示词约束，没有"每条都必须有落点"的扫描 —— 只有 creator 有。回归 `task-plan.test.ts` 19 条。同日追加：明星检索改成**每品牌一条**（拼成一条会退化成类目测评、0 个姓名）；检索命中的代言/大使报道机械摘录成 `starLeads`，报告附录固定出一页「公开报道中的代言/大使线索」——模型超时走合成兜底时也不再是「报告里完全没有明星痕迹」 |
+
 **其它值得知道的边界**：
 - `apps/gateway` 的优雅关闭对 SSE 长连接无效（§11.3），部署脚本应使用 `kill -9` 或超时兜底；
 - 各平台 `login.py` 的选择器是 DOM 硬编码，平台改版即失效；**除贴吧外六平台仍是上游原样**（§8.5）；
@@ -1474,6 +1591,7 @@ node --import tsx --test tests/*.test.ts
 | 21 | `agent-pack/src/agents.ts` **回喂只有"整份重写"一种形态** | P0 之后剩下的回喂全是"模型才能改的内容问题"，但代价没变：单次输出 4 万 token / 10–20 分钟，而且**会顺手改坏没出问题的页**（真机 `job_0mv9k0wvg8vvpwmqd9y`：为修 `slides[9]` 的 matrix 重写整份，同一块依旧漏 `sourceRef`）。业主的原话是「每次出报告都有这种问题，别让我审完再告诉你怎么修」——问题不在"修不修"，在**修的粒度太粗** | → **2026-10-18 P1 按页补丁**：新增 `ReportPagePatchSchema`（`{slides:[...]}`，页结构校验**复用** `validateSlide`，与整份 schema 同一份规则）；`finalizeReport` 的修复回路改成「归页 → 只重写问题页 → 按 `index` 对位合并」。四条硬约束：① 只替换同名页、页序页数不变；② 不认识的 `index` 忽略；③ **补丁把页掏空（块数腰斩）时保留原页**——"这不是修复而是删内容"；④ **进度度量**：问题数必须严格下降才采纳，不降就中断（防打转，也防"改好这页弄坏那页"）。补丁不被接受时（`E-AGENT-001`，模型又整份输出）自动退回整份重写；`E-AGENT-002`（超时/传输）不退回，免得再等十分钟。真机探针（真实端点）：模型**完全照做**——1 页 / `index=9` / 2 块完整 / 输出 **287 token**（整份约 4 万）/ **4.5 秒**；`callId` 带轮次（`..._r1`），否则第二轮会被幂等当成重放、用量不记账。回归用例 `report-patch.test.ts` ⑲⑳㉑㉒㉓（235 → **241**） |
 | 22 | **`agent-pack/src/schemas.ts` 的 `validateBlock` 把 `matrix.sourceRef` 静默吞掉** —— 这才是 R6 反复回喂的**真正病根** | 契约类型 `Block` 里 matrix 早就有 `sourceRef?`（注释还写着"此前只有 matrix 缺这个字段，属于契约缺口而非设计取舍"），但 `validateBlock` 的 matrix 分支**没带 `...sref`**，骨架里也没写 `sourceRef`。后果是一条闭环的死循环：模型写 `matrix.sourceRef` → **校验层丢掉** → R6 判"含数字的块无来源" → 生成期阻塞 → 回喂 → 模型再写一次 → 又丢。**模型不是学不会，是它写的东西被我们自己丢了**；R6 对 matrix 而言"不可修复"是假象。发现方式：P1 的补丁探针打出 `matrix.sourceRef=(无)`，补上 `...sref` 后立刻变成 `phase:budget`（同样的 prompt、同样的模型） | → **2026-10-18 修**：matrix 分支补 `...sref`；两处骨架（`ReportDslSchema` / `ReportPagePatchSchema`）补 `"sourceRef?": string`；`schema-coverage.test.ts` 新增「十种块型都必须能把 `sourceRef` 原样带出来」（逐块型断言写入→读出一致，任何一层吞字段都会红）。**真机验证**（重跑 report 阶段，09:22:08 → 09:30:41，**8 分 33 秒**）：任务 `succeeded`、`degraded_json = []`、`attempts = 1`（**一次回喂都没有**）；产物 14 页里 **matrix/chart 4 个全部带 `sourceRef`**（含 `slides[9] matrix = phase:budget`），`citations` 17 条中**逻辑引用混入 0 条** |
 | 23 | **人选粉丝量永远显示「未采集」** —— 不是没采到，是**读的时刻不对** | 真机 `job_0mvgany95k7poz73mks`：报告里 5 位人选粉丝量全是「未采集」，而缓存里 06:45:09/06:45:28 就已采到 60.1 万 / 13.0 万 / 16.1 万 / 16.9 万 / 43.5 万。三层原因叠在一起：① 作者主页补采由 `enqueueAuthorProfiles` 在 search **完成时**派生并排到队尾，资料行比 creator 阶段结束（06:36:22）晚 9 分钟才落库；② `refreshPlatformData` 的**阶段白名单写死在 intel/creator**，而它在每个阶段终稿前本来就会调一次 —— report 阶段（06:45:37 起，跑了 12 分钟）**被这条 return 挡在门外**，数据躺在缓存里也没人读；③ 读侧取**写时快照**：`platformCreatorCandidates` 把 `followers` 固化成 0，`creatorAccountRows` 只读这个 0。铁证：模型写的「人选建议与分层」与机械块 `platformAccountRows` **两张表同时显示未采集** —— 后者直接读聚合，有数据必出值 | → **2026-10-20 修（三处）**：① 白名单加 `report`，并加两道闸（台账无平台内容不查、粉丝量已齐不查）；② `/query` 新增 `authorIds` 点名取（`matchCreatorRows` 纯函数），绕开「只拼本批前 N 条 rows 作者」的截断；③ 新增 `creatorLiveViews` / `withLiveCreatorStats`，**读时以证据表为准**重算粉丝量与分层（与 `tierOf` 同尺），并同步改写文案里的「未采集」口径；模型生成的表由 `backfillCreatorStatsInTables` 回填（只补空值、且该表必须已有 `sourceRef`，否则会凭空造出一条 R6 阻塞）。顺带修标识列：`pfcre_<平台>_<昵称哈希>` 是内部聚合 id（读者查不到、模型还会误当 `creatorId` 喂回采集 → `stored:0`），证据条目新增 `uid`（平台原始 UID），标识列按 `uid → 主页链接 → 哈希` 回退。详见 `docs/data-provenance-design.md` §16；回归 `tests/creator-stats.test.ts` 9 例 + `platform-collect.test.ts` 白名单 1 例（241 → **252**） |
+| 24 | `packages/render/src/index.ts` 的 `blockToHtml` | 渲染器只做 HTML 转义，不解析行内 Markdown —— 而 DSL 文案里**本来就带 `**重点**`**（合成路径、来源说明、新增的明星溯源块都这么写）。结果业主在报告里读到的是一串字面星号：`**未采集**`、`**逐字命中姓名**`，恰好全在「数据来源/凭据」这类最需要被信任的段落里 | → **2026-10-27 修**：新增 `mdInline()`（先 `esc()` 再只替换 `**x**` → `<strong>`），用于 text / bullets / table 单元格与 caption / quote / callout。只认双星号：单个 `*`、`_` 在中文正文里（`3*4`、`foo_bar`）太容易误伤；先转义再替换，因此不可能借此注入标签。回归：渲染产物里 `**` 字面量计数为 0 |
 ---
 
 ## 附录 A · 模块-文件对照表
@@ -1481,20 +1599,21 @@ node --import tsx --test tests/*.test.ts
 > 机械生成（`packages/*/src` + `apps/*/src`）。行数为 2026-10-13 快照。
 
 
-**`apps/collector`** — 8 个文件 / 1963 行
+**`apps/collector`** — 9 个文件 / 2647 行
 
 | 文件 | 行数 | 职责（文件头首句） |
 |---|---:|---|
+| `src/login-session.ts` | 477 | 服务端扫码登录的**会话管理**（Node 侧）。 |
 | `src/tasks.ts` | 468 | 采集任务管理。 |
 | `src/core-runner.ts` | 466 | 内嵌采集内核（`services/collector-core`）的**子进程驱动**。 |
 | `src/normalize.ts` | 321 | 平台原始记录 → 统一行 的归一化。 |
-| `src/server.ts` | 243 | collector 的 HTTP 面。 |
-| `src/store.ts` | 161 | 采集结果的本地只读缓存。 |
-| `src/config.ts` | 150 | collector sidecar 自己的配置。 |
+| `src/server.ts` | 388 | collector 的 HTTP 面。 |
+| `src/store.ts` | 171 | 采集结果的本地只读缓存。 |
+| `src/config.ts` | 180 | collector sidecar 自己的配置。 |
 | `src/browser-session.ts` | 78 | 常驻采集浏览器的查找与回收。 |
-| `src/main.ts` | 76 | collector sidecar 入口。 |
+| `src/main.ts` | 98 | collector sidecar 入口。 |
 
-**`apps/gateway`** — 5 个文件 / 907 行
+**`apps/gateway`** — 5 个文件 / 1029 行
 
 | 文件 | 行数 | 职责（文件头首句） |
 |---|---:|---|
@@ -1641,13 +1760,13 @@ node --import tsx --test tests/*.test.ts
 | 测试文件 | 用例 | 行数 | 守住什么 |
 |---|---:|---:|---|
 | `brand-self.test.ts` | 14 | 556 | 品牌自诊在"无授权数据"时必须如实写「无数据」，而不是编数字；**未指定自有品牌（`ownBrandId`）时整份报告不做自诊、且不得出现「我方/本品」字样**（R14：任何槽位出现违禁词都要判错，且机械修复后仍要过校验）；**「本品牌」必须整词换主语（→「品牌」）而不是挖词中间的字**（WP-B-10′）；**「本方案」这类含违禁子串的普通名词必须豁免，不得误判、更不得被删**（WP-B-10″） |
-| `brief-llm-fill.test.ts` | 6 | 151 | 规则抽取结果的权威性：模型只能补空字段，不能改预算/时间窗 |
+| `brief-llm-fill.test.ts` | 8 | 196 | 规则抽取结果的权威性：模型只能补空字段，不能改预算/时间窗；**品牌名走模型摘录**（`brandIds` 是可选字段、永不进 missing，故单独放行；原话没品牌语境时不问模型、模型越权返回也丢弃） |
 | `brief-parse.test.ts` | 13 | 188 | 自然语言解析（规则段）纯函数、中英混合输入；**category 会被逐字当平台搜索词，必须是中文** |
 | `collector.test.ts` | 45 | 1320 | sidecar 归一化、落盘目录契约、快照取新增行、ID 闭环、常驻浏览器端口与回收 |
 | `creator-stats.test.ts` | 9 | 244 | 粉丝量**读时解析**（不再是写时快照）：creator 阶段候选人 `followers` 会被固化成 0，report 阶段补读到真值后必须能显示出来；**分层随之从「互动量分位」改成粉丝量口径**；文案里「未采集」同步改写；**拿不到资料行时不得把已知数据降级成 0**；`pfcre_` 内部哈希不得出现在报告的标识列（按 uid → 主页链接回退）；模型生成的表格按 `sourceRef` 有无决定能不能回填数字（避免凭空造 R6 阻塞）；`/query` 的 `authorIds` 点名取 vs 默认模式；**report 阶段必须允许补读**（`shouldRefreshPlatform`）及其两道闸 |
 | `data-provenance.test.ts` | 18 | 655 | 条目级溯源不依赖模型自觉（证据登记 → 引用 → 渲染反查）；含**兜底路径不得写死行业文案**的回归 |
 | `data-realism.test.ts` | 13 | 436 | 不引用本地样例数据；样例达人不得出现在报告里 |
-| `e2e.test.ts` | 13 | 577 | LLD §7.3 强制 E2E 清单（mock 模式，全离线） |
+| `e2e.test.ts` | 14 | 614 | LLD §7.3 强制 E2E 清单（mock 模式，全离线） |
 | `governance-fixes.test.ts` | 6 | 186 | 治理口径的三个不变量（口径错了不会有用例失败，只能专门钉） |
 | `kb-ingest.test.ts` | 15 | 508 | KB 入库通道、来源登记不变量、mutating 工具准入 |
 | `platform-collect.test.ts` | 29 | 852 | 七平台工具与适配器（打桩 fetch，不碰 MediaCrawler）；**预采集覆盖范围 = brief 声明的平台**（`BM_MC_PREFETCH_SCOPE`） |
@@ -1656,14 +1775,17 @@ node --import tsx --test tests/*.test.ts
 | `report-summary.test.ts` | 16 | 500 | 摘要回灌 + 向量落盘 + 模型混用守卫 |
 | `schema-coverage.test.ts` | 5 | 181 | 骨架/块型/页面角色的防漂移（加第 11 种块型时编译器不会提醒）；**十种块型都必须能把 `sourceRef` 原样带出来**（matrix 曾在 schema 层被整类吞掉） |
 | `stream-replay.test.ts` | 6 | 251 | 进度实时性与刷新后流式回放 |
+| `task-plan.test.ts` | 23 | 511 | **任务拆解（`brief.notes` → `taskPlan`）**：洗数据容错（未知 phase→report、重复 id 去重、上限 8）；`notes` 有内容却漏 `taskPlan` 即不合格、显式 `[]` 合法；提示词段只列本阶段条目且标注「意图不是事实」；漏回应条目机械补 `gap`；**明星条目自称已满足但公开检索无其姓名时必须降级 `gap`**；公开报道通道只捞人不放宽数字（粉丝量/报价强制归零）；`requirementCoverage` 必须出现在 `validate` 返回里（新字段被静默吞掉的教训）；**代言线索机械摘录**（标记须在标题、品牌按标题归属、链接去重、不给粉丝量/报价列）；**`webSearchRows` 必须读 `result.results`**（读 `rows` 会静默返回空，明星通道曾因此整条失效）；**提示词回声必须从 `notes` 里切掉**（模型会把「规则：这是用户想让你做到的事…」整句抄回 `brief.notes`，随后被当成「用户诉求」拆进 `taskPlan`，凭空多出两条假要求；只切我们自己的固定文案，不按「规则：」泛匹配）；**公众人物候选的四处溯源标注必须一起改**（真机 `job_0mvqiisybvto1p5nkf9` 把 4 位明星标成「本地达人报价库（L2）」+「库内无账号 ID」+「未知」+「0.0 万」——最后一列读起来是「请这位明星不要钱」）；**「明星候选与官宣出处」按 (候选 × 命中报道) 展开**（同一艺人可能同时代言两个品牌，只取第一条等于替他做了一次没有依据的取舍，每人上限 2 条） |
 | `tool-call-guard.test.ts` | 5 | 67 | 工具调用风暴闸门（真机曾出现同一工具连续被调 131 次） |
 | `web-console.test.ts` | 5 | 214 | 前端托管契约（含路径穿越守卫） |
 | `web-search.test.ts` | 10 | 313 | 唯一外部计费源（打桩 fetch） |
-| **合计** | **253** | **8024** | 19 个文件 |
+| `platform-login.test.ts` | 10 | 103 | 服务端扫码登录的三处**翻译边界**：Python stdout 行→会话事件（人类日志/无 `event` 的 JSON 必须丢弃，否则会话永远停在 starting）、探测结果→每平台一行（缺失补 `error` 而不是消失）、扫码成功→状态快照就地翻新（`markPlatformBound`，回归「弹层说已绑定、卡片说未绑定」）；`unverified` 语义不许被降级成 `unbound` |
+| `embedding-dialect.test.ts` | 6 | 170 | 嵌入端点**方言**（本地内核 vs 云端 OpenAI 兼容 API）：`auto` 有 Key 判 openai、无 Key 判本地；**openai 方言必须不发 `input_type` / `dimensions`**（SiliconFlow 实测对这两个字段直接 HTTP 400 `code 20015`，旧的无条件发送会让整条语义通道静默失效）；本地方言反过来必须带上（task 前缀靠它注入，漏了只掉精度不报错）；云端没有 `/health`，探活必须换成一次真实嵌入请求；维度不符与 401 的错误文案必须点名 `BM_EMBED_DIM` / API Key，否则运维会去查网络而不是查配置 |
+| **合计** | **295** | **8889** | 22 个文件 |
 
 ## 附录 C · 环境变量
 
-共 **83 个变量 / 19 个分组**，完整清单与逐条注释见仓库根 `.env.example`（单一事实源）。
+共 **86 个变量 / 20 个分组**，完整清单与逐条注释见仓库根 `.env.example`（单一事实源）。
 按分组概览：
 
 ### C.1 分组与变量总览（默认值取自 `.env.example`）
@@ -1689,9 +1811,21 @@ node --import tsx --test tests/*.test.ts
 
 `BM_PRICE_INPUT_PER_1K`=`0.001` · `BM_PRICE_OUTPUT_PER_1K`=`0.002`
 
-**检索 M7**（15 个）
+**检索 M7**（17 个）
 
-`BM_VECTOR_DRIVER`=`memory` · `BM_EMBED_URL`=`http://127.0.0.1:8899/v1/embeddings` · `BM_EMBED_MODEL`=`embeddinggemma-2` · `BM_EMBED_DIM`=`768` · `BM_EMBED_BATCH_SIZE`=`32` · `BM_EMBED_TIMEOUT_MS`=`60000` · `BM_MILVUS_URI`=`http://127.0.0.1:19530` · `BM_MILVUS_COLLECTION`=`brandsale_kb` · `BM_MILVUS_TOKEN`=`（空）` · `BM_MILVUS_TIMEOUT_MS`=`3000` · `BM_RERANK_URL`=`（空）` · `BM_RERANK_MODEL`=`（空）` · `BM_RERANK_POOL_SIZE`=`50` · `BM_RERANK_TIMEOUT_MS`=`30000` · `BM_RERANK_COOLDOWN_MS`=`30000`
+`BM_VECTOR_DRIVER`=`memory` · `BM_EMBED_URL`=`https://api.siliconflow.cn/v1/embeddings` · `BM_EMBED_MODEL`=`BAAI/bge-m3` · `BM_EMBED_API_KEY`=`（空，需自行填）` · `BM_EMBED_DIALECT`=`auto` · `BM_EMBED_DIM`=`1024` · `BM_EMBED_BATCH_SIZE`=`32` · `BM_EMBED_TIMEOUT_MS`=`60000` · `BM_MILVUS_URI`=`http://127.0.0.1:19530` · `BM_MILVUS_COLLECTION`=`brandsale_kb` · `BM_MILVUS_TOKEN`=`（空）` · `BM_MILVUS_TIMEOUT_MS`=`3000` · `BM_RERANK_URL`=`（空）` · `BM_RERANK_MODEL`=`（空）` · `BM_RERANK_POOL_SIZE`=`50` · `BM_RERANK_TIMEOUT_MS`=`30000` · `BM_RERANK_COOLDOWN_MS`=`30000`
+
+> **2026-10-28：嵌入默认改为云端 API（SiliconFlow · BAAI/bge-m3，1024 维）。**
+> 本地 `services/embedding-core`（EmbeddingGemma 2 / 768）源码仍保留为可选路径，但**运行时已移除**
+> （容器、4.25 GB 镜像、1.4 GB 权重均已删除）。回切需先 `npm run embedding:setup` 重新下载权重，
+> 再 `npm run embedding:up`（缺权重时脚本会直接报错，不会抛一个 Docker COPY 失败）。
+> `stack:up` 现在只起 Milvus——嵌入不在本地栈里了。
+> 两者请求体不同，故引入 `BM_EMBED_DIALECT`：`openai` 只发 `model`+`input` 并带 `Authorization`，
+> `embeddinggemma` 额外发 `input_type`/`title`/`dimensions` 且探活打 `/health`；`auto` 按"有没有 Key"推断。
+> 实测依据：SiliconFlow 对 `input_type`/`dimensions` 直接返回 HTTP 400 `code 20015`，
+> 旧的无条件发送会让语义通道整条失效而检索安静退回 BM25。换维度后必须
+> `npm run embedding:backfill -- --force` + `npm run vector:rebuild -- --reset`（Milvus 的 dim 建表后不可改，
+> 已加维度守卫：集合已存在且维度不符时直接报错并给出这两条命令）。
 
 **知识库回灌 M7**（1 个）
 
@@ -1707,11 +1841,15 @@ node --import tsx --test tests/*.test.ts
 
 **报告深度预算（P2-2）**（3 个）
 
-`BM_REPORT_MAX_TOKENS`=`32768` · `BM_REPORT_CONTEXT_CHARS`=`48000` · `BM_REPORT_MIN_SLIDES`=`12`
+`BM_REPORT_MAX_TOKENS`=`307200` · `BM_REPORT_CONTEXT_CHARS`=`48000` · `BM_REPORT_MIN_SLIDES`=`12`
+
+> `BM_REPORT_MAX_TOKENS` 与 `BM_LLM_MAX_OUTPUT_TOKENS` 必须对齐：M3.1-Flash 强制 adaptive thinking，
+> reasoning 与正文共用 `max_tokens`，32768 会在长报告上被思考烧光 → `finish_reason=length` → 半截 JSON
+> → 整份落 `synthReport`。report 阶段读的是 `config.report.maxTokens`（`agents.ts:1035`），不是全局默认值。
 
 **联网检索（火山引擎「联网搜索 Lite」）**（8 个）
 
-`BM_WEB_SEARCH_ENABLED`=`true` · `BM_WEB_SEARCH_URL`=`https://open.feedcoopapi.com/search_api/web_search` · `BM_WEB_SEARCH_API_KEY`=`（空）` · `BM_WEB_SEARCH_COUNT`=`20` · `BM_WEB_SEARCH_MAX_COUNT`=`50` · `BM_WEB_SEARCH_TIMEOUT_MS`=`8000` · `BM_WEB_SEARCH_CACHE_TTL`=`900` · `BM_WEB_SEARCH_PREFETCH`=`true`
+`BM_WEB_SEARCH_ENABLED`=`true` · `BM_WEB_SEARCH_URL`=`https://open.feedcoopapi.com/search_api/web_search` · `BM_WEB_SEARCH_API_KEY`=`（空）` · `BM_WEB_SEARCH_COUNT`=`20` · `BM_WEB_SEARCH_MAX_COUNT`=`50` · `BM_WEB_SEARCH_TIMEOUT_MS`=`20000` · `BM_WEB_SEARCH_CACHE_TTL`=`900` · `BM_WEB_SEARCH_PREFETCH`=`true`
 
 **平台内公开内容采集（七个平台，L3）**（0 个）
 

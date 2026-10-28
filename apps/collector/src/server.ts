@@ -17,6 +17,16 @@
  *   POST /query            {platform, op?, kind?, keyword?, limit?, authorIds?} → 读本地缓存
  *   GET  /stats            各平台缓存条数
  *   GET  /env-check        内核自检（跑 run.py --help，验证依赖是否齐）
+ *
+ * 登录态（2026-10-28，服务端无头扫码方案 A）：
+ *   GET  /login/status              七平台绑定状态（读上一次探测结果 + 是否正在探测）
+ *   POST /login/check               {platforms?} → 真起浏览器探一遍（串行，十几秒）
+ *   POST /login/start               {platform} → 开一个扫码会话，返回 sessionId
+ *   GET  /login/:id                 轮询会话（含二维码 dataUrl 与倒计时）
+ *   POST /login/:id/cancel          取消会话
+ *
+ * ⚠️ 登录路由**不改平台侧任何数据**，只是把「扫码」这一步从本机搬到服务端：
+ * 起无头浏览器 → 取二维码 → 等用户扫 → 登录态落到与采集共用的 profile。
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -25,14 +35,17 @@ import { MEDIA_CRAWLER_PLATFORM_META, MEDIA_CRAWLER_PLATFORMS, type MediaCrawler
 import type { CollectOp } from "@brandsale/config";
 import type { CollectorConfig } from "./config.ts";
 import { dataDirExists } from "./config.ts";
-import { probeCore } from "./core-runner.ts";
+import { probeCore, probeSpiderXhs, probeSpiderDy } from "./core-runner.ts";
 import type { CollectStore } from "./store.ts";
+import type { LoginManager } from "./login-session.ts";
 import type { TaskManager } from "./tasks.ts";
 
 export interface ServerDeps {
   config: CollectorConfig;
   store: CollectStore;
   tasks: TaskManager;
+  /** 服务端扫码登录。缺省时登录路由返回 503（老部署/单测不装配它也能跑） */
+  login?: LoginManager;
 }
 
 /** 缓存行里我们关心的最小形状：只做 authorId / id 的关联 */
@@ -122,7 +135,7 @@ const isOp = (v: unknown): v is CollectOp =>
   typeof v === "string" && ["search", "content_detail", "comments", "creator"].includes(v);
 
 export function createCollectorServer(deps: ServerDeps) {
-  const { config, store, tasks } = deps;
+  const { config, store, tasks, login } = deps;
 
   return createServer((req, res) => {
     void (async () => {
@@ -142,6 +155,26 @@ export function createCollectorServer(deps: ServerDeps) {
               runPy: config.runPy,
               python: config.pythonBin,
               pythonSource: config.pythonSource,
+            },
+            xhs: {
+              driver: config.xhsDriver,
+              spiderXhs: {
+                dir: config.spiderXhs.dir,
+                installed: config.spiderXhs.installed,
+                python: config.spiderXhs.pythonBin,
+                pythonSource: config.spiderXhs.pythonSource,
+                sessionFile: config.spiderXhs.sessionFile,
+              },
+            },
+            dy: {
+              driver: config.dyDriver,
+              spiderDy: {
+                dir: config.spiderDy.dir,
+                installed: config.spiderDy.installed,
+                python: config.spiderDy.pythonBin,
+                pythonSource: config.spiderDy.pythonSource,
+                sessionFile: config.spiderDy.sessionFile,
+              },
             },
             dataDir: { path: config.dataDir, exists: dataDirExists(config.dataDir) },
             logDir: config.logDir,
@@ -290,11 +323,128 @@ export function createCollectorServer(deps: ServerDeps) {
         }
 
         if (req.method === "GET" && path === "/env-check") {
-          const out = await probeCore(
-            { coreDir: config.coreDir, pythonBin: config.pythonBin, runPy: config.runPy, dataDir: config.dataDir, logDir: config.logDir },
-            config.envCheckTimeoutMs,
-          );
-          return json(res, out.ok ? 200 : 503, { ok: out.ok, detail: out.detail });
+          const paths = {
+            coreDir: config.coreDir,
+            pythonBin: config.pythonBin,
+            runPy: config.runPy,
+            dataDir: config.dataDir,
+            logDir: config.logDir,
+          };
+          const checks: { ok: boolean; detail: string; label: string }[] = [];
+          checks.push({ ...(await probeCore(paths, config.envCheckTimeoutMs)), label: "MediaCrawler" });
+          if (config.xhsDriver === "spider") {
+            checks.push({ ...(await probeSpiderXhs(config.spiderXhs, config.envCheckTimeoutMs)), label: "Spider_XHS" });
+          }
+          if (config.dyDriver === "spider") {
+            checks.push({ ...(await probeSpiderDy(config.spiderDy, config.envCheckTimeoutMs)), label: "DouYin_Spider" });
+          }
+          const ok = checks.every((c) => c.ok);
+          const detail = checks
+            .map((c) => `${c.label}：${c.ok ? "正常" : "异常"}（${c.detail}）`)
+            .join("；");
+          return json(res, ok ? 200 : 503, { ok, detail, checks });
+        }
+
+        /* ── 登录态（服务端无头扫码）─────────────────────── */
+
+        if (req.method === "GET" && path === "/login/status") {
+          if (!login) return json(res, 503, { ok: false, error: "登录能力未装配" });
+          const snap = login.status();
+          return json(res, 200, {
+            ok: true,
+            configured: true,
+            headless: config.headless || config.loginHeadless,
+            checkedAt: snap.checkedAt ?? null,
+            probing: snap.probing,
+            busy: login.busy(),
+            platforms: MEDIA_CRAWLER_PLATFORMS.map((p) => {
+              const meta = MEDIA_CRAWLER_PLATFORM_META[p];
+              const hit = snap.results.find((r) => r.platform === p);
+              return {
+                platform: p,
+                name: meta.displayName,
+                sourceId: meta.sourceId,
+                state: hit?.state ?? "unverified",
+                ...(hit?.confidence ? { confidence: hit.confidence } : {}),
+                detail: hit?.detail ?? "还没有探测过（点「检测登录状态」）",
+              };
+            }),
+          });
+        }
+
+        if (req.method === "POST" && path === "/login/check") {
+          if (!login) return json(res, 503, { ok: false, error: "登录能力未装配" });
+          const body = await readJsonBody(req);
+          const want = Array.isArray(body.platforms)
+            ? (body.platforms as unknown[]).map((x) => String(x)).filter(isPlatform)
+            : [];
+          try {
+            const snap = await login.check(want);
+            // 与 GET /login/status 保持同一响应形状：前端靠 platforms 字段计数，
+            // 若直接展开 snap 只有 results，会显示「已检测 0 个平台」。
+            return json(res, 200, {
+              ok: true,
+              configured: true,
+              checkedAt: snap.checkedAt ?? null,
+              probing: snap.probing,
+              platforms: MEDIA_CRAWLER_PLATFORMS.map((p) => {
+                const meta = MEDIA_CRAWLER_PLATFORM_META[p];
+                const hit = snap.results.find((r) => r.platform === p);
+                return {
+                  platform: p,
+                  name: meta.displayName,
+                  sourceId: meta.sourceId,
+                  state: hit?.state ?? "unverified",
+                  ...(hit?.confidence ? { confidence: hit.confidence } : {}),
+                  detail: hit?.detail ?? "还没有探测过（点「检测登录状态」）",
+                };
+              }),
+            });
+          } catch (e) {
+            // 被占用不是错误，是"现在不行" → 409 让调用方明确告知用户
+            return json(res, 409, { ok: false, error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+
+        if (req.method === "POST" && path === "/login/start") {
+          if (!login) return json(res, 503, { ok: false, error: "登录能力未装配" });
+          const body = await readJsonBody(req);
+          if (!isPlatform(body.platform)) {
+            return json(res, 400, { ok: false, error: `platform 必须是 ${MEDIA_CRAWLER_PLATFORMS.join("/")}` });
+          }
+          const out = login.start(body.platform);
+          if (!out.ok) return json(res, 409, { ok: false, error: out.reason });
+          return json(res, 202, { ok: true, session: out.session });
+        }
+
+        if (req.method === "POST" && path === "/login/cookie") {
+          if (!login) return json(res, 503, { ok: false, error: "登录能力未装配" });
+          const body = await readJsonBody(req);
+          if (!isPlatform(body.platform)) {
+            return json(res, 400, { ok: false, error: `platform 必须是 ${MEDIA_CRAWLER_PLATFORMS.join("/")}` });
+          }
+          if (typeof body.cookie !== "string") {
+            return json(res, 400, { ok: false, error: "cookie 必须是字符串" });
+          }
+          const out = await login.setCookie(body.platform, body.cookie);
+          if (!out.ok) return json(res, 409, { ok: false, error: out.reason });
+          return json(res, 200, { ok: true, status: out.status });
+        }
+
+        // 顺序：具体路由必须在 /login/:id 之前，否则 id 会吃成 "status"
+        if (req.method === "POST" && path.startsWith("/login/") && path.endsWith("/cancel")) {
+          if (!login) return json(res, 503, { ok: false, error: "登录能力未装配" });
+          const id = path.slice("/login/".length, -"/cancel".length);
+          const ok = login.cancel(id);
+          return json(res, ok ? 200 : 404, ok ? { ok: true } : { ok: false, error: "会话不存在或已结束" });
+        }
+
+        if (req.method === "GET" && path.startsWith("/login/")) {
+          if (!login) return json(res, 503, { ok: false, error: "登录能力未装配" });
+          const id = path.slice("/login/".length);
+          const session = login.get(id);
+          if (!session) return json(res, 404, { ok: false, error: `会话不存在：${id}` });
+          return json(res, 200, { ok: true, session });
         }
 
         return json(res, 404, { ok: false, error: `未知路由 ${req.method} ${path}` });

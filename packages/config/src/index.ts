@@ -325,6 +325,15 @@ export interface Config {
     /** 嵌入服务地址（OpenAI 兼容 /v1/embeddings）。为空 → 退回本地哈希向量 */
     embedUrl: string;
     embedModel: string;
+    /** 云端端点的 API Key（本地 embedding-core 留空）。有 Key 时方言默认按 openai 处理 */
+    embedApiKey: string;
+    /**
+     * 嵌入服务方言：
+     *   `auto`            有 Key → openai；无 Key → embeddinggemma（本地内核）
+     *   `openai`          只发 model + input，带 Authorization，探活用真实嵌入请求
+     *   `embeddinggemma`  额外发 input_type / title / dimensions，探活打 /health
+     */
+    embedDialect: "auto" | "openai" | "embeddinggemma";
     /** 向量维度。**决定落盘向量能参与比较的范围**；改变它需要重建已有向量 */
     embedDim: number;
     /** 单次嵌入请求的最大条数（分批） */
@@ -619,7 +628,15 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
       vectorDriver: str(get("BM_VECTOR_DRIVER"), "memory") === "milvus" ? "milvus" : "memory",
       embedUrl: str(get("BM_EMBED_URL")),
       embedModel: str(get("BM_EMBED_MODEL")),
+      embedApiKey: str(get("BM_EMBED_API_KEY")),
+      // 非法值退回 auto（而不是让整个进程起不来）：方言只影响请求体形态，
+      // auto 的推断在两种部署下都是对的，真正的错配会在首次嵌入时以 4xx 明确报出来。
+      embedDialect: ((): "auto" | "openai" | "embeddinggemma" => {
+        const v = str(get("BM_EMBED_DIALECT"));
+        return v === "openai" || v === "embeddinggemma" ? v : "auto";
+      })(),
       // 默认 768：EmbeddingGemma 2 的原生维度。用哈希兜底时该值不参与（哈希固定 256）。
+      // ⚠️ 换 bge-m3 必须同时改成 1024，否则首次嵌入就抛维度不匹配。
       embedDim: num(get("BM_EMBED_DIM"), 768),
       embedBatchSize: num(get("BM_EMBED_BATCH_SIZE"), 32),
       embedTimeoutMs: num(get("BM_EMBED_TIMEOUT_MS"), 60_000),

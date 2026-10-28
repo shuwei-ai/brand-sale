@@ -9,7 +9,61 @@
 
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseDotEnv } from "@brandsale/config";
+
+/**
+ * 小红书采集后端选择。
+ *
+ * 背景（真机）：MediaCrawler 的小红书是 Playwright 浏览器自动化，出口 IP 被风控时
+ * （error_code 300012）连登录二维码都拿不到；`services/spider-xhs`（Spider_XHS，
+ * cv-cat）走纯 HTTP + 本地签名，登录与采集都不起浏览器。
+ *
+ *   mc     = MediaCrawler（默认，历史行为）
+ *   spider = services/spider-xhs（只读公开内容；不启用蒲公英/千帆/私信/发布等能力）
+ */
+export type XhsDriver = "mc" | "spider";
+
+export interface SpiderXhsConfig {
+  /** Spider_XHS 项目目录（本地克隆，不进公开仓库） */
+  dir: string;
+  /** 它自己的 Python 解释器（独立 venv，与 MediaCrawler 的依赖面互不污染） */
+  pythonBin: string;
+  pythonSource: string;
+  /** brandsale 自有的执行器脚本（apps/collector/py/spider_xhs_runner.py） */
+  runnerPy: string;
+  /** 登录会话落盘（a1+web_session 完整 cookie；.data-collector 已被 gitignore） */
+  sessionFile: string;
+  /** 目录是否存在（不存在时 /health 会报出来，显式选择 spider 的任务会明确失败） */
+  installed: boolean;
+}
+
+/**
+ * 抖音采集后端选择（与小红书同理）。
+ *
+ * 背景（真机）：MediaCrawler 的抖音搜索接口 `search_info_by_keyword` 已被抖音风控
+ * 封死 —— 即使登录态真实有效，搜索恒返回空 `data`；`services/douyin-spider`
+ * （DouYin_Spider，cv-cat）走纯 HTTP + 本地签名（curl_cffi + a_bogus/msToken），
+ * 实测同一 sessionid 能正常出搜索/评论数据。
+ *
+ *   mc     = MediaCrawler（默认，历史行为）
+ *   spider = services/douyin-spider（只读公开内容；不接发布/私信/直播等能力）
+ */
+export type DyDriver = "mc" | "spider";
+
+export interface SpiderDyConfig {
+  /** DouYin_Spider 项目目录（本地克隆，不进公开仓库） */
+  dir: string;
+  /** 它自己的 Python 解释器（独立 venv，与 MediaCrawler 的依赖面互不污染） */
+  pythonBin: string;
+  pythonSource: string;
+  /** brandsale 自有的执行器脚本（apps/collector/py/spider_dy_runner.py） */
+  runnerPy: string;
+  /** 登录会话落盘（sessionid 等完整 cookie；.data-collector 已被 gitignore） */
+  sessionFile: string;
+  /** 目录是否存在（不存在时 /health 会报出来，显式选择 spider 的任务会明确失败） */
+  installed: boolean;
+}
 
 export interface CollectorConfig {
   host: string;
@@ -29,6 +83,14 @@ export interface CollectorConfig {
   logDir: string;
   /** 归一化结果的本地缓存目录 */
   storeDir: string;
+
+  /** 小红书驱动；其余六平台始终走 MediaCrawler */
+  xhsDriver: XhsDriver;
+  spiderXhs: SpiderXhsConfig;
+
+  /** 抖音驱动；其余六平台始终走 MediaCrawler */
+  dyDriver: DyDriver;
+  spiderDy: SpiderDyConfig;
 
   /** 采集时是否无头。本机扫码登录需要可见窗口，默认 false */
   headless: boolean;
@@ -71,6 +133,22 @@ export interface CollectorConfig {
    * 关掉：`BM_MC_PROFILE_ENRICH=false`。
    */
   profileEnrich: { enabled: boolean; maxAuthors: number };
+
+  /* ── 服务端扫码登录（无头）───────────────────────────
+   * 与采集共用同一份 profile（`<coreDir>/browser_data`），扫完码采集子进程直接复用。
+   */
+  /** profile 根目录。内核的 `browser_data`，两边必须一致，否则扫了也不生效 */
+  browserDataDir: string;
+  /** 登录执行器脚本（`apps/collector/py/login_runner.py`） */
+  loginRunnerPy: string;
+  /** 无头登录。服务端部署必须 true —— 有头模式需要 DISPLAY，无图形界面起不来 */
+  loginHeadless: boolean;
+  /** 单次扫码总等待（毫秒） */
+  loginTimeoutMs: number;
+  /** 二维码有效期（秒），决定前端倒计时与 Python 侧刷新节奏 */
+  loginQrTtlSeconds: number;
+  /** 七平台状态探测总超时（毫秒）。串行起浏览器，每个 3–8s */
+  loginCheckTimeoutMs: number;
 }
 
 const num = (v: string | undefined, dflt: number): number => {
@@ -95,6 +173,12 @@ const cdpMode = (v: string | undefined): CdpMode => {
   return "reuse";
 };
 
+const xhsDriver = (v: string | undefined): XhsDriver =>
+  (v ?? "").trim().toLowerCase() === "spider" ? "spider" : "mc";
+
+const dyDriver = (v: string | undefined): DyDriver =>
+  (v ?? "").trim().toLowerCase() === "spider" ? "spider" : "mc";
+
 /**
  * 选定内核解释器。优先级：
  *   1. `BM_MC_PYTHON`（显式指定，排障或自定义环境时用）
@@ -113,6 +197,19 @@ function resolvePython(coreDir: string, configured: string): { bin: string; sour
   return { bin: "python3", source: "PATH" };
 }
 
+/** Spider_XHS 用独立 venv，避免与 MediaCrawler 的 Playwright 依赖面互相污染。 */
+function resolveSpiderPython(spiderDir: string, configured: string): { bin: string; source: string } {
+  if (configured) return { bin: configured, source: "BM_SPIDER_XHS_PYTHON" };
+  const candidates: [string, string][] = [
+    [join(spiderDir, ".venv", "bin", "python"), "spiderDir/.venv"],
+    [join(spiderDir, ".venv", "Scripts", "python.exe"), "spiderDir/.venv"],
+  ];
+  for (const [bin, source] of candidates) {
+    if (existsSync(bin)) return { bin, source };
+  }
+  return { bin: "python3", source: "PATH" };
+}
+
 export function loadCollectorConfig(cwd: string = process.cwd()): CollectorConfig {
   const fileVars = parseDotEnv(resolve(cwd, ".env"));
   // 真实环境变量优先于 .env（与主程序的优先级保持一致）
@@ -123,6 +220,11 @@ export function loadCollectorConfig(cwd: string = process.cwd()): CollectorConfi
   const coreDir = resolve(cwd, str(get("BM_MC_CORE_DIR"), "services/collector-core"));
   const dataDir = resolve(cwd, str(get("BM_MC_DATA_DIR"), join(coreDir, "data")));
   const python = resolvePython(coreDir, str(get("BM_MC_PYTHON")));
+  const spiderDir = resolve(cwd, str(get("BM_SPIDER_XHS_DIR"), "services/spider-xhs"));
+  const spiderPython = resolveSpiderPython(spiderDir, str(get("BM_SPIDER_XHS_PYTHON")));
+  const spiderDyDir = resolve(cwd, str(get("BM_SPIDER_DY_DIR"), "services/douyin-spider"));
+  const spiderDyPython = resolveSpiderPython(spiderDyDir, str(get("BM_SPIDER_DY_PYTHON")));
+  const storeDir = resolve(cwd, str(get("BM_COLLECTOR_DATA"), "./.data-collector"));
 
   return {
     host: str(get("BM_COLLECTOR_HOST"), "127.0.0.1"),
@@ -134,7 +236,27 @@ export function loadCollectorConfig(cwd: string = process.cwd()): CollectorConfi
     runPy: join(coreDir, "run.py"),
     dataDir,
     logDir: resolve(cwd, str(get("BM_MC_LOG_DIR"), "./.data-collector/logs")),
-    storeDir: resolve(cwd, str(get("BM_COLLECTOR_DATA"), "./.data-collector")),
+    storeDir,
+
+    xhsDriver: xhsDriver(get("BM_XHS_DRIVER")),
+    spiderXhs: {
+      dir: spiderDir,
+      pythonBin: spiderPython.bin,
+      pythonSource: spiderPython.source,
+      runnerPy: fileURLToPath(new URL("../py/spider_xhs_runner.py", import.meta.url)),
+      sessionFile: resolve(cwd, str(get("BM_SPIDER_XHS_SESSION"), join(storeDir, "spider-xhs-session.json"))),
+      installed: existsSync(join(spiderDir, "apis", "xhs_pc_apis.py")),
+    },
+
+    dyDriver: dyDriver(get("BM_DY_DRIVER")),
+    spiderDy: {
+      dir: spiderDyDir,
+      pythonBin: spiderDyPython.bin,
+      pythonSource: spiderDyPython.source,
+      runnerPy: fileURLToPath(new URL("../py/spider_dy_runner.py", import.meta.url)),
+      sessionFile: resolve(cwd, str(get("BM_SPIDER_DY_SESSION"), join(storeDir, "spider-dy-session.json"))),
+      installed: existsSync(join(spiderDyDir, "dy_apis", "douyin_api.py")),
+    },
 
     headless: bool(get("BM_MC_HEADLESS"), false),
     cdpMode: cdpMode(get("BM_MC_CDP")),
@@ -148,6 +270,15 @@ export function loadCollectorConfig(cwd: string = process.cwd()): CollectorConfi
       enabled: bool(get("BM_MC_PROFILE_ENRICH"), true),
       maxAuthors: num(get("BM_MC_PROFILE_ENRICH_MAX"), 30),
     },
+
+    /* 登录执行器与本文件同仓：用 `import.meta.url` 定位，不依赖 cwd ——
+     * systemd / 容器里 cwd 未必是仓库根，用相对 cwd 的路径会找不到脚本。 */
+    browserDataDir: resolve(cwd, str(get("BM_MC_BROWSER_DATA"), join(coreDir, "browser_data"))),
+    loginRunnerPy: fileURLToPath(new URL("../py/login_runner.py", import.meta.url)),
+    loginHeadless: bool(get("BM_MC_LOGIN_HEADLESS"), true),
+    loginTimeoutMs: num(get("BM_MC_LOGIN_TIMEOUT_MS"), 180_000),
+    loginQrTtlSeconds: num(get("BM_MC_LOGIN_QR_TTL"), 120),
+    loginCheckTimeoutMs: num(get("BM_MC_LOGIN_CHECK_TIMEOUT_MS"), 240_000),
   };
 }
 

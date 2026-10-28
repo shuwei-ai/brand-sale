@@ -62,6 +62,10 @@ export class MilvusVectorIndex implements VectorIndex {
     embedModel: string;
     embedDim: number;
     embedTimeoutMs: number;
+    /** 云端嵌入端点的 Key（本地内核留空） */
+    embedApiKey?: string;
+    /** 嵌入方言；缺省按"有没有 Key"推断 */
+    embedDialect?: "auto" | "openai" | "embeddinggemma";
   }) {
     this.mem = new SemanticMemory({
       embedUrl: opts.embedUrl,
@@ -71,6 +75,8 @@ export class MilvusVectorIndex implements VectorIndex {
       embedModel: opts.embedModel,
       embedTimeoutMs: opts.embedTimeoutMs,
       milvusTimeoutMs: opts.timeoutMs,
+      ...(opts.embedApiKey ? { embedApiKey: opts.embedApiKey } : {}),
+      ...(opts.embedDialect ? { embedDialect: opts.embedDialect } : {}),
       ...(opts.token ? { milvusToken: opts.token } : {}),
     });
   }
@@ -123,5 +129,7 @@ export function createVectorIndex(cfg: Config["retrieval"]): VectorIndex | null 
     embedModel: cfg.embedModel,
     embedDim: cfg.embedDim,
     embedTimeoutMs: cfg.embedTimeoutMs,
+    ...(cfg.embedApiKey ? { embedApiKey: cfg.embedApiKey } : {}),
+    ...(cfg.embedDialect ? { embedDialect: cfg.embedDialect } : {}),
   });
 }

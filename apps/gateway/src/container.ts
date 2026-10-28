@@ -107,6 +107,22 @@ export function createContainer(config: Config = loadConfig()): Container {
     );
   }
 
+  /* 云端嵌入端点的两个高频错配，启动时就说清楚，别等检索静默降级：
+   *   ① 远端地址没配 Key → 每次嵌入 401，语义通道全灭而 BM25 照常，看起来"检索正常"；
+   *   ② 换了模型没改维度 → 首次嵌入就抛维度不匹配（bge-m3 是 1024，不是 768）。 */
+  if (config.retrieval.embedUrl && !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(config.retrieval.embedUrl)) {
+    if (!config.retrieval.embedApiKey) {
+      warnings.push(
+        `BM_EMBED_URL 指向远端（${config.retrieval.embedUrl}）但未配置 BM_EMBED_API_KEY：该端点大概率返回 401，语义通道会全部降级为关键词检索。`,
+      );
+    }
+  }
+  if (/bge-m3/i.test(config.retrieval.embedModel) && config.retrieval.embedDim !== 1024) {
+    warnings.push(
+      `BM_EMBED_MODEL=${config.retrieval.embedModel} 的原生维度是 1024，但 BM_EMBED_DIM=${config.retrieval.embedDim}：首次嵌入会抛维度不匹配。改完还需 npm run embedding:backfill -- --force 与 npm run vector:rebuild -- --reset。`,
+    );
+  }
+
   const bus = new EventBus(repos);
   const orchestrator = new Orchestrator({
     config,

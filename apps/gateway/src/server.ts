@@ -25,6 +25,7 @@ import {
   type TenantContext,
 } from "@brandsale/contracts";
 import { AppError, isAppError } from "@brandsale/contracts";
+import { MEDIA_CRAWLER_PLATFORM_META, MEDIA_CRAWLER_PLATFORMS } from "@brandsale/config";
 import { completeBriefDraft } from "@brandsale/agent-pack";
 import { createContainer, type Container } from "./container.ts";
 import { bootstrapHtml } from "./bootstrap.ts";
@@ -75,6 +76,49 @@ const SPA_ENTRY = new Set(["/", "/console", "/console/", "/index.html"]);
 
 export function createGateway(container: Container, web: StaticMount = resolveWebDist()) {
   const { orchestrator, repos, config } = container;
+
+  /**
+   * 转发到采集 sidecar。**前端永远只认网关**（不直连 8890）：
+   * collector 只绑回环、无鉴权，一旦被浏览器直连就等于把采集面暴露给任意页面。
+   */
+  const collectorCall = async (
+    sub: string,
+    init: { method?: string; body?: unknown; timeoutMs?: number } = {},
+  ): Promise<{ status: number; body: Record<string, unknown> }> => {
+    const base = config.mediaCrawler.collectorBaseUrl;
+    if (!base) {
+      return {
+        status: 503,
+        body: { ok: false, error: "未配置 BM_MC_COLLECTOR_URL：采集/登录 sidecar 未接入" },
+      };
+    }
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), init.timeoutMs ?? 15_000);
+    try {
+      const r = await fetch(`${base}${sub}`, {
+        method: init.method ?? "GET",
+        headers: { "Content-Type": "application/json" },
+        ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+        signal: ac.signal,
+      });
+      const text = await r.text();
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(text) as Record<string, unknown>;
+      } catch {
+        body = { ok: false, error: `collector 返回的不是 JSON：${text.slice(0, 200)}` };
+      }
+      return { status: r.status, body };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return {
+        status: 504,
+        body: { ok: false, error: msg.includes("abort") ? "collector 响应超时" : `无法连接 collector：${msg}` },
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -204,6 +248,18 @@ export function createGateway(container: Container, web: StaticMount = resolveWe
           return json(res, 200, { ok: true });
         }
 
+        if (sub === "" && method === "DELETE") {
+          await orchestrator.deleteJob(jobId, ctx.tenantId);
+          repos.audit.add({
+            tenantId: ctx.tenantId,
+            kind: "job.delete",
+            jobId,
+            reason: `删除任务「${jobId}」及其全部关联数据`,
+            traceId: ctx.traceId,
+          });
+          return json(res, 200, { ok: true });
+        }
+
         if (sub.startsWith("rerun/") && method === "POST") {
           const phase = sub.slice("rerun/".length) as PhaseName;
           if (!PHASE_ORDER.includes(phase)) throw new AppError({ code: "E-SYS-500", message: `未知阶段 ${phase}` });
@@ -267,6 +323,92 @@ export function createGateway(container: Container, web: StaticMount = resolveWe
           ctx,
         );
         return json(res, 201, out);
+      }
+
+      /* ── 平台绑定（服务端无头扫码，方案 A）─────────────────
+       *
+       * 三个动作都只是**代理**到 collector 的 `/login/*`：网关不自己起浏览器。
+       * 为什么把这些路由放在网关而不是让前端直连 8890 —— 8890 只绑回环、无鉴权，
+       * 直连等于绕过租户隔离，且浏览器会因跨域/端口策略拿到一堆奇怪错误。
+       *
+       * `configured=false` 是最常见的分支（没装采集内核 / 没配 sidecar）：返回结构
+       * 仍然完整，前端据此显示「采集未接入」而不是报一个 500。
+       */
+
+      if (path === `${API_PREFIX}/platforms` && method === "GET") {
+        const out = await collectorCall("/login/status", { timeoutMs: 10_000 });
+        if (out.status === 200) {
+          // `mcEnabled` 由网关自己补：collector 不知道主程序的采集开关，
+          // 但用户需要知道"绑定了会不会真的被用上"
+          return json(res, 200, { ...out.body, mcEnabled: config.mediaCrawler.enabled });
+        }
+        return json(res, 200, {
+          ok: true,
+          configured: false,
+          reason: String(out.body.error ?? "采集 sidecar 不可用"),
+          checkedAt: null,
+          probing: false,
+          platforms: MEDIA_CRAWLER_PLATFORMS.map((p) => ({
+            platform: p,
+            name: MEDIA_CRAWLER_PLATFORM_META[p].displayName,
+            sourceId: MEDIA_CRAWLER_PLATFORM_META[p].sourceId,
+            state: "unavailable",
+            detail: "采集 sidecar 未接入，无法查询绑定状态",
+          })),
+          mcEnabled: config.mediaCrawler.enabled,
+        });
+      }
+
+      if (path === `${API_PREFIX}/platforms/check` && method === "POST") {
+        const body = (await readBody(req)) as { platforms?: string[] };
+        // 串行起浏览器，七平台十几秒到一分钟 → 给足 5 分钟，别让代理层先超时
+        const out = await collectorCall("/login/check", {
+          method: "POST",
+          body: { platforms: body.platforms ?? [] },
+          timeoutMs: 300_000,
+        });
+        return json(res, out.status, out.body);
+      }
+
+      const loginStart = new RegExp(`^${API_PREFIX}/platforms/([a-z]+)/login$`).exec(path);
+      if (loginStart && method === "POST") {
+        const platform = loginStart[1]!;
+        if (!(MEDIA_CRAWLER_PLATFORMS as readonly string[]).includes(platform)) {
+          return json(res, 400, { ok: false, error: `未知平台 ${platform}` });
+        }
+        const out = await collectorCall("/login/start", { method: "POST", body: { platform }, timeoutMs: 20_000 });
+        return json(res, out.status, out.body);
+      }
+
+      const loginCookie = new RegExp(`^${API_PREFIX}/platforms/([a-z]+)/cookie$`).exec(path);
+      if (loginCookie && method === "POST") {
+        const platform = loginCookie[1]!;
+        if (!(MEDIA_CRAWLER_PLATFORMS as readonly string[]).includes(platform)) {
+          return json(res, 400, { ok: false, error: `未知平台 ${platform}` });
+        }
+        const body = (await readBody(req)) as { cookie?: unknown };
+        if (typeof body.cookie !== "string") {
+          return json(res, 400, { ok: false, error: "cookie 必须是字符串" });
+        }
+        // 写 cookie 要起浏览器 + 探活，十几秒到半分钟 → 给足 2 分钟
+        const out = await collectorCall("/login/cookie", {
+          method: "POST",
+          body: { platform, cookie: body.cookie },
+          timeoutMs: 120_000,
+        });
+        return json(res, out.status, out.body);
+      }
+
+      const loginPoll = new RegExp(`^${API_PREFIX}/platforms/login/([0-9a-fA-F-]+)$`).exec(path);
+      if (loginPoll && method === "GET") {
+        const out = await collectorCall(`/login/${loginPoll[1]!}`, { timeoutMs: 10_000 });
+        return json(res, out.status, out.body);
+      }
+
+      const loginCancel = new RegExp(`^${API_PREFIX}/platforms/login/([0-9a-fA-F-]+)/cancel$`).exec(path);
+      if (loginCancel && method === "POST") {
+        const out = await collectorCall(`/login/${loginCancel[1]!}/cancel`, { method: "POST", timeoutMs: 10_000 });
+        return json(res, out.status, out.body);
       }
 
       /* ── 知识库与审计 ─────────────────────────────────── */

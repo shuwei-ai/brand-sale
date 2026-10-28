@@ -24,7 +24,7 @@ import { createWriteStream, existsSync, readFileSync, type Dirent } from "node:f
 import { mkdir, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { MEDIA_CRAWLER_PLATFORM_META, type CollectOp, type MediaCrawlerPlatform } from "@brandsale/config";
-import type { CdpMode } from "./config.ts";
+import type { CdpMode, SpiderDyConfig, SpiderXhsConfig, XhsDriver, DyDriver } from "./config.ts";
 import type { RowKind } from "./normalize.ts";
 
 export interface CorePaths {
@@ -38,6 +38,12 @@ export interface CorePaths {
   dataDir: string;
   /** 子进程日志目录 */
   logDir: string;
+  /** 小红书后端；缺省为 mc，保证旧部署与测试的构造方式不变 */
+  xhsDriver?: XhsDriver;
+  spiderXhs?: SpiderXhsConfig;
+  /** 抖音后端；缺省为 mc */
+  dyDriver?: DyDriver;
+  spiderDy?: SpiderDyConfig;
 }
 
 export interface CrawlRequest {
@@ -164,6 +170,77 @@ export function buildRunnerArgs(req: CrawlRequest, paths: CorePaths): string[] {
   return args;
 }
 
+/**
+ * Spider_XHS 的四个只读算子。与 MediaCrawler 一样使用白名单拼参，不透传任意 CLI。
+ * 落盘目录与 session 文件由 collector 固定下发，调用方无法改写。
+ */
+export function buildSpiderRunnerArgs(req: CrawlRequest, paths: CorePaths): string[] {
+  if (!paths.spiderXhs) throw new Error("BM_XHS_DRIVER=spider 但未配置 Spider_XHS");
+  const spider = paths.spiderXhs;
+  const { op, params, maxItems } = req;
+  const args = [
+    spider.runnerPy,
+    "--spider-dir",
+    spider.dir,
+    "--session-file",
+    spider.sessionFile,
+    "--data-dir",
+    paths.dataDir,
+  ];
+  if (op === "search") {
+    args.push("--op", "search", "--keyword", s(params.keyword ?? params.query), "--max-items", String(maxItems));
+  } else if (op === "content_detail") {
+    args.push("--op", "content_detail", "--note-id", s(params.contentId ?? params.url));
+  } else if (op === "comments") {
+    args.push(
+      "--op",
+      "comments",
+      "--note-id",
+      s(params.contentId ?? params.url),
+      "--max-comments",
+      String(maxItems),
+      "--sub-comments",
+      params.subComments === true ? "true" : "false",
+    );
+  } else if (op === "creator") {
+    args.push("--op", "creator", "--creator-ids", s(params.creatorId ?? params.creator));
+  } else {
+    throw new Error(`未知算子：${op}`);
+  }
+  return args;
+}
+
+/**
+ * DouYin_Spider 的四个只读算子。与 MediaCrawler 一样使用白名单拼参，不透传任意 CLI。
+ * 落盘目录与 session 文件由 collector 固定下发，调用方无法改写。
+ */
+export function buildSpiderDyRunnerArgs(req: CrawlRequest, paths: CorePaths): string[] {
+  if (!paths.spiderDy) throw new Error("BM_DY_DRIVER=spider 但未配置 DouYin_Spider");
+  const spider = paths.spiderDy;
+  const { op, params, maxItems } = req;
+  const args = [
+    spider.runnerPy,
+    "--spider-dir",
+    spider.dir,
+    "--session-file",
+    spider.sessionFile,
+    "--data-dir",
+    paths.dataDir,
+  ];
+  if (op === "search") {
+    args.push("--op", "search", "--keyword", s(params.keyword ?? params.query), "--max-items", String(maxItems));
+  } else if (op === "content_detail") {
+    args.push("--op", "content_detail", "--aweme-id", s(params.contentId ?? params.url));
+  } else if (op === "comments") {
+    args.push("--op", "comments", "--aweme-id", s(params.contentId ?? params.url), "--max-comments", String(maxItems));
+  } else if (op === "creator") {
+    args.push("--op", "creator", "--creator-ids", s(params.creatorId ?? params.creator));
+  } else {
+    throw new Error(`未知算子：${op}`);
+  }
+  return args;
+}
+
 /** 某次采集的日志文件路径（`<logDir>/<taskId>.log`）。运行前即可确定。 */
 export const logFileFor = (paths: CorePaths, taskId: string): string => join(paths.logDir, `${taskId}.log`);
 
@@ -223,13 +300,30 @@ export async function runCrawl(
   const logFile = logFileFor(paths, taskId);
   const logStream = createWriteStream(logFile, { flags: "a" });
 
-  const args = buildRunnerArgs(req, paths);
+  const useSpiderXhs = req.platform === "xhs" && paths.xhsDriver === "spider";
+  const useSpiderDy = req.platform === "dy" && paths.dyDriver === "spider";
+  if (useSpiderXhs && !paths.spiderXhs?.installed) {
+    logStream.end();
+    throw new Error("已选择 Spider_XHS，但 services/spider-xhs 不完整；请检查 BM_SPIDER_XHS_DIR");
+  }
+  if (useSpiderDy && !paths.spiderDy?.installed) {
+    logStream.end();
+    throw new Error("已选择 DouYin_Spider，但 services/douyin-spider 不完整；请检查 BM_SPIDER_DY_DIR");
+  }
+  const args = useSpiderXhs
+    ? buildSpiderRunnerArgs(req, paths)
+    : useSpiderDy
+      ? buildSpiderDyRunnerArgs(req, paths)
+      : buildRunnerArgs(req, paths);
+  const pythonBin = useSpiderXhs ? paths.spiderXhs!.pythonBin : useSpiderDy ? paths.spiderDy!.pythonBin : paths.pythonBin;
+  const cwd = useSpiderXhs ? paths.spiderXhs!.dir : useSpiderDy ? paths.spiderDy!.dir : paths.coreDir;
   const startedAt = Date.now();
 
-  logStream.write(`$ ${paths.pythonBin} ${args.join(" ")}\n(cwd=${paths.coreDir})\n\n`);
+  const driverLabel = useSpiderXhs ? "spider-xhs" : useSpiderDy ? "spider-dy" : "mediacrawler";
+  logStream.write(`$ ${pythonBin} ${args.join(" ")}\n(cwd=${cwd})\n(driver=${driverLabel})\n\n`);
 
-  const child = spawn(paths.pythonBin, args, {
-    cwd: paths.coreDir,
+  const child = spawn(pythonBin, args, {
+    cwd,
     // BM_MC_MASK_NICKNAME 显式透传给内核：默认**空**（= 完整显示昵称，见 tools/user_hash.py）。
     // 之所以要显式传而不靠继承：`.env` 里的变量不会自动进 collector 进程的 process.env。
     env: {
@@ -273,7 +367,13 @@ export async function runCrawl(
  * 七个平台的全部依赖（playwright / pyexecjs / cv2 / xhshow …），`--help` 能一次性
  * 把这些"缺哪个包"的问题暴露出来，而 argparse 拿到 `--help` 会直接退 0、不会真的采集。
  */
-export async function probeCore(paths: CorePaths, timeoutMs: number): Promise<{ ok: boolean; detail: string }> {
+async function probeCommand(
+  label: string,
+  command: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number,
+): Promise<{ ok: boolean; detail: string }> {
   return new Promise((resolve) => {
     let settled = false;
     const done = (v: { ok: boolean; detail: string }): void => {
@@ -285,16 +385,16 @@ export async function probeCore(paths: CorePaths, timeoutMs: number): Promise<{ 
 
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(paths.pythonBin, [paths.runPy, "--help"], { cwd: paths.coreDir, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
-      return done({ ok: false, detail: `无法启动内核解释器：${e instanceof Error ? e.message : String(e)}` });
+      return done({ ok: false, detail: `无法启动${label}解释器：${e instanceof Error ? e.message : String(e)}` });
     }
 
     let out = "";
     let err = "";
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      done({ ok: false, detail: `内核自检超时（${timeoutMs}ms）` });
+      done({ ok: false, detail: `${label}自检超时（${timeoutMs}ms）` });
     }, timeoutMs);
 
     child.stdout?.on("data", (b: Buffer) => {
@@ -305,19 +405,47 @@ export async function probeCore(paths: CorePaths, timeoutMs: number): Promise<{ 
     });
     child.on("error", (e) => {
       clearTimeout(timer);
-      done({ ok: false, detail: `无法启动内核解释器：${e.message}` });
+      done({ ok: false, detail: `无法启动${label}解释器：${e.message}` });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
       if (code === 0) {
-        const first = out.split("\n").find((l) => l.trim()) ?? "内核就绪";
+        const first = out.split("\n").find((l) => l.trim()) ?? `${label}就绪`;
         done({ ok: true, detail: first.trim() });
       } else {
         const tail = (err || out).trim().split("\n").slice(-6).join(" ｜ ");
-        done({ ok: false, detail: tail || `内核退出码 ${code}` });
+        done({ ok: false, detail: tail || `${label}退出码 ${code}` });
       }
     });
   });
+}
+
+export async function probeCore(paths: CorePaths, timeoutMs: number): Promise<{ ok: boolean; detail: string }> {
+  return probeCommand("内核", paths.pythonBin, [paths.runPy, "--help"], paths.coreDir, timeoutMs);
+}
+
+/** Spider_XHS 自检会真正 import 签名与登录依赖，并确认本机有可用 JS 运行时。 */
+export async function probeSpiderXhs(spider: SpiderXhsConfig, timeoutMs: number): Promise<{ ok: boolean; detail: string }> {
+  if (!spider.installed) return { ok: false, detail: `Spider_XHS 目录不完整：${spider.dir}` };
+  return probeCommand(
+    "Spider_XHS",
+    spider.pythonBin,
+    [spider.runnerPy, "--op", "probe", "--spider-dir", spider.dir],
+    spider.dir,
+    timeoutMs,
+  );
+}
+
+/** DouYin_Spider 自检会真正 import 签名与 curl_cffi 依赖。 */
+export async function probeSpiderDy(spider: SpiderDyConfig, timeoutMs: number): Promise<{ ok: boolean; detail: string }> {
+  if (!spider.installed) return { ok: false, detail: `DouYin_Spider 目录不完整：${spider.dir}` };
+  return probeCommand(
+    "DouYin_Spider",
+    spider.pythonBin,
+    [spider.runnerPy, "--op", "probe", "--spider-dir", spider.dir],
+    spider.dir,
+    timeoutMs,
+  );
 }
 
 /**

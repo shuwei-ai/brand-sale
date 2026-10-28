@@ -16,7 +16,7 @@
 | 源 | 台账 ID | 真实链路 | 说明 |
 |---|---|---|---|
 | 联网搜索 | `volc_web_search` | ✅ 实测连通 | 火山引擎联网搜索 Lite，抓公开网页 |
-| 小红书公开内容 | `mc_xhs` | ⏳ 需本机采集 | MediaCrawler，经 collector sidecar |
+| 小红书公开内容 | `mc_xhs` | ⏳ 需本机采集 | MediaCrawler 或 Spider_XHS，经 collector sidecar |
 | 抖音公开内容 | `mc_dy` | ⏳ 需本机采集 | 同上 |
 | 快手公开内容 | `mc_ks` | ⏳ 需本机采集 | 同上 |
 | B站公开内容 | `mc_bili` | ⏳ 需本机采集 | 同上 |
@@ -72,6 +72,37 @@ brandsale 适配器 ──HTTP──▶ collector ──spawn──▶ 内嵌采
 
 collector 只暴露**四个只读算子**，没有任何转发式代理接口 —— MediaCrawler 自带的
 点赞/评论/关注/发帖能力在接口形状上就无从表达。这是刻意的：见 §6。
+
+### 1.1 小红书双后端：MediaCrawler / Spider_XHS
+
+小红书采集有一个**可选后端**（`BM_XHS_DRIVER`），其余六平台始终走 MediaCrawler：
+
+| 值 | 后端 | 原理 | 适用场景 |
+|---|---|---|---|
+| `mc`（默认） | MediaCrawler | Playwright 浏览器自动化 | 历史行为，与其余六平台一致 |
+| `spider` | Spider_XHS | 纯 HTTP + 本地签名（无浏览器） | 出口 IP 被风控、无头指纹被判定为机器人时 |
+
+两者暴露**同一个工具契约**（`mc_xhs`，四个只读算子），归一化落盘格式完全同构，
+所以报告、引用、缓存、适配器零改动 —— 只是小红书那一路换了个执行器。
+
+`spider` 只启用**只读公开内容**（搜索 / 笔记详情 / 评论 / 作者主页），刻意不接
+Spider_XHS 自带的蒲公英（KOL）、千帆（分销商）、私信、发布等能力 —— 那些要么是
+本项目已移除的数据源，要么是写操作。
+
+切换方式：
+
+```bash
+npm run collector:spider-setup   # 准备 Spider_XHS 独立 Python 环境 + 签名 JS 依赖
+BM_XHS_DRIVER=spider npm run collector
+```
+
+相关配置：`BM_SPIDER_XHS_DIR` / `BM_SPIDER_XHS_PYTHON` / `BM_SPIDER_XHS_SESSION`。
+登录会话是完整 Cookie（含 `web_session`），落盘在 `.data-collector/`（已 gitignore），
+权限 0600。Spider_XHS 本地克隆（`services/spider-xhs/`）也默认不入公开仓库。
+
+> ⚠️ Spider_XHS 上游仓库**没有 LICENSE**（GitHub 上 `license: None`），默认保留全部版权。
+> 本项目仅在业主明确「个人使用」的前提下保留本地克隆作为可选执行器，**不复制其代码进
+> brandsale 源码**；brandsale 自有的执行器是 `apps/collector/py/spider_xhs_runner.py`。
 
 ---
 
@@ -172,7 +203,7 @@ BM_WEB_SEARCH_URL=https://open.feedcoopapi.com/search_api/web_search
 BM_WEB_SEARCH_API_KEY=            # 空 = 能力缺席
 BM_WEB_SEARCH_COUNT=20
 BM_WEB_SEARCH_MAX_COUNT=50
-BM_WEB_SEARCH_TIMEOUT_MS=8000
+BM_WEB_SEARCH_TIMEOUT_MS=20000     # 8s 在真机频繁 E-DATA-002 aborted；15–20s 为可用区间
 BM_WEB_SEARCH_CACHE_TTL=900       # 相同查询缓存 15 分钟
 BM_WEB_SEARCH_PREFETCH=true
 

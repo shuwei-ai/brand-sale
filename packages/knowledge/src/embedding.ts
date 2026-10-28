@@ -124,6 +124,112 @@ export function blobToVector(b: Uint8Array | null): Float32Array | null {
 
 export type EmbedInputType = "query" | "document";
 
+/**
+ * 嵌入服务的「方言」—— 决定请求体长什么样、怎么鉴权、健康检查打哪里。
+ *
+ * 这两类端点的差异不是格式洁癖，每一条都对应过真实的 4xx：
+ *
+ *   `embeddinggemma`：`services/embedding-core`（本地，无鉴权）。
+ *     · 认 `input_type` / `title` —— 它靠这个注入 task 前缀，**省略就静默掉精度**；
+ *     · 认 `dimensions` —— 允许把原生 768 压到更小；
+ *     · `GET /health` 是它自己实现的路由。
+ *
+ *   `openai`：云端 OpenAI 兼容端点（SiliconFlow / 通义 / OpenAI / TEI）。
+ *     · **不认** `input_type` / `title`：严格实现的网关直接 400，宽松的静默忽略；
+ *     · `dimensions` 只有 text-embedding-3 这类支持可变维的模型才认，bge-m3 传了会报错；
+ *     · 需要 `Authorization: Bearer`；
+ *     · **没有** `/health`（打过去是 404）→ 探活必须换成一次极小体积的真实嵌入请求。
+ *
+ * 早期实现无条件发 `input_type` + `dimensions` 且不带头，因此只能对接本地内核。
+ */
+export type EmbedDialect = "embeddinggemma" | "openai";
+
+/** 配置里的形态：`auto` 按"有没有 API Key"推断（本地内核不需要 Key）。 */
+export type EmbedDialectConfig = EmbedDialect | "auto";
+
+export function resolveEmbedDialect(dialect: EmbedDialectConfig | undefined, apiKey: string): EmbedDialect {
+  if (dialect === "openai" || dialect === "embeddinggemma") return dialect;
+  return apiKey ? "openai" : "embeddinggemma";
+}
+
+export interface EmbedRequestShape {
+  model: string;
+  dialect: EmbedDialect;
+  apiKey?: string;
+  inputType?: EmbedInputType;
+  title?: string;
+  dimensions?: number;
+}
+
+/** 组装请求头与请求体（两个调用点共用，避免"一处改了另一处没改"）。 */
+export function embedRequestInit(
+  shape: EmbedRequestShape,
+  texts: string[],
+  signal?: AbortSignal,
+): { headers: Record<string, string>; body: string; signal?: AbortSignal } {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (shape.apiKey) headers.Authorization = `Bearer ${shape.apiKey}`;
+
+  if (shape.dialect === "embeddinggemma") {
+    const body: Record<string, unknown> = {
+      model: shape.model,
+      input: texts,
+      input_type: shape.inputType ?? "document",
+    };
+    if (shape.title) body.title = shape.title;
+    if (shape.dimensions) body.dimensions = shape.dimensions;
+    return { headers, body: JSON.stringify(body), ...(signal ? { signal } : {}) };
+  }
+
+  // openai 方言：只发标准字段。多一个未知字段就可能被严格网关判 400。
+  return {
+    headers,
+    body: JSON.stringify({ model: shape.model, input: texts }),
+    ...(signal ? { signal } : {}),
+  };
+}
+
+/** 从 OpenAI 兼容响应里取向量，并逐条校验维度与条数。 */
+export function parseEmbedResponse(json: unknown, dim: number, expectedCount: number): Float32Array[] {
+  const rows = (json as { data?: { embedding?: number[] }[] } | null)?.data ?? [];
+  if (rows.length !== expectedCount) {
+    throw new EmbeddingUnavailableError(`嵌入服务返回条数与请求不一致：请求 ${expectedCount}，返回 ${rows.length}`);
+  }
+  return rows.map((r, i) => {
+    const vec = r.embedding ?? [];
+    // 维度不符立刻炸：静默放过会让后续所有 cosine 分数失去意义
+    if (vec.length !== dim) {
+      throw new EmbeddingUnavailableError(
+        `嵌入维度不匹配（第 ${i} 条）：期望 ${dim}，实得 ${vec.length}。` +
+          `查询与文档必须同维度，且该维度决定落盘向量能参与比较的范围。` +
+          `换模型后请同步改 BM_EMBED_DIM（bge-m3 = 1024，EmbeddingGemma 2 = 768），` +
+          `再跑 npm run embedding:backfill -- --force 与 npm run vector:rebuild -- --reset。`,
+      );
+    }
+    return Float32Array.from(vec);
+  });
+}
+
+/** 429 / 5xx 的退避重试。远端按次计费且有 RPS 限制，直连 burst 会整批失败。 */
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+
+export async function fetchWithRetry(
+  doFetch: () => Promise<Response>,
+  attempts = 3,
+): Promise<Response> {
+  let last: Response | undefined;
+  for (let i = 0; i < attempts; i++) {
+    const res = await doFetch();
+    if (!RETRYABLE.has(res.status)) return res;
+    last = res;
+    if (i === attempts - 1) break;
+    const retryAfter = Number(res.headers.get("retry-after"));
+    const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 400 * 2 ** i;
+    await new Promise((r) => setTimeout(r, wait));
+  }
+  return last!;
+}
+
 export interface EmbedOptions {
   /** 任务前缀（见文件头第 1 条）。缺省 "document"。 */
   inputType?: EmbedInputType;
@@ -174,7 +280,7 @@ export class HashEmbeddingProvider implements EmbeddingProvider {
 /* ── 实现 2：HTTP（EmbeddingGemma 2 / 任意 OpenAI 兼容端点） ── */
 
 export interface HttpEmbeddingOptions {
-  /** OpenAI 兼容的嵌入端点，如 http://127.0.0.1:8899/v1/embeddings */
+  /** OpenAI 兼容的嵌入端点，如 http://127.0.0.1:8899/v1/embeddings 或 https://api.siliconflow.cn/v1/embeddings */
   url: string;
   /** 模型标识（写进 embed_model） */
   model: string;
@@ -182,6 +288,10 @@ export interface HttpEmbeddingOptions {
   /** 单次请求最多几条文本；超出的分批。默认 32。 */
   batchSize?: number;
   timeoutMs?: number;
+  /** 云端端点必填；本地内核留空 */
+  apiKey?: string;
+  /** 不填 = 按 apiKey 有无推断（见 resolveEmbedDialect） */
+  dialect?: EmbedDialect;
 }
 
 export class HttpEmbeddingProvider implements EmbeddingProvider {
@@ -191,6 +301,8 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
   private readonly url: string;
   private readonly batchSize: number;
   private readonly timeoutMs: number;
+  private readonly apiKey: string;
+  readonly dialect: EmbedDialect;
 
   constructor(opts: HttpEmbeddingOptions) {
     if (!opts.url) throw new EmbeddingUnavailableError("HttpEmbeddingProvider 需要非空的 url");
@@ -199,6 +311,8 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
     this.dim = opts.dim;
     this.batchSize = Math.max(1, opts.batchSize ?? 32);
     this.timeoutMs = opts.timeoutMs ?? 60_000;
+    this.apiKey = opts.apiKey ?? "";
+    this.dialect = resolveEmbedDialect(opts.dialect, this.apiKey);
   }
 
   async embed(texts: string[], opts: EmbedOptions = {}): Promise<Float32Array[]> {
@@ -212,7 +326,21 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
     return out;
   }
 
+  /**
+   * 探活。两种方言的打法不同：
+   *   · 本地内核有 `GET /health`；
+   *   · 云端没有这个路由（打过去 404），只能发一次 1 条文本的真实嵌入请求 ——
+   *     它顺带验证了 Key 与模型名，比"端口通"更有意义。
+   */
   async health(): Promise<boolean> {
+    if (this.dialect === "openai") {
+      try {
+        await this.embed(["health"], { inputType: "query" });
+        return true;
+      } catch {
+        return false;
+      }
+    }
     try {
       const base = this.url.replace(/\/v1\/embeddings\/?$/, "");
       const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(Math.min(this.timeoutMs, 10_000)) });
@@ -223,19 +351,15 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
   }
 
   private async request(texts: string[], opts: EmbedOptions): Promise<Float32Array[]> {
+    const init = embedRequestInit(
+      { model: this.model, dialect: this.dialect, ...(this.apiKey ? { apiKey: this.apiKey } : {}), dimensions: this.dim, ...(opts.inputType ? { inputType: opts.inputType } : {}) },
+      texts,
+      opts.signal ?? AbortSignal.timeout(this.timeoutMs),
+    );
+
     let res: Response;
     try {
-      res = await fetch(this.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: this.model,
-          input: texts,
-          input_type: opts.inputType ?? "document",
-          dimensions: this.dim,
-        }),
-        ...(opts.signal ? { signal: opts.signal } : { signal: AbortSignal.timeout(this.timeoutMs) }),
-      });
+      res = await fetchWithRetry(() => fetch(this.url, { method: "POST", headers: init.headers, body: init.body, signal: init.signal }));
     } catch (e) {
       throw new EmbeddingUnavailableError(
         `无法连接嵌入服务 ${this.url}：${e instanceof Error ? e.message : String(e)}`,
@@ -243,24 +367,11 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
       );
     }
     if (!res.ok) {
-      throw new EmbeddingUnavailableError(`嵌入服务返回 HTTP ${res.status}：${(await res.text()).slice(0, 200)}`);
+      throw new EmbeddingUnavailableError(
+        `嵌入服务返回 HTTP ${res.status}${res.status === 401 || res.status === 403 ? "（API Key 无效或无权限）" : ""}：${(await res.text()).slice(0, 200)}`,
+      );
     }
-    const json = (await res.json()) as { data?: { embedding?: number[] }[] };
-    const rows = json.data ?? [];
-    if (rows.length !== texts.length) {
-      throw new EmbeddingUnavailableError(`嵌入服务返回条数与请求不一致：请求 ${texts.length}，返回 ${rows.length}`);
-    }
-    return rows.map((r, i) => {
-      const vec = r.embedding ?? [];
-      // 维度不符立刻炸：静默放过会让后续所有 cosine 分数失去意义
-      if (vec.length !== this.dim) {
-        throw new EmbeddingUnavailableError(
-          `嵌入维度不匹配（第 ${i} 条）：期望 ${this.dim}，实得 ${vec.length}。` +
-            `查询与文档必须同维度，且该维度决定落盘向量能参与比较的范围`,
-        );
-      }
-      return Float32Array.from(vec);
-    });
+    return parseEmbedResponse(await res.json(), this.dim, texts.length);
   }
 }
 
@@ -272,6 +383,10 @@ export interface EmbeddingConfigLike {
   embedDim: number;
   embedBatchSize?: number;
   embedTimeoutMs?: number;
+  /** 云端端点必填；本地内核留空 */
+  embedApiKey?: string;
+  /** `auto` = 有 Key 就按 openai 方言、没有就按本地内核 */
+  embedDialect?: EmbedDialectConfig;
 }
 
 /**
@@ -283,12 +398,15 @@ export interface EmbeddingConfigLike {
  */
 export function embeddingProviderFromConfig(cfg: EmbeddingConfigLike): EmbeddingProvider {
   if (!cfg.embedUrl) return new HashEmbeddingProvider();
+  const apiKey = cfg.embedApiKey ?? "";
   return new HttpEmbeddingProvider({
     url: cfg.embedUrl,
     model: cfg.embedModel,
     dim: cfg.embedDim,
     ...(cfg.embedBatchSize !== undefined ? { batchSize: cfg.embedBatchSize } : {}),
     ...(cfg.embedTimeoutMs !== undefined ? { timeoutMs: cfg.embedTimeoutMs } : {}),
+    ...(apiKey ? { apiKey } : {}),
+    ...(cfg.embedDialect ? { dialect: resolveEmbedDialect(cfg.embedDialect, apiKey) } : {}),
   });
 }
 

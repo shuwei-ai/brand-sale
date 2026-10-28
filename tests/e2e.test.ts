@@ -238,6 +238,43 @@ test("幂等：同 key 同 body 复用任务；同 key 不同 body 报 E-JOB-002
   }
 });
 
+/* ── 删除任务：级联清除关联数据、幂等可重建 ────────────── */
+
+test("删除任务：级联清除阶段/产物/事件/用量，且删除后可用同 key 重建", async () => {
+  const { c, dispose } = await freshContainer();
+  try {
+    const { jobId } = await c.orchestrator.startJob({ idempotencyKey: "del", spec: { brief: BRIEF } }, ctx);
+    await waitDone(c, jobId);
+
+    // 删除前：关联数据应存在
+    assert.ok(c.repos.phases.list(jobId).length > 0, "删除前应有阶段记录");
+    assert.ok(c.repos.artifacts.list(jobId).length > 0, "删除前应有产物");
+    assert.ok((await c.orchestrator.getUsage(jobId))!.tokens.calls > 0, "删除前应有用量记录");
+
+    await c.orchestrator.deleteJob(jobId, DEMO_TENANT);
+
+    // 删除后：主表与关联表全部清空
+    assert.equal(await c.orchestrator.getJob(jobId, DEMO_TENANT), null, "任务应被删除");
+    assert.equal(c.repos.phases.list(jobId).length, 0, "阶段应级联删除");
+    assert.equal(c.repos.artifacts.list(jobId).length, 0, "产物应级联删除");
+    assert.equal(c.repos.ledger.byJob(jobId).length, 0, "台账应级联删除");
+    assert.equal((await c.orchestrator.getUsage(jobId))!.tokens.calls, 0, "用量应级联删除");
+
+    // 幂等记录已清：同 key 可重建出一个**新的** jobId
+    const again = await c.orchestrator.startJob({ idempotencyKey: "del", spec: { brief: BRIEF } }, ctx);
+    assert.notEqual(again.jobId, jobId, "删除后同 key 重建应得到新任务");
+    assert.equal(again.reused, false, "不应命中旧幂等记录");
+
+    // 越权/不存在：删除别人的任务应报 E-AUTH-002
+    await assert.rejects(
+      () => c.orchestrator.deleteJob(again.jobId, "other_tenant"),
+      (e: unknown) => e instanceof AppError && e.code === "E-AUTH-002",
+    );
+  } finally {
+    dispose();
+  }
+});
+
 /* ── E2E #5 崩溃恢复：不重跑已完成阶段、用量不翻倍 ─────── */
 
 test("E2E-5 崩溃恢复：已完成的阶段不重跑，用量不翻倍", async () => {

@@ -45,8 +45,10 @@ async function main(): Promise<void> {
     embedUrl: opt("embed-url", process.env.BM_EMBED_URL ?? "http://127.0.0.1:8899/v1/embeddings"),
     milvusUrl: opt("milvus-url", process.env.BM_MILVUS_URI ?? "http://127.0.0.1:19530"),
     collection: opt("collection", "brandsale_smoke"),
-    dim: Number(opt("dim", "768")),
-    embedModel: "embeddinggemma-2",
+    dim: Number(opt("dim", process.env.BM_EMBED_DIM ?? "768")),
+    embedModel: process.env.BM_EMBED_MODEL ?? "embeddinggemma-2",
+    ...(process.env.BM_EMBED_API_KEY ? { embedApiKey: process.env.BM_EMBED_API_KEY } : {}),
+    ...(process.env.BM_EMBED_DIALECT ? { embedDialect: process.env.BM_EMBED_DIALECT as "auto" | "openai" | "embeddinggemma" } : {}),
     milvusTimeoutMs: 10_000,
   });
 
@@ -171,6 +173,10 @@ async function main(): Promise<void> {
     embedUrl: opt("embed-url", "http://127.0.0.1:8899/v1/embeddings"),
     milvusUrl: "http://127.0.0.1:1", // 故意打不通
     collection: "brandsale_smoke",
+    dim: Number(opt("dim", process.env.BM_EMBED_DIM ?? "768")),
+    embedModel: process.env.BM_EMBED_MODEL ?? "embeddinggemma-2",
+    ...(process.env.BM_EMBED_API_KEY ? { embedApiKey: process.env.BM_EMBED_API_KEY } : {}),
+    ...(process.env.BM_EMBED_DIALECT ? { embedDialect: process.env.BM_EMBED_DIALECT as "auto" | "openai" | "embeddinggemma" } : {}),
     milvusTimeoutMs: 1_500,
   });
   const brokenResult = await broken.trySearch("任意查询", { tenantId: TENANT_A });

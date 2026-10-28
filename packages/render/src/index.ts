@@ -57,6 +57,19 @@ const CHART_COLORS = ["#1f6feb", "#bf8700", "#2da44e", "#8250df", "#cf222e", "#0
 const IMAGE_REF_RE = /^(https:\/\/|data:image\/[a-z0-9.+-]+;base64,)/i;
 
 const esc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+/**
+ * 行内 Markdown（只支持 `**加粗**`）→ HTML。
+ *
+ * 为什么必须有：DSL 里大量文案本来就带 `**重点**`（合成路径、提示词、人选的来源说明都这么写），
+ * 而这里的渲染器只做转义、不解析行内语法 —— 结果业主在报告里读到的是字面的
+ * `**未采集**`、`**逐字命中姓名**`。这是纯粹的可读性缺陷，但出现在"数据来源"这类
+ * 最需要被信任的段落里时，读起来像乱码。
+ *
+ * 边界：**只认 `**`**。单个 `*`/`_` 在中文正文里（`3*4`、`foo_bar`）太容易误伤，不支持；
+ * 且**先转义再替换**，所以这条通道不可能注入标签。
+ */
+const mdInline = (s: string): string => esc(s).replace(/\*\*([^*<>]{1,160}?)\*\*/g, "<strong>$1</strong>");
 const fmt = (n: number): string => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/\.?0+$/, ""));
 
 export class RenderService implements IRenderService {
@@ -288,18 +301,18 @@ export class RenderService implements IRenderService {
         ${body}
         ${
           slide.citations.length > 0
-            ? `<div class="cites"><b>引用</b><ul>${slide.citations
+            ? `<div class="cites"><b>来源与核验</b><ul>${slide.citations
                 .map((c) => {
                   const d = this.citeDetail(c, opts.catalog);
                   // 有 URL 才给链接：反查不到出处时显示纯文本，绝不生成猜测性链接
                   const where = d.url
                     ? `<a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${esc(d.label)}</a>`
                     : `<code>${esc(d.label)}</code>`;
-                  const badge = d.platform ? `<span class="badge">${esc(d.platform)}</span> ` : "";
+                  const badge = d.platform ? `<span class="badge">${esc(d.platform)}</span>` : "";
                   const meta = d.meta ? ` · <span class="citemeta">${esc(d.meta)}</span>` : "";
-                  return `<li>${badge}${esc(c.claim)} — ${where}${meta} · 置信度 ${c.confidence.toFixed(2)} · ${c.tier} · ${
+                  return `<li>${badge}${esc(c.claim)} — ${where}${meta}<span class="citemeta"> · 置信度 ${c.confidence.toFixed(2)} · ${c.tier} · ${
                     c.verifiedBy === "human" ? "人工核验" : "自动"
-                  }</li>`;
+                  }</span></li>`;
                 })
                 .join("")}</ul></div>`
             : ""
@@ -311,84 +324,129 @@ export class RenderService implements IRenderService {
 
     return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(dsl.meta.title)}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@500;600;700&family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-  :root{--ink:#1a1c1f;--muted:#5c636e;--line:#e3e6ea;--bg:#f6f7f9;--accent:#1f6feb;--warn:#b45309;--risk:#b91c1c;--up:#c62828;--down:#2e7d32}
+  :root{
+    --ink:#20242a;--muted:#6b7280;--line:#e7e9ee;--line-soft:#f0f2f6;
+    --bg:#f7f6f3;--surface:#ffffff;--accent:#1f4e5f;--accent-soft:#eef3f5;
+    --warn:#9a5b0a;--risk:#b3261e;--up:#c0392b;--down:#1e7d46;
+    --serif:"Noto Serif SC","Songti SC",serif;--sans:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif}
-  .wrap{max-width:960px;margin:0 auto;padding:40px 24px 80px}
-  .cover{background:#fff;border:1px solid var(--line);border-radius:16px;padding:32px;margin-bottom:20px}
-  .cover h1{margin:0 0 8px;font-size:26px}
-  .cover .meta{color:var(--muted);font-size:13px}
-  .degraded{margin-top:12px;background:#fff7ed;border:1px solid #fed7aa;color:var(--warn);padding:10px 12px;border-radius:10px;font-size:13px}
-  .slide{position:relative;background:#fff;border:1px solid var(--line);border-radius:16px;padding:26px 28px 34px;margin-bottom:18px}
-  .slide-head{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:16px}
-  .slide-head .idx{color:var(--accent);font-weight:700;font-variant-numeric:tabular-nums}
-  .slide-head h2{margin:0;font-size:18px}
-  /* 页面角色样式：section/appendix 与正文拉开视觉层级 */
-  .slide.role-section{background:linear-gradient(180deg,#f8faff,#fff);border-left:4px solid var(--accent)}
-  .slide.role-section .slide-head h2{font-size:22px}
-  .slide.role-appendix{background:#fcfcfd;font-size:13.5px}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.8 var(--sans);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  .wrap{max-width:1120px;margin:0 auto;padding:64px 40px 120px}
+  /* 封面：视觉焦点，大衬线标题 + 分层 meta + 强调色竖线 */
+  .cover{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:56px 56px 48px;margin-bottom:32px;overflow:hidden}
+  .cover::before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:var(--accent)}
+  .cover h1{margin:0 0 20px;font-family:var(--serif);font-weight:700;font-size:34px;line-height:1.35;letter-spacing:.01em;max-width:24em}
+  .cover .meta{color:var(--muted);font-size:13.5px;letter-spacing:.02em}
+  .cover .meta b{color:var(--ink);font-weight:600}
+  .degraded{margin-top:20px;background:#fdf6ec;border:1px solid #f3d9b0;color:var(--warn);padding:14px 18px;border-radius:12px;font-size:14px}
+  .slide{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:44px 48px 52px;margin-bottom:28px}
+  .slide-head{display:flex;align-items:baseline;gap:16px;border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:28px}
+  .slide-head .idx{font-family:var(--serif);color:var(--accent);font-weight:700;font-size:15px;letter-spacing:.04em;font-variant-numeric:tabular-nums}
+  .slide-head h2{margin:0;font-family:var(--serif);font-size:22px;font-weight:600;line-height:1.4;letter-spacing:.01em}
+  /* 页面角色：section 用强调色竖线拉开层级，appendix 降一档更安静 */
+  .slide.role-section{background:linear-gradient(180deg,#fbfcfe,#fff);border-left:4px solid var(--accent)}
+  .slide.role-section .slide-head h2{font-size:26px}
+  .slide.role-appendix{background:#fcfcfd}
   .slide.role-appendix .slide-head .idx{color:var(--muted)}
-  .slide.role-closing{background:linear-gradient(180deg,#fff,#f8f9fb)}
-  .pagenum{position:absolute;right:20px;bottom:12px;color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}
-  .cols{column-count:2;column-gap:26px}
+  .slide.role-closing{background:linear-gradient(180deg,#fff,#fafaf8)}
+  .pagenum{position:absolute;right:28px;bottom:20px;color:#9aa1ab;font-size:12px;font-variant-numeric:tabular-nums}
+  .cols{column-count:2;column-gap:40px}
   .cols > *{break-inside:avoid}
-  h3{margin:18px 0 8px;font-size:15px}
-  ul{margin:8px 0;padding-left:20px}
-  li{margin:4px 0}
-  table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13.5px}
-  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left}
-  th{background:#fafbfc;font-weight:600}
-  .kpi{display:flex;flex-wrap:wrap;gap:12px;margin:10px 0}
-  .kpi .card{flex:1 1 170px;border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:#fcfcfd}
-  .kpi .card .l{color:var(--muted);font-size:12.5px}
-  .kpi .card .v{font-size:22px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums}
-  .kpi .card .t{margin-top:6px}
-  .kpi.kpi-wide .card.lead{border-color:var(--accent);background:#f5f9ff}
-  .kpi.kpi-wide .card.lead .v{font-size:26px}
-  .tag{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:999px;border:1px solid currentColor}
-  .tag.high{color:#15803d}.tag.medium{color:#b45309}.tag.low{color:#b91c1c}
-  .callout{border-radius:10px;padding:10px 12px;margin:12px 0;font-size:13.5px}
-  .callout.info{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af}
-  .callout.warn{background:#fff7ed;border:1px solid #fed7aa;color:var(--warn)}
-  .callout.risk{background:#fef2f2;border:1px solid #fecaca;color:var(--risk)}
-  .cites{margin-top:16px;border-top:1px dashed var(--line);padding-top:10px;font-size:12.5px;color:var(--muted)}
-  .cites ul{margin:6px 0 0}
-  /* 条目级溯源的视觉语言：平台徽标 + 可点的原文链接 + 采集口径 */
-  .cites .badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:999px;background:#eef4ff;color:#1f6feb;border:1px solid #d3e2fd;margin-right:4px}
-  .cites a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(31,111,235,.35)}
+  h3{margin:32px 0 14px;font-size:16.5px;font-weight:600;line-height:1.5;color:var(--ink)}
+  h3:first-child{margin-top:0}
+  p{margin:0 0 16px}
+  ul{margin:12px 0;padding-left:22px}
+  li{margin:9px 0;line-height:1.75}
+  li::marker{color:var(--accent)}
+  table{border-collapse:collapse;width:100%;margin:20px 0;font-size:14px;line-height:1.65}
+  th,td{border:1px solid var(--line);padding:13px 15px;text-align:left;vertical-align:top;word-break:break-word;overflow-wrap:anywhere}
+  th{background:var(--accent-soft);font-weight:600;color:var(--ink);white-space:nowrap}
+  tbody tr:nth-child(even){background:#fafbfc}
+  tbody tr:hover{background:#f5f7f9}
+  /* 宽表横向滚动：容器内滚动而非撑破页面；min-width 防止列被挤成竖排 */
+  .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:20px 0;border:1px solid var(--line);border-radius:12px}
+  .table-scroll table{margin:0;border:none;min-width:760px}
+  .table-scroll th,.table-scroll td{border-left:none;border-top:none}
+  .table-scroll th:first-child,.table-scroll td:first-child{border-left:none}
+  .table-scroll tr:first-child th{border-top:none}
+  .table-wide td{white-space:normal;word-break:break-word}
+  .table-wide th{white-space:nowrap}
+  .kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:16px;margin:20px 0}
+  .kpi .card{border:1px solid var(--line);border-radius:14px;padding:18px 20px;background:#fbfcfd}
+  .kpi .card .l{color:var(--muted);font-size:13px;letter-spacing:.02em}
+  .kpi .card .v{font-family:var(--serif);font-size:24px;font-weight:700;margin-top:8px;font-variant-numeric:tabular-nums;line-height:1.3}
+  .kpi .card .t{margin-top:10px}
+  .kpi.kpi-wide .card.lead{border-color:var(--accent);background:var(--accent-soft);box-shadow:0 2px 12px rgba(31,78,95,.08)}
+  .kpi.kpi-wide .card.lead .v{font-size:28px}
+  .tag{display:inline-block;font-size:11.5px;padding:2px 9px;border-radius:999px;border:1px solid currentColor;letter-spacing:.02em}
+  .tag.high{color:#1e7d46}.tag.medium{color:#9a5b0a}.tag.low{color:#b3261e}
+  .callout{border-radius:12px;padding:16px 20px;margin:20px 0;font-size:14px;line-height:1.7;border:1px solid transparent}
+  .callout.info{background:#f0f6fb;border-color:#d4e4ef;color:#1f4a63}
+  .callout.warn{background:#fdf6ec;border-color:#f3d9b0;color:var(--warn)}
+  .callout.risk{background:#fdf1f0;border-color:#f3c4c0;color:var(--risk)}
+  /* 引用注脚：默认收成一条小结，明细用更轻的视觉，避免页尾堆成乱码 */
+  .cites{margin-top:28px;border-top:1px solid var(--line);padding-top:18px;font-size:13px;color:var(--muted)}
+  .cites > b{display:block;font-size:12px;font-weight:600;letter-spacing:.08em;color:#9aa1ab;margin-bottom:8px}
+  .cites ul{margin:0;padding-left:0;list-style:none}
+  .cites li{margin:8px 0;padding-left:14px;position:relative;line-height:1.7}
+  .cites li::before{content:"·";position:absolute;left:0;color:#9aa1ab}
+  .cites .badge{display:inline-block;font-size:11px;padding:0 7px;border-radius:999px;background:var(--accent-soft);color:var(--accent);border:1px solid #d6e2e7;margin-right:6px}
+  .cites a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(31,78,95,.3)}
   .cites a:hover{border-bottom-color:var(--accent)}
-  .cites .citemeta{color:#8a919e}
-  .timeline{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}
-  .timeline .ph{flex:1 1 200px;border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:#fcfcfd}
-  .timeline .ph b{display:block;margin-bottom:2px}
-  .timeline .ph .d{color:var(--muted);font-size:12px;margin-bottom:6px}
-  figure.chart,figure.matrix{margin:14px 0;border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:#fff}
+  .cites .citemeta{color:#a0a6b0}
+  blockquote{border-left:3px solid var(--accent);margin:24px 0;padding:6px 0 6px 20px;color:#454b54;font-family:var(--serif);font-size:16px;line-height:1.75}
+  blockquote div{font-family:var(--sans);font-size:12.5px;color:var(--muted);margin-top:8px}
+  .timeline{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin:20px 0}
+  .timeline .ph{border:1px solid var(--line);border-radius:14px;padding:18px 20px;background:#fbfcfd}
+  .timeline .ph b{display:block;margin-bottom:4px;font-size:15px}
+  .timeline .ph .d{color:var(--muted);font-size:12.5px;margin-bottom:10px;font-variant-numeric:tabular-nums}
+  .timeline .ph ul{margin:0;padding-left:18px}
+  .timeline .ph li{margin:5px 0;font-size:14px}
+  figure.chart,figure.matrix{margin:24px 0;border:1px solid var(--line);border-radius:14px;padding:24px 26px;background:#fff}
   figure.chart svg,figure.matrix svg{width:100%;height:auto;display:block}
-  figure.chart figcaption,figure.matrix figcaption{color:var(--muted);font-size:12.5px;margin-top:6px}
-  .toc{margin:6px 0}
-  .toc-row{display:flex;align-items:baseline;gap:8px;padding:6px 0;border-bottom:1px dotted var(--line);font-size:14px}
-  .toc-t{font-weight:600}
-  .toc-d{flex:1;border-bottom:1px dotted var(--line);transform:translateY(-3px)}
-  .toc-p{color:var(--muted);font-variant-numeric:tabular-nums}
-  .src{background:#fff;border:1px solid var(--line);border-radius:16px;padding:22px 26px;margin-top:18px;font-size:13.5px}
-  .src h3{margin-top:0}
+  figure.chart figcaption,figure.matrix figcaption{color:var(--muted);font-size:12.5px;margin-top:10px;text-align:center;letter-spacing:.02em}
+  figure img{max-width:100%;border-radius:10px}
+  figure figcaption{color:var(--muted);font-size:12.5px;margin-top:8px}
+  .toc{margin:4px 0}
+  .toc-row{display:flex;align-items:baseline;gap:14px;padding:13px 0;border-bottom:1px solid var(--line-soft);font-size:15px}
+  .toc-t{font-weight:500;color:var(--ink)}
+  .toc-d{flex:1;border-bottom:1px dotted #cbd2db;transform:translateY(-4px)}
+  .toc-p{color:var(--muted);font-family:var(--serif);font-variant-numeric:tabular-nums}
+  .src{background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:40px 48px;margin-top:32px;font-size:14px}
+  .src h3{margin-top:0;font-family:var(--serif);font-size:18px}
   .excl{color:var(--warn)}
-  .disc{margin-top:14px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:10px}
+  .disc{margin-top:20px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:16px}
+  @media (max-width:768px){
+    .wrap{padding:24px 16px 64px}
+    .cover{padding:36px 28px 32px}
+    .cover h1{font-size:26px}
+    .slide{padding:28px 22px 40px}
+    .slide-head{flex-wrap:wrap}
+    .slide-head h2{font-size:19px}
+    .cols{column-count:1}
+    table{font-size:13px}
+    th,td{padding:10px}
+  }
   @media print{
     @page{size:A4 portrait;margin:12mm}
     body{background:#fff}
     .wrap{max-width:none;padding:0}
-    .cover{page-break-after:always}
+    .cover{page-break-after:always;border-radius:0}
     .slide,.src{break-inside:avoid;page-break-inside:avoid;border-radius:0;margin-bottom:10mm}
     .slide{page-break-after:always}
     .pagenum{position:static;text-align:right;margin-top:8mm}
+    tbody tr:hover{background:transparent}
   }
 </style></head>
 <body><div class="wrap">
   <div class="cover">
     <h1>${esc(dsl.meta.title)}</h1>
-    <div class="meta">分析窗口 ${esc(dsl.meta.window.from)} ~ ${esc(dsl.meta.window.to)} · 生成于 ${esc(dsl.meta.generatedAt)} · 品牌 ${esc(dsl.meta.brand.name)}</div>
+    <div class="meta"><b>${esc(dsl.meta.brand.name)}</b>　·　分析窗口 ${esc(dsl.meta.window.from)} ~ ${esc(dsl.meta.window.to)}　·　生成于 ${esc(dsl.meta.generatedAt.slice(0, 10))}</div>
     ${dsl.meta.degraded ? `<div class="degraded">降级说明：${esc(dsl.meta.degraded.reason)}</div>` : ""}
   </div>
   ${pages}
@@ -412,12 +470,12 @@ export class RenderService implements IRenderService {
     switch (block.type) {
       case "text":
         return block.style === "caption"
-          ? `<p style="color:#5c636e;font-size:13px">${esc(block.content)}</p>`
+          ? `<p style="color:#5c636e;font-size:13px">${mdInline(block.content)}</p>`
           : block.style === "h2"
-            ? `<h3 style="font-size:17px">${esc(block.content)}</h3>`
-            : `<h3>${esc(block.content)}</h3>`;
+            ? `<h3 style="font-size:17px">${mdInline(block.content)}</h3>`
+            : `<h3>${mdInline(block.content)}</h3>`;
       case "bullets":
-        return `<ul>${block.items.map((i) => `<li>${esc(i)}</li>`).join("")}</ul>`;
+        return `<ul>${block.items.map((i) => `<li>${mdInline(i)}</li>`).join("")}</ul>`;
       case "kpi": {
         const wide = block.items.length > 4;
         return `<div class="kpi${wide ? " kpi-wide" : ""}">${block.items
@@ -429,10 +487,14 @@ export class RenderService implements IRenderService {
           )
           .join("")}</div>`;
       }
-      case "table":
-        return `<table><thead><tr>${block.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${block.rows
-          .map((r) => `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`)
-          .join("")}</tbody></table>${block.caption ? `<p style="color:#5c636e;font-size:12.5px">${esc(block.caption)}</p>` : ""}`;
+      case "table": {
+        // 宽表（≥6 列）包横向滚动容器，避免撑破页面宽度；窄表直接渲染
+        const wide = block.columns.length >= 6;
+        const table = `<table${wide ? ' class="table-wide"' : ""}><thead><tr>${block.columns.map((c) => `<th>${mdInline(c)}</th>`).join("")}</tr></thead><tbody>${block.rows
+          .map((r) => `<tr>${r.map((c) => `<td>${mdInline(c)}</td>`).join("")}</tr>`)
+          .join("")}</tbody></table>${block.caption ? `<p style="color:#5c636e;font-size:12.5px">${mdInline(block.caption)}</p>` : ""}`;
+        return wide ? `<div class="table-scroll">${table}</div>` : table;
+      }
       case "chart":
         return this.svgChart(block);
       case "image":
@@ -444,11 +506,11 @@ export class RenderService implements IRenderService {
           .map((p) => `<div class="ph"><b>${esc(p.label)}</b><div class="d">${esc(p.from)} ~ ${esc(p.to)}</div><ul>${p.items.map((i) => `<li>${esc(i)}</li>`).join("")}</ul></div>`)
           .join("")}</div>`;
       case "quote":
-        return `<blockquote style="border-left:3px solid #e3e6ea;margin:10px 0;padding-left:12px;color:#5c636e">${esc(block.text)}${
+        return `<blockquote style="border-left:3px solid #e3e6ea;margin:10px 0;padding-left:12px;color:#5c636e">${mdInline(block.text)}${
           block.attribution ? `<div style="font-size:12.5px">—— ${esc(block.attribution)}</div>` : ""
         }</blockquote>`;
       case "callout":
-        return `<div class="callout ${block.tone}">${esc(block.text)}</div>`;
+        return `<div class="callout ${block.tone}">${mdInline(block.text)}</div>`;
       case "matrix":
         return this.svgMatrix(block);
       default:

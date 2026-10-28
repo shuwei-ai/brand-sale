@@ -23,6 +23,9 @@ import type {
   KbStatsItem,
   LedgerEntry,
   PhaseListResponse,
+  PlatformBinding,
+  PlatformLoginResponse,
+  PlatformsResponse,
   SourceWithAuthz,
   UsageSummary,
 } from "./types.ts";
@@ -78,6 +81,9 @@ export const api = {
       body: { reason },
     }),
 
+  deleteJob: (jobId: string) =>
+    request<{ ok: true }>(apiPath(`/jobs/${encodeURIComponent(jobId)}`), { method: "DELETE" }),
+
   rerunPhase: (jobId: string, phase: PhaseName) =>
     request<{ ok: true; rerunFrom: PhaseName }>(
       apiPath(`/jobs/${encodeURIComponent(jobId)}/rerun/${encodeURIComponent(phase)}`),
@@ -111,6 +117,31 @@ export const api = {
 
   grantAuthz: (body: { sourceId: string; grantedBy?: string; days?: number; scopes?: string[] }) =>
     request<{ authzId: string }>(apiPath("/authz"), { method: "POST", body }),
+
+  /* ── 平台绑定（服务端无头扫码）─────────────────────────── */
+  /** 读绑定状态（不触发探测，秒回；`checkedAt` 是上次探测时间） */
+  platforms: (signal?: AbortSignal) =>
+    request<PlatformsResponse>(apiPath("/platforms"), { ...(signal ? { signal } : {}) }),
+
+  /** 真起浏览器探一遍登录态。串行七平台 → 十几秒到一分钟，调用方要给 loading */
+  checkPlatforms: (platforms: string[] = []) =>
+    request<PlatformsResponse>(apiPath("/platforms/check"), { method: "POST", body: { platforms } }),
+
+  startPlatformLogin: (platform: string) =>
+    request<PlatformLoginResponse>(apiPath(`/platforms/${encodeURIComponent(platform)}/login`), { method: "POST" }),
+
+  pollPlatformLogin: (sessionId: string) =>
+    request<PlatformLoginResponse>(apiPath(`/platforms/login/${encodeURIComponent(sessionId)}`)),
+
+  cancelPlatformLogin: (sessionId: string) =>
+    request<{ ok: boolean }>(apiPath(`/platforms/login/${encodeURIComponent(sessionId)}/cancel`), { method: "POST" }),
+
+  /** 手动导入 cookie（扫码被风控挡住时的兜底）。写入 profile 后探活，同步返回结果 */
+  setPlatformCookie: (platform: string, cookie: string) =>
+    request<{ ok: boolean; status: PlatformBinding }>(apiPath(`/platforms/${encodeURIComponent(platform)}/cookie`), {
+      method: "POST",
+      body: { cookie },
+    }),
 
   /* ── 知识库 ───────────────────────────────────────────── */
   kbStats: () => request<{ items: KbStatsItem[] }>(apiPath("/kb/stats")),

@@ -16,6 +16,9 @@ import {
   autoRepair,
   describeDepthPolicy,
   measureReportDepth,
+  planItemsFor,
+  planKeywordsFor,
+  taskPlanOf,
   validateReportDsl,
   type AgentCode,
   type Brief,
@@ -50,6 +53,7 @@ import { EvidenceRegistry } from "./evidence.ts";
 import { ToolRegistry, type ToolCallContext, type ToolCallRecord, type ToolDeps } from "./tools.ts";
 import { PLATFORM_DIGEST_TOOL_NAME, PHASE_TOOL_HINT, registerAllTools } from "./tool-impls.ts";
 import { SYSTEM_PROMPTS, contextBlock } from "./prompts.ts";
+import { enforceRequirementCoverage, extractStarLeads, planSearchQueries, taskPlanPromptSection, webSearchRows } from "./task-plan.ts";
 import {
   BriefSchema,
   BudgetSchema,
@@ -94,6 +98,28 @@ type StrategyOutcome =
 /** 从上游产物里取人选结果（报告阶段给它标"来源=本地报价库、平台账号未核验"用） */
 const creatorsOf = (input: PhaseRunInput): CreatorOutput | undefined =>
   input.upstream.creator as CreatorOutput | undefined;
+
+/**
+ * 本次"为拆解条目额外做的那次联网检索"命中的正文（标题 + 摘要 + 站点拼接）。
+ *
+ * 只服务一条通道：**明星/名人候选的可溯源性**。姓名逐字比对、不做模糊匹配 ——
+ * 明星既不在平台采集账号池、也不在本地报价库，公开报道里出现过的姓名是唯一
+ * 既真实又与本次话题相关的证据；但它只能证明"这个人被报道过"，
+ * 不能证明粉丝量与报价，所以走这条通道的候选会被强制归零这两个数字。
+ */
+/**
+ * 拆解检索（`web_search_plan*`）命中的行。
+ *
+ * ⚠️ 字段名是 **`results` 不是 `rows`**：`tool-impls.ts` 的 web_search 返回
+ * `{ result: { query, count, results } }`，而适配器内部那层才叫 `rows`。
+ * 2026-10-27 之前这里读的是 `rows` → 永远拿到空数组 → "公开报道可溯源"通道**实际从未生效**
+ * （明星候选一律被判成幻觉剔除），且没有任何报错，只有一份看不见的空字符串。
+ * 归一化逻辑放在 `task-plan.ts`（纯函数、有用例），这里只做调用。
+ */
+const publicMentions = (prefetched: Record<string, unknown>): string =>
+  webSearchRows(prefetched)
+    .map((r) => [r["title"], r["snippet"], r["summary"], r["siteName"]].filter((x) => typeof x === "string").join(" "))
+    .join("\n");
 
 const ARTIFACT_KIND_BY_PHASE: Record<PhaseName, string> = {
   intake: "brief",
@@ -317,14 +343,23 @@ const SCHEMA_BY_PHASE = {
  *   - 给所有阶段一个很大的值 → 短任务（intake）也会按大预算计费与等待。
  * 一份 13 页、含真表格与图表的 DSL 约 40–60KB JSON（≈2 万+ token），
  * 所以 report 必须显著高于其它阶段；具体值可由 BM_REPORT_MAX_TOKENS 覆盖。
+ *
+ * 🔴 2026-10-27 全线上调（原 4096/8192/10240）。原因：接入强制 adaptive thinking 的端点后，
+ *   **reasoning token 与正文共用这份预算**，而且 Pi 循环是**逐轮**套用本值
+ *   （见 tryPiAgent：`model.maxTokens = phaseMaxTokens`）。真机证据
+ *   `job_0mvqi2ippie9919kjjn`：intel 阶段 Pi 循环 6 次工具往返后停在
+ *   `assistant[thinking+4×toolCall]`，日志 `Agent 循环未产出任何文本`；
+ *   随后的直连兜底两次 `output_tokens=0` —— 思考把 8192 烧光、正文一个字没出。
+ *   同一份任务在 report 上也是这个形态。所以“只把 report 调大”是不够的。
  */
 const MAX_TOKENS_BY_PHASE: Partial<Record<PhaseName, number>> = {
-  intake: 4_096,
-  intel: 8_192,
-  creator: 8_192,
-  playbook: 10_240,
-  budget: 8_192,
-  report: 32_768,
+  // 这几个阶段要产出结构化 JSON + 走多轮工具往返，思考预算单独算，故统一给 64K 上限。
+  intake: 65_536,
+  intel: 65_536,
+  creator: 65_536,
+  playbook: 65_536,
+  budget: 65_536,
+  report: 32_768, // 实际不生效：maxTokensFor() 对 report 走 config.report.maxTokens
 };
 
 /**
@@ -596,7 +631,20 @@ export class AgentPack {
                 degradedKeys,
               )
             : phase === "creator"
-              ? this.enforceRealCreators(attempt.value as CreatorOutput, tc, prefetched, degradedKeys)
+              ? /* 线索**最后**挂：`enforceRealCreators` 会重建候选人数组、`enforceCreatorPlan`
+                 * 会补 requirementCoverage，两者都只认 candidates，挂早了会被覆盖掉。
+                 * 它同时也是"模型彻底没给出明星"时的唯一兜底 —— 检索回来的官宣报道照样进报告。 */
+                this.attachStarLeads(
+                  this.enforceCreatorPlan(
+                    this.enforceRealCreators(attempt.value as CreatorOutput, tc, prefetched, degradedKeys),
+                    input,
+                    tc,
+                    prefetched,
+                    degradedKeys,
+                  ),
+                  prefetched,
+                  input.job.spec.brief.brandIds ?? [],
+                )
               : attempt.value;
         // 证据集落成 job 产物（重放安全：只写第一份，审计要的是"这次采到了什么"）
         this.persistEvidence(tc.jobId);
@@ -808,7 +856,13 @@ export class AgentPack {
         ?.map((c) => c.talent?.talentId)
         .filter((id): id is string => Boolean(id)) ?? [];
     const accounts = aggregatePlatformAccounts(this.evidence.list(tc.jobId));
-    const { value: pruned, dropped } = pruneUnverifiableCreators(value, { talentIds: realTalentIds, accounts });
+    const { value: pruned, dropped } = pruneUnverifiableCreators(value, {
+      talentIds: realTalentIds,
+      accounts,
+      /* 第三条可溯源通道（只对"公开报道里出现过该姓名"的候选放行）：
+       * 明星既不在平台采集账号池、也不在报价库，前两条路走不通时这是唯一有据的来源。 */
+      publicText: publicMentions(prefetched),
+    });
 
     /* 闸门只做"剔除"是不够的。剔完仍可能一条真实账号都不剩（模型压根没用上游给的
      * 平台账号池，直接写占位），而池子明明躺着几十个真实账号。所以这里必须补上
@@ -833,6 +887,73 @@ export class AgentPack {
     });
     console.warn(`[agent-pack] creator 剔除不可溯源人选 ${dropped.length} 条：${dropped.map((d) => d.nickname).join("、").slice(0, 200)}`);
     return completed;
+  }
+
+  /**
+   * 拆解条目在人选阶段的落地校验（规则见 `task-plan.ts`，这里只负责接线）。
+   *
+   * 与 `enforceRealCreators` **串联而不是合并**：前者删掉不可溯源的人，后者核对
+   * "每条要求有没有下落"。顺序不能反 —— 先核对再剔除，会让"明星候选已满足"的
+   * 结论建立在马上要被删掉的人身上。
+   *
+   * 两类缺口都进 degradedKeys（读者能在阶段卡片上看到"这条没做到"），而不是只打日志：
+   * 用户明确提的要求没落实，属于产出缺陷，不属于数据可用性事实。
+   */
+  private enforceCreatorPlan(
+    value: CreatorOutput,
+    input: PhaseRunInput,
+    tc: ToolCallContext,
+    prefetched: Record<string, unknown>,
+    degradedKeys: string[],
+  ): CreatorOutput {
+    const plan = taskPlanOf(input.upstream.intake);
+    if (plan.length === 0) return value;
+
+    /* 可溯源姓名只认两处：本次采集到的平台账号、本地报价库候选。
+     * **不能**把产出里的候选人自己算进来 —— 那等于让模型自证。 */
+    const verifiable = new Set<string>();
+    for (const a of aggregatePlatformAccounts(this.evidence.list(tc.jobId))) verifiable.add(a.author);
+    const pricing = (unwrap(prefetched["pricing_query"]) as { candidates?: { talent?: { nickname?: string } }[] } | undefined)?.candidates ?? [];
+    for (const c of pricing) if (c.talent?.nickname) verifiable.add(c.talent.nickname);
+
+    const { value: covered, gaps } = enforceRequirementCoverage(value, plan, {
+      verifiable,
+      publicText: publicMentions(prefetched),
+    });
+    if (gaps.length === 0) return covered;
+
+    degradedKeys.push(...gaps);
+    tc.emit({
+      type: "data.degraded",
+      seq: 0,
+      at: new Date().toISOString(),
+      source: "creator",
+      missing: gaps.slice(0, 5),
+      reason: "requirement_gap",
+    });
+    for (const g of gaps) console.warn(`[agent-pack] ${g}`);
+    return covered;
+  }
+
+  /**
+   * 把「公开报道里的代言/大使线索」挂进 creator 产物（机械摘录，纯数据搬运）。
+   *
+   * 存在的理由：模型这条路只要超时/截断就会落到 `synthCreators`，而兜底只会从平台账号池
+   * 造人 —— 用户明明要求"达人候选里要有明星"，报告里却连一条痕迹都没有，看起来像系统没管。
+   * 而"这个牌子请过谁"的官宣报道其实已经在证据表里（creator 阶段按 `{品牌} 代言人` 检索过）。
+   * 这里把它们原样交给下游：只给标题/站点/链接，不猜姓名、不补粉丝量、不给报价。
+   */
+  private attachStarLeads(
+    value: CreatorOutput,
+    prefetched: Record<string, unknown>,
+    brands: readonly string[],
+  ): CreatorOutput {
+    const leads = extractStarLeads(webSearchRows(prefetched), brands);
+    if (leads.length === 0) return value;
+    console.info(
+      `[agent-pack] creator 公开报道线索 ${leads.length} 条（不猜姓名，仅标题+链接）：${leads.slice(0, 3).map((l) => l.title).join(" / ")}`,
+    );
+    return { ...value, starLeads: leads };
   }
 
   /**
@@ -940,6 +1061,9 @@ export class AgentPack {
     const brief = input.job.spec.brief;
     const intel = input.upstream.intel as IntelOutput | undefined;
     const playbookUp = input.upstream.playbook as PlaybookOutput | undefined;
+    /* 拆解条目（intake 产出）—— 决定"要不要为用户的额外要求多取一次数"。
+     * 只在有对应阶段条目时才有值，没要求的任务与原来完全一致（不多花一次检索费用）。 */
+    const plan = taskPlanOf(input.upstream.intake);
 
     const run = async (key: string, tool: string, params: Record<string, unknown>): Promise<void> => {
       try {
@@ -987,8 +1111,11 @@ export class AgentPack {
          *   mock 模式 → 全离线可复现，不发任何外部请求（E2E 用例靠这条保证不联网）。
          * count 走 config（BM_WEB_SEARCH_COUNT），不在代码里写死，避免两处漂移。 */
         if (this.deps.config.webSearch.prefetch && !this.deps.gateway.mocked && this.registry.get("web_search")) {
+          /* 拆解条目带来的检索词直接拼进行业级 query（**不新增调用次数**）：
+           * 用户说「要看明星代言」，多一个词就能把代言类报道捞回来，而不用再付一次检索费。 */
+          const planKw = planKeywordsFor(plan, "intel");
           await run("web_search", "web_search", {
-            query: `${brief.industry} ${brief.category} 市场趋势 竞品动态 ${brief.window.to.slice(0, 4)}`,
+            query: `${brief.industry} ${brief.category} 市场趋势 竞品动态 ${brief.window.to.slice(0, 4)}${planKw.length > 0 ? ` ${planKw.join(" ")}` : ""}`,
             count: this.deps.config.webSearch.defaultCount,
           });
           /* 品牌级检索（一次一品牌，落在 brief 声明的竞品上）。
@@ -1041,6 +1168,29 @@ export class AgentPack {
             engagementRate: c.talent.engagementRate,
             category: c.talent.category,
           });
+        }
+
+        /* 拆解条目要求「必须包含明星/名人」这类内容时，平台采集的关键词永远是类目词 ——
+         * 「精华」搜不到"谁在代言"，于是人选阶段永远只有达人、没有明星，用户的这条要求
+         * 在整条链路上无人负责。这里**额外**联网检索：
+         *   ① 命中结果进提示词，CT 才有"公开报道"可依据；
+         *   ② 同一份正文用于"公开报道可溯源"通道（见 pruneUnverifiableCreators），
+         *      否则模型写对了明星名字也会被剔除闸当成幻觉删掉。
+         * 明星条目走 **每品牌一条** 的模板（`{品牌} 代言人`）：拼成一条大查询会退化成
+         * 类目测评、0 个姓名 —— 这是 2026-10-27 真机实测的差别，见 planSearchQueries 注释。 */
+        const creatorPlan = planItemsFor(plan, "creator");
+        const planQueries = planSearchQueries(plan, "creator", { brandIds: brief.brandIds, category: brief.category });
+        if (planQueries.length > 0 && this.deps.config.webSearch.prefetch && !this.deps.gateway.mocked && this.registry.get("web_search")) {
+          /* 这些检索是**计费**的，必须留痕：看不到就无法解释"为什么这次多花了 N 次检索"，
+           * 也无法证明拆解条目真的驱动了取数（否则只能靠模型自己说见过 P1）。 */
+          for (const [i, q] of planQueries.entries()) {
+            /* 首条沿用 `web_search_plan`（历史台账/测试都按这个名字找），其余加后缀 */
+            const key = i === 0 ? "web_search_plan" : `web_search_plan_${i + 1}`;
+            console.info(`[agent-pack] creator 拆解检索（${creatorPlan.map((x) => x.id).join(",")}）：${q}`);
+            await run(key, "web_search", { query: q, count: this.deps.config.webSearch.defaultCount });
+          }
+        } else if (planItemsFor(plan, "creator").length > 0) {
+          console.info("[agent-pack] creator 有拆解条目，但未追加联网检索（无关键词 / 未开启 BM_WEB_SEARCH_PREFETCH / 工具未装配）");
         }
 
         /* 真实采集账号 → 候选人池。
@@ -1828,11 +1978,37 @@ ${describeDepthPolicy(policy)}`;
      *   工具数据 —— 本次实测取回的，带来源与分级；
      *   上游产物 —— 前序阶段的结论，只可引用不可改写。
      * 之前吃过亏：Brief 没进提示词，模型拿不到输入，只能对着 Schema 全填 null；
-     * 而"无来源数字写 null"这条合规指令又把用户输入的预算/权重一起清掉了。 */
+     * 而"无来源数字写 null"这条合规指令又把用户输入的预算/权重一起清掉了。
+     *
+     * `notes` 单独成段、且从事实块里摘出去：它是"用户想让你做的事"，不是
+     * "客户已确认的事实"。原来它跟着 Brief 一起以「事实基准，直接采用」的名义喂进去，
+     * 等于把用户自由文本抬到与预算/时间窗同级的事实地位 —— 而它既没有 citation，
+     * 也无法被 R6/R13 校验，是一条绕过反造假闸的旁路。 */
+    const { notes: briefNotes, ...briefFacts } = input.job.spec.brief;
+    /* 任务拆解只对下游阶段有意义：intake 自己就是拆解者（它拿到的是原始 notes）。 */
+    const plan = taskPlanOf(input.upstream.intake);
+    const planSection = phase === "intake" ? "" : taskPlanPromptSection(plan, phase);
     const sections = [
       `【当前阶段】${phase}（${agent}）`,
       `【阶段作业指引】${PHASE_TOOL_HINT[phase]}`,
-      `【客户输入 Brief（事实基准，直接采用）】\n${JSON.stringify(input.job.spec.brief, null, 2)}`,
+      `【客户输入 Brief（结构化字段 = 事实基准，直接采用）】\n${JSON.stringify(briefFacts, null, 2)}`,
+      ...(briefNotes
+        ? [
+            `【用户补充说明（notes · 意图与约束，不是事实数据）】\n${briefNotes}`,
+          ]
+        : []),
+      /* ⚠️ 这段"规则"必须**单独成段**，不能接在 notes 后面。
+       * 接在一起时模型把它当成用户说的话：真机 `job_0mvqifcw39k8sy4r6jc` 的 taskPlan 里
+       * 真出现了 need=「其中的数字、人名、事件一律不得当作数据引用」这种条目 ——
+       * 凭空多出两条"用户要求"，下游还得逐条回应。它是对**输出**的约束，不是待拆解的诉求。 */
+      ...(briefNotes
+        ? [
+            `【处理上面这段说明的规则（对输出的约束，**不是**待拆解的用户诉求）】\n` +
+              `这是用户想让你**做到**的事，不是已核实的结论。其中的数字、人名、事件一律不得当作数据引用；` +
+              `要写进结论就必须自己取数并带 citation，取不到就写"无数据"。`,
+          ]
+        : []),
+      ...(planSection ? [planSection] : []),
       `【输出结构模板（字段名必须完全一致，不要增删改字段名）】\n${schema.skeleton}`,
       `【可调用工具】${this.registry.list().filter((t) => t.policy.allowedAgents.includes(agent)).map((t) => `${t.policy.name}(${t.description})`).join("\n- ")}`,
       `【可用数据源清单（唯一合法的来源集合）】\n${this.renderCatalog(catalog)}`,
@@ -1869,6 +2045,14 @@ ${describeDepthPolicy(policy)}`;
     if (phase === "report") {
       sections.push(`【颗粒度下限 · 违反即需要重做】\n${describeDepthPolicy(policy)}`);
     }
+    if (phase === "intake") {
+      sections.push(`【本阶段额外要求 · 任务拆解】
+必须显式输出 taskPlan 数组（没有额外要求就写 []，但**字段不能省**）：
+把「用户补充说明」里每条可执行诉求拆成 { id, need, phase, requirement, keywords? }。
+need 必须是**用户原话**（逐字摘录）。⚠️「处理上面这段说明的规则」那段是**输出约束**，
+不是用户说的话，**不要**为它拆条目（例如「数字不得当作数据引用」「取不到写无数据」都不是需求）。
+漏写这个字段等于没有拆解，下游六个阶段会完全无视用户的要求。`);
+    }
     return sections.join("\n\n");
   }
 
@@ -1900,10 +2084,25 @@ ${describeDepthPolicy(policy)}`;
       case "intake": {
         const v = prefetched["validate_brief"] as { ok?: boolean; issues?: string[] } | undefined;
         const auth = prefetched["resolve_authorization"] as { usableSources?: BriefAuth["usable"]; blockedSources?: BriefAuth["blocked"] } | undefined;
+        /* 兜底合成**不能**把「补充说明」丢掉：没有模型就没有真正的拆解能力，但把它
+         * 整条塞进 report 阶段、要求"必须明确回应"仍然是有意义的降级 —— 否则这条
+         * 用户要求会在降级路径上彻底消失，而报告看起来一切正常。
+         * 这条兜底条目**只复述原话**，不替用户编造诉求。 */
+        const notes = brief.notes?.trim();
         return {
           brief,
           authorization: { usableSources: auth?.usableSources ?? [], blockedSources: auth?.blockedSources ?? [] },
           clarifications: v?.ok === false ? (v.issues ?? []) : [],
+          taskPlan: notes
+            ? [
+                {
+                  id: "P1",
+                  need: notes.slice(0, 200),
+                  phase: "report" as const,
+                  requirement: "在报告中明确回应这条补充说明：能落地的写进对应页，做不到就如实写「本轮未取得」，不得忽略",
+                },
+              ]
+            : [],
           confidence: asFallback ? 0.4 : 0.9,
         };
       }
