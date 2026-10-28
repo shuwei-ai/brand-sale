@@ -58,6 +58,37 @@ const IMAGE_REF_RE = /^(https:\/\/|data:image\/[a-z0-9.+-]+;base64,)/i;
 
 const esc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+/** 从 URL 提取可读的短标签：域名（去协议、去 www、去末尾斜杠），过长则截断 */
+const urlLabel = (url: string): string => {
+  let label = url.replace(/^https?:\/\//i, "").replace(/^www\./i, "").replace(/\/+$/, "");
+  const q = label.indexOf("/");
+  if (q >= 0) label = label.slice(0, q); // 只留 host
+  return label.length > 28 ? `${label.slice(0, 28)}…` : label;
+};
+
+/**
+ * 把正文里的裸 URL 转成可点击超链接，显示为简短域名。
+ *
+ * 为什么必须有：合成路径与公众人物章节里，模型会把「站点名 · https://长串URL ；…」当普通文本
+ * 写进单元格。渲染层原样转义后，这些 URL 占掉整列一半以上的宽度，把「品牌头衔」「可用性」等
+ * 该被读的中文列挤成逐字竖排。把 URL 缩成域名链接后，来源列回归「站点名 + 可点短链」的形态。
+ *
+ * 边界：**只认 http(s):// 开头的绝对地址**（javascript:/file:/相对路径一律不动）；
+ * 实现上先用占位符把 URL 摘出、再转义其余文本、最后还原，故这条通道不可能注入标签。
+ */
+const linkify = (s: string): string => {
+  const urls: string[] = [];
+  const masked = s.replace(/https?:\/\/[^\s，。；、（）()<>"'‘’“”]+/gi, (url) => {
+    urls.push(url);
+    return `\u0000${urls.length - 1}\u0000`;
+  });
+  const escaped = esc(masked);
+  return escaped.replace(/\u0000(\d+)\u0000/g, (_m, i) => {
+    const url = urls[Number(i)]!;
+    return `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(urlLabel(url))}</a>`;
+  });
+};
+
 /**
  * 行内 Markdown（只支持 `**加粗**`）→ HTML。
  *
@@ -67,9 +98,9 @@ const esc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;"
  * 最需要被信任的段落里时，读起来像乱码。
  *
  * 边界：**只认 `**`**。单个 `*`/`_` 在中文正文里（`3*4`、`foo_bar`）太容易误伤，不支持；
- * 且**先转义再替换**，所以这条通道不可能注入标签。
+ * 且**先转义再替换**，所以这条通道不可能注入标签。URL 由 linkify 先行处理，二者互不冲突。
  */
-const mdInline = (s: string): string => esc(s).replace(/\*\*([^*<>]{1,160}?)\*\*/g, "<strong>$1</strong>");
+const mdInline = (s: string): string => linkify(s).replace(/\*\*([^*<>]{1,160}?)\*\*/g, "<strong>$1</strong>");
 const fmt = (n: number): string => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/\.?0+$/, ""));
 
 export class RenderService implements IRenderService {
@@ -376,6 +407,7 @@ export class RenderService implements IRenderService {
   .table-scroll tr:first-child th{border-top:none}
   .table-wide td{white-space:normal;word-break:break-word}
   .table-wide th{white-space:nowrap}
+  td.nowrap,.table-wide td.nowrap{white-space:nowrap}
   .kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:16px;margin:20px 0}
   .kpi .card{border:1px solid var(--line);border-radius:14px;padding:18px 20px;background:#fbfcfd}
   .kpi .card .l{color:var(--muted);font-size:13px;letter-spacing:.02em}
@@ -490,8 +522,11 @@ export class RenderService implements IRenderService {
       case "table": {
         // 宽表（≥6 列）包横向滚动容器，避免撑破页面宽度；窄表直接渲染
         const wide = block.columns.length >= 6;
+        // 短单元格（≤4 字，且不含链接）加 nowrap，避免「姓名」「置信度」这类窄列被拆成竖排
+        const cell = (c: string): string =>
+          `<td${/^.{1,4}$/.test(c) && !/https?:/.test(c) ? ' class="nowrap"' : ""}>${mdInline(c)}</td>`;
         const table = `<table${wide ? ' class="table-wide"' : ""}><thead><tr>${block.columns.map((c) => `<th>${mdInline(c)}</th>`).join("")}</tr></thead><tbody>${block.rows
-          .map((r) => `<tr>${r.map((c) => `<td>${mdInline(c)}</td>`).join("")}</tr>`)
+          .map((r) => `<tr>${r.map(cell).join("")}</tr>`)
           .join("")}</tbody></table>${block.caption ? `<p style="color:#5c636e;font-size:12.5px">${mdInline(block.caption)}</p>` : ""}`;
         return wide ? `<div class="table-scroll">${table}</div>` : table;
       }

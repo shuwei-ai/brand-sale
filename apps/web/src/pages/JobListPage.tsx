@@ -15,6 +15,24 @@ const clock = (iso: string): string => {
 
 const pct = (job: JobRecord): number => Math.round((job.progress?.percent ?? 0) * 100);
 
+/** 执行时长：已完成用 finishedAt，进行中实时累计到当前；缺起点则显示占位 */
+const duration = (job: JobRecord): string => {
+  const start = new Date(job.createdAt).getTime();
+  if (Number.isNaN(start)) return "—";
+  const running = job.status === "running" || job.status === "queued";
+  const endRaw = running ? undefined : job.finishedAt;
+  const end = endRaw ? new Date(endRaw).getTime() : Date.now();
+  if (Number.isNaN(end) || end < start) return "—";
+  const ms = end - start;
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h} 小时 ${m} 分`;
+  if (m > 0) return `${m} 分 ${sec} 秒`;
+  return `${sec} 秒`;
+};
+
 export function JobListPage() {
   const { message } = App.useApp();
   const navigate = useNavigate();
@@ -107,6 +125,19 @@ export function JobListPage() {
             —
           </Typography.Text>
         ),
+    },
+    {
+      title: "执行时长",
+      width: 110,
+      render: (_: unknown, row) => {
+        const running = row.status === "running" || row.status === "queued";
+        return (
+          <Typography.Text style={{ fontSize: 12 }} type={running ? "secondary" : undefined}>
+            {duration(row)}
+            {running ? " · 进行中" : ""}
+          </Typography.Text>
+        );
+      },
     },
     { title: "创建时间", dataIndex: "createdAt", width: 180, render: (v: string) => clock(v) },
     {
