@@ -13,9 +13,27 @@
  */
 
 const STORAGE_KEY = "bm_token";
+const USER_KEY = "bm_user";
 
 /** 开发态默认令牌，与网关 `t.<tenantId>.<userId>` 约定一致 */
 export const DEFAULT_TOKEN = "t.tenant_demo.u_demo";
+
+/** 登录成功后本地缓存的用户信息（仅用于顶栏展示，真正的鉴权在网关上做） */
+export interface LoggedInUser {
+  userId: string;
+  tenantId: string;
+  nickname: string | null;
+  openid: string;
+}
+
+const readUser = (): LoggedInUser | null => {
+  try {
+    const raw = localStorage.getItem(USER_KEY);
+    return raw ? (JSON.parse(raw) as LoggedInUser) : null;
+  } catch {
+    return null;
+  }
+};
 
 const read = (): string => {
   try {
@@ -27,7 +45,12 @@ const read = (): string => {
 };
 
 let token = read();
+let user = readUser();
 const listeners = new Set<() => void>();
+
+const notify = () => {
+  for (const l of listeners) l();
+};
 
 export const getToken = (): string => token;
 
@@ -40,8 +63,34 @@ export const setToken = (next: string): void => {
   } catch {
     /* 忽略：存不下也不影响本次会话 */
   }
-  for (const l of listeners) l();
+  notify();
 };
+
+/** 登录成功：写入 token 与用户信息，并广播 */
+export const login = (nextToken: string, u: LoggedInUser): void => {
+  token = nextToken.trim();
+  user = u;
+  try {
+    localStorage.setItem(STORAGE_KEY, token);
+    localStorage.setItem(USER_KEY, JSON.stringify(u));
+  } catch {
+    /* 忽略 */
+  }
+  notify();
+};
+
+/** 登出：清掉用户信息，token 退回默认令牌 */
+export const logout = (): void => {
+  user = null;
+  try {
+    localStorage.removeItem(USER_KEY);
+  } catch {
+    /* 忽略 */
+  }
+  notify();
+};
+
+export const getLoggedInUser = (): LoggedInUser | null => user;
 
 export const subscribeToken = (listener: () => void): (() => void) => {
   listeners.add(listener);

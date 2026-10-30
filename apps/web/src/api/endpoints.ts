@@ -11,6 +11,10 @@ import { apiPath, request } from "./client.ts";
 import type {
   ArtifactListItem,
   AuditResponse,
+  AuthCompleteResponse,
+  AuthSessionResponse,
+  AuthSessionStatusResponse,
+  AuthUsersResponse,
   AuthzRecord,
   BriefParseResponse,
   CreateJobResponse,
@@ -182,4 +186,25 @@ export const api = {
 
   /* ── 审计 ─────────────────────────────────────────────── */
   audit: (limit = 50) => request<AuditResponse>(`${apiPath("/audit")}?limit=${limit}`),
+
+  /* ── 扫码登录（DreamAuth）─────────────────────────────── */
+  /** 创建扫码会话（无鉴权） */
+  authCreateSession: () =>
+    request<AuthSessionResponse>(apiPath("/auth/session"), { method: "POST", body: {} }),
+
+  /** 轮询会话状态（无鉴权） */
+  authSessionStatus: (sessionNo: string, signal?: AbortSignal) =>
+    request<AuthSessionStatusResponse>(apiPath(`/auth/session/${encodeURIComponent(sessionNo)}`), {
+      ...(signal ? { signal } : {}),
+    }),
+
+  /** 取授权结果 + 映射账号 + 签发 token（无鉴权） */
+  authComplete: (sessionNo: string) =>
+    request<AuthCompleteResponse>(apiPath(`/auth/session/${encodeURIComponent(sessionNo)}/complete`), {
+      method: "POST",
+      body: {},
+    }),
+
+  /** 登录管理：当前租户的用户与会话记录（需鉴权） */
+  authUsers: () => request<AuthUsersResponse>(apiPath("/auth/users")),
 };

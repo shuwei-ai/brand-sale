@@ -303,6 +303,47 @@ export const MIGRATIONS: { id: number; name: string; sql: string }[] = [
     CREATE INDEX IF NOT EXISTS idx_chunks_embed_model ON kb_chunks(embed_model);
     `,
   },
+  {
+    /**
+     * 登录体系（DreamAuth 微信扫码登录）。
+     *
+     * `users` 表是**本地账号**：DreamAuth 扫码只返回 `openid`（第三方微信身份标识），
+     * 本系统用它把微信身份「钉」到自己的账号上，并签发自有 token（`t.<tenant>.<user>`，
+     * 与既有鉴权约定一致）。openid 只是外部身份引用，不是主键，也不参与业务鉴权。
+     *
+     * `login_sessions` 是扫码会话：网关调 DreamAuth 创建会话后在此登记，
+     * 前端轮询状态、取结果，成功后 upsert 一条 user、签发 token。
+     * 会话与 DreamAuth 侧的 `sessionNo` 一一对应，过期/消费状态在此镜像。
+     */
+    id: 5,
+    name: "auth-users-sessions",
+    sql: `
+    CREATE TABLE IF NOT EXISTS users (
+      user_id    TEXT PRIMARY KEY,
+      tenant_id  TEXT NOT NULL,
+      openid     TEXT NOT NULL,
+      nickname   TEXT,
+      avatar     TEXT,
+      created_at TEXT NOT NULL,
+      last_login_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_openid ON users(openid);
+    CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
+
+    CREATE TABLE IF NOT EXISTS login_sessions (
+      session_no  TEXT PRIMARY KEY,
+      tenant_id   TEXT NOT NULL,
+      status      INTEGER NOT NULL DEFAULT 1,
+      openid      TEXT,
+      nickname    TEXT,
+      avatar      TEXT,
+      expire_at   TEXT NOT NULL,
+      consumed_at TEXT,
+      created_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_login_sessions_tenant ON login_sessions(tenant_id);
+    `,
+  },
 ];
 
 export function openDb(sqlitePath: string): Db {

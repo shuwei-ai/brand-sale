@@ -758,6 +758,213 @@ export class AuthzRepo {
   }
 }
 
+/* ── 登录用户 ─────────────────────────────────────────── */
+
+export interface UserRow {
+  userId: string;
+  tenantId: string;
+  openid: string;
+  nickname: string | null;
+  avatar: string | null;
+  createdAt: string;
+  lastLoginAt: string | null;
+}
+
+export class UserRepo {
+  constructor(private db: Db) {}
+
+  /** 按 openid 找用户（openid 是 DreamAuth 侧稳定身份） */
+  findByOpenid(openid: string): UserRow | null {
+    const r = this.db.get<{
+      user_id: string;
+      tenant_id: string;
+      openid: string;
+      nickname: string | null;
+      avatar: string | null;
+      created_at: string;
+      last_login_at: string | null;
+    }>("SELECT * FROM users WHERE openid = ?", openid);
+    return r ? this.toUser(r) : null;
+  }
+
+  get(userId: string): UserRow | null {
+    const r = this.db.get<{
+      user_id: string;
+      tenant_id: string;
+      openid: string;
+      nickname: string | null;
+      avatar: string | null;
+      created_at: string;
+      last_login_at: string | null;
+    }>("SELECT * FROM users WHERE user_id = ?", userId);
+    return r ? this.toUser(r) : null;
+  }
+
+  /** upsert：同 openid 首次登录建号，重复登录刷新昵称/头像/最后登录时间 */
+  upsert(input: { userId: string; tenantId: string; openid: string; nickname?: string; avatar?: string }): UserRow {
+    const existing = this.findByOpenid(input.openid);
+    const at = nowIso();
+    if (existing) {
+      this.db.run(
+        `UPDATE users SET nickname = COALESCE(?, nickname), avatar = COALESCE(?, avatar), last_login_at = ? WHERE openid = ?`,
+        input.nickname ?? null,
+        input.avatar ?? null,
+        at,
+        input.openid,
+      );
+      return this.findByOpenid(input.openid)!;
+    }
+    this.db.run(
+      `INSERT INTO users (user_id, tenant_id, openid, nickname, avatar, created_at, last_login_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      input.userId,
+      input.tenantId,
+      input.openid,
+      input.nickname ?? null,
+      input.avatar ?? null,
+      at,
+      at,
+    );
+    return this.get(input.userId)!;
+  }
+
+  list(tenantId: string, limit = 100): UserRow[] {
+    return this.db
+      .all<{
+        user_id: string;
+        tenant_id: string;
+        openid: string;
+        nickname: string | null;
+        avatar: string | null;
+        created_at: string;
+        last_login_at: string | null;
+      }>("SELECT * FROM users WHERE tenant_id = ? ORDER BY last_login_at DESC LIMIT ?", tenantId, limit)
+      .map((r) => this.toUser(r));
+  }
+
+  private toUser(r: {
+    user_id: string;
+    tenant_id: string;
+    openid: string;
+    nickname: string | null;
+    avatar: string | null;
+    created_at: string;
+    last_login_at: string | null;
+  }): UserRow {
+    return {
+      userId: r.user_id,
+      tenantId: r.tenant_id,
+      openid: r.openid,
+      nickname: r.nickname,
+      avatar: r.avatar,
+      createdAt: r.created_at,
+      lastLoginAt: r.last_login_at,
+    };
+  }
+}
+
+/* ── 扫码登录会话 ─────────────────────────────────────── */
+
+export interface LoginSessionRow {
+  sessionNo: string;
+  tenantId: string;
+  status: number;
+  openid: string | null;
+  nickname: string | null;
+  avatar: string | null;
+  expireAt: string;
+  consumedAt: string | null;
+  createdAt: string;
+}
+
+export class LoginSessionRepo {
+  constructor(private db: Db) {}
+
+  create(input: { sessionNo: string; tenantId: string; expireAt: string }): LoginSessionRow {
+    this.db.run(
+      `INSERT INTO login_sessions (session_no, tenant_id, status, expire_at, created_at)
+       VALUES (?, ?, 1, ?, ?)`,
+      input.sessionNo,
+      input.tenantId,
+      input.expireAt,
+      nowIso(),
+    );
+    return this.get(input.sessionNo)!;
+  }
+
+  get(sessionNo: string): LoginSessionRow | null {
+    const r = this.db.get<{
+      session_no: string;
+      tenant_id: string;
+      status: number;
+      openid: string | null;
+      nickname: string | null;
+      avatar: string | null;
+      expire_at: string;
+      consumed_at: string | null;
+      created_at: string;
+    }>("SELECT * FROM login_sessions WHERE session_no = ?", sessionNo);
+    return r ? this.toRow(r) : null;
+  }
+
+  /** 标记会话状态（含授权结果与用户信息） */
+  update(sessionNo: string, patch: { status: number; openid?: string; nickname?: string; avatar?: string }): void {
+    this.db.run(
+      `UPDATE login_sessions SET status = ?, openid = COALESCE(?, openid), nickname = COALESCE(?, nickname), avatar = COALESCE(?, avatar) WHERE session_no = ?`,
+      patch.status,
+      patch.openid ?? null,
+      patch.nickname ?? null,
+      patch.avatar ?? null,
+      sessionNo,
+    );
+  }
+
+  /** 标记已消费 */
+  consume(sessionNo: string): void {
+    this.db.run("UPDATE login_sessions SET consumed_at = ? WHERE session_no = ?", nowIso(), sessionNo);
+  }
+
+  list(tenantId: string, limit = 100): LoginSessionRow[] {
+    return this.db
+      .all<{
+        session_no: string;
+        tenant_id: string;
+        status: number;
+        openid: string | null;
+        nickname: string | null;
+        avatar: string | null;
+        expire_at: string;
+        consumed_at: string | null;
+        created_at: string;
+      }>("SELECT * FROM login_sessions WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?", tenantId, limit)
+      .map((r) => this.toRow(r));
+  }
+
+  private toRow(r: {
+    session_no: string;
+    tenant_id: string;
+    status: number;
+    openid: string | null;
+    nickname: string | null;
+    avatar: string | null;
+    expire_at: string;
+    consumed_at: string | null;
+    created_at: string;
+  }): LoginSessionRow {
+    return {
+      sessionNo: r.session_no,
+      tenantId: r.tenant_id,
+      status: r.status,
+      openid: r.openid,
+      nickname: r.nickname,
+      avatar: r.avatar,
+      expireAt: r.expire_at,
+      consumedAt: r.consumed_at,
+      createdAt: r.created_at,
+    };
+  }
+}
+
 /* ── 外部缓存 ───────────────────────────────────────────── */
 
 export class CacheRepo {
@@ -795,6 +1002,8 @@ export class Repositories {
   readonly sources: SourceRepo;
   readonly authz: AuthzRepo;
   readonly cache: CacheRepo;
+  readonly users: UserRepo;
+  readonly loginSessions: LoginSessionRepo;
 
   constructor(public readonly db: Db) {
     this.jobs = new JobRepo(db);
@@ -808,6 +1017,8 @@ export class Repositories {
     this.sources = new SourceRepo(db);
     this.authz = new AuthzRepo(db);
     this.cache = new CacheRepo(db);
+    this.users = new UserRepo(db);
+    this.loginSessions = new LoginSessionRepo(db);
   }
 }
 

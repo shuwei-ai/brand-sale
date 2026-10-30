@@ -500,6 +500,30 @@ export interface Config {
     logLevel: "debug" | "info" | "warn" | "error";
   };
 
+  /**
+   * DreamAuth 微信扫码登录（第三方托管的开放平台）。
+   *
+   * 定位：可选的身份源。网关调 DreamAuth 的 Open API（创建扫码会话 → 轮询 →
+   * 取授权结果），拿到 `openid` 后映射成本系统的账号，再签发自有 token
+   * （`t.<tenant>.<user>`，与既有鉴权约定一致）。
+   *
+   * ⚠️ 这是**外部服务依赖**：登录链路依赖 DreamAuth 线上服务（默认域名
+   * `guangyingzhimeng.dpdns.org`）与微信小程序「DreamAuth」。与项目
+   * 「零外部服务依赖、全离线可跑」的原则相悖——所以默认 **disabled**，
+   * 未开启时 `/auth/*` 路由返回明确的「未启用」而不是静默降级。
+   * `accessKey`/`secretKey` 需先在 DreamAuth 小程序应用中心创建应用后获取。
+   */
+  dreamAuth: {
+    enabled: boolean;
+    /** Open API 基础地址（不含路径），默认指向 DreamAuth 生产域名 */
+    baseUrl: string;
+    accessKey: string;
+    /** 签名密钥，**只允许出现在后端**，绝不进前端/日志 */
+    secretKey: string;
+    /** 扫码会话默认有效期（秒），DreamAuth 侧硬上限 300 */
+    expireSeconds: number;
+  };
+
   /** 闸门异常时是否拒绝。**必须为 true**，仅测试可改。 */
   gateFailClosed: boolean;
 }
@@ -717,6 +741,14 @@ export function loadConfig(cwd: string = process.cwd(), overrides: Record<string
       logLevel: (str(get("BM_LOG_LEVEL"), "info") as Config["observability"]["logLevel"]) ?? "info",
     },
 
+    dreamAuth: {
+      enabled: bool(get("BM_DA_ENABLED"), false),
+      baseUrl: str(get("BM_DA_BASE_URL"), "https://guangyingzhimeng.dpdns.org/kite-hub").replace(/\/+$/, ""),
+      accessKey: str(get("BM_DA_ACCESS_KEY")),
+      secretKey: str(get("BM_DA_SECRET_KEY")),
+      expireSeconds: num(get("BM_DA_EXPIRE_SECONDS"), 300),
+    },
+
     gateFailClosed: bool(get("BM_GATE_FAIL_CLOSED"), true),
   };
 
@@ -738,6 +770,14 @@ export function assertConfigInvariants(c: Config): string[] {
   }
   if (c.webSearch.enabled && !c.webSearch.apiKey) {
     problems.push("BM_WEB_SEARCH_ENABLED=true 但 BM_WEB_SEARCH_API_KEY 为空：联网检索适配器与 web_search 工具都不会注册");
+  }
+
+  /* DreamAuth 扫码登录错配：开了开关却没配凭据，登录会必然失败 */
+  if (c.dreamAuth.enabled && (!c.dreamAuth.accessKey || !c.dreamAuth.secretKey)) {
+    problems.push(
+      "BM_DA_ENABLED=true 但 BM_DA_ACCESS_KEY / BM_DA_SECRET_KEY 为空：扫码登录无法签名调用 DreamAuth Open API。" +
+        "请先在 DreamAuth 小程序应用中心创建应用并填入凭据",
+    );
   }
 
   /* 平台采集链路的三道门。这里只**提示**、不阻断——collector 可能稍后才起，

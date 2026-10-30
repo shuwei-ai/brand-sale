@@ -1,16 +1,21 @@
-import { Layout, Menu, Space, Typography } from "antd";
+import { Layout, Menu, Space, Typography, Button, Dropdown } from "antd";
 import {
   ApartmentOutlined,
   DatabaseOutlined,
+  DownOutlined,
   FileTextOutlined,
   HomeOutlined,
   PlusSquareOutlined,
   QrcodeOutlined,
+  SafetyCertificateOutlined,
   UnorderedListOutlined,
+  UserOutlined,
 } from "@ant-design/icons";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { useSyncExternalStore } from "react";
 import { HealthBadge } from "./HealthBadge.tsx";
 import { TokenBox } from "./TokenBox.tsx";
+import { getLoggedInUser, logout, subscribeToken } from "../api/session.ts";
 
 const { Header, Sider, Content } = Layout;
 
@@ -21,6 +26,7 @@ const MENU = [
   { key: "/kb", icon: <DatabaseOutlined />, label: "知识库" },
   { key: "/governance", icon: <ApartmentOutlined />, label: "数据源与审计" },
   { key: "/platforms", icon: <QrcodeOutlined />, label: "平台绑定" },
+  { key: "/auth", icon: <SafetyCertificateOutlined />, label: "登录管理" },
 ];
 
 /** 侧栏高亮键：/jobs/xxx 详情页也要把「任务列表」点亮 */
@@ -31,12 +37,19 @@ function selectedKey(pathname: string): string {
   if (pathname.startsWith("/kb")) return "/kb";
   if (pathname.startsWith("/governance")) return "/governance";
   if (pathname.startsWith("/platforms")) return "/platforms";
+  if (pathname.startsWith("/auth")) return "/auth";
   return "/jobs/new";
 }
 
 export function AppShell() {
   const navigate = useNavigate();
   const { pathname } = useLocation();
+  const user = useSyncExternalStore(subscribeToken, getLoggedInUser, getLoggedInUser);
+
+  const doLogout = () => {
+    logout();
+    navigate("/login");
+  };
 
   return (
     <Layout style={{ minHeight: "100vh" }}>
@@ -55,6 +68,26 @@ export function AppShell() {
         <div style={{ flex: 1 }} />
         <HealthBadge />
         <TokenBox />
+        {user ? (
+          <Dropdown
+            menu={{
+              items: [
+                { key: "manage", label: "登录管理", icon: <SafetyCertificateOutlined />, onClick: () => navigate("/auth") },
+                { type: "divider" },
+                { key: "logout", label: "退出登录", onClick: doLogout },
+              ],
+            }}
+          >
+            <Button size="small" icon={<UserOutlined />}>
+              {user.nickname ?? "微信用户"}
+              <DownOutlined style={{ fontSize: 10, marginLeft: 6 }} />
+            </Button>
+          </Dropdown>
+        ) : (
+          <Button size="small" type="primary" onClick={() => navigate("/login")}>
+            登录
+          </Button>
+        )}
       </Header>
 
       <Layout>

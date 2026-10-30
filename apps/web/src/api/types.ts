@@ -228,3 +228,55 @@ export interface PlatformLoginResponse {
   ok: boolean;
   session: PlatformLoginSession;
 }
+
+/* ── 扫码登录（DreamAuth）────────────────────────────── */
+
+export interface AuthSessionResponse {
+  sessionNo: string;
+  scene: string;
+  /** data:image/png;base64,... */
+  qrcode: string;
+  expireAt: string;
+}
+
+export interface AuthSessionStatusResponse {
+  sessionNo: string;
+  /** 1 待扫 / 2 已扫待确认 / 3 已授权 / 4 取消 / 6 已消费 / 7 过期 */
+  status: number;
+  expireAt: string;
+}
+
+export interface AuthCompleteResponse {
+  token: string;
+  user: {
+    userId: string;
+    tenantId: string;
+    nickname: string | null;
+    openid: string;
+  };
+}
+
+export interface AuthUser {
+  userId: string;
+  tenantId: string;
+  openid: string;
+  nickname: string | null;
+  avatar: string | null;
+  createdAt: string;
+  lastLoginAt: string | null;
+}
+
+export interface AuthSessionRecord {
+  sessionNo: string;
+  status: number;
+  openid: string | null;
+  nickname: string | null;
+  createdAt: string;
+  consumedAt: string | null;
+  expireAt: string;
+}
+
+export interface AuthUsersResponse {
+  users: AuthUser[];
+  sessions: AuthSessionRecord[];
+}

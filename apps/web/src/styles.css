@@ -233,3 +233,133 @@ body {
     height: 280px;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   登录页（DreamAuth 微信扫码）
+   与控制台共用主题令牌；颜色经 --login-primary 注入，不写死第二份色值。
+   布局：居中卡片 + 二维码焦点区，扫码态用半透明遮罩反馈，避免元素抖动。
+   ═══════════════════════════════════════════════════════════════════ */
+
+.login {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 20px;
+  background:
+    radial-gradient(1200px 600px at 50% -10%, color-mix(in srgb, var(--login-primary) 10%, transparent), transparent 60%),
+    #f4f5fa;
+}
+
+.login-card {
+  width: min(100%, 400px);
+  background: #fff;
+  border: 1px solid #e7eaf1;
+  border-radius: 16px;
+  box-shadow: 0 20px 50px -20px rgba(25, 29, 39, 0.18);
+  overflow: hidden;
+}
+
+.login-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 24px 0;
+}
+
+.login-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: var(--login-primary);
+  color: #fff;
+  font-weight: 700;
+  font-size: 17px;
+}
+
+.login-brand {
+  display: block;
+  font-size: 15px;
+  line-height: 1.2;
+}
+
+.login-sub {
+  display: block;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.login-body {
+  padding: 22px 24px 24px;
+  text-align: center;
+}
+
+.login-qr-wrap {
+  position: relative;
+  width: 200px;
+  height: 200px;
+  margin: 0 auto 18px;
+}
+
+.login-qr {
+  width: 200px;
+  height: 200px;
+  border-radius: 12px;
+  border: 1px solid #e7eaf1;
+  display: block;
+  object-fit: contain;
+}
+
+.login-qr--placeholder {
+  display: grid;
+  place-items: center;
+  background: #fafbfe;
+}
+
+.login-qr-mask {
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #4b5364;
+  font-size: 13px;
+}
+
+.login-title {
+  margin: 0 0 6px;
+  font-size: 17px;
+  font-weight: 600;
+  color: #191d27;
+}
+
+.login-hint {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #8a92a6;
+}
+
+.login-actions {
+  margin-top: 18px;
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+
+.login-foot {
+  padding: 12px 24px 16px;
+  border-top: 1px solid #eef0f6;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: #8a92a6;
+  line-height: 1.5;
+}

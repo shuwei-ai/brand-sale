@@ -28,6 +28,7 @@ import { AppError, isAppError } from "@brandsale/contracts";
 import { MEDIA_CRAWLER_PLATFORM_META, MEDIA_CRAWLER_PLATFORMS } from "@brandsale/config";
 import { completeBriefDraft } from "@brandsale/agent-pack";
 import { createContainer, type Container } from "./container.ts";
+import { DreamAuthError } from "./dreamauth.ts";
 import { bootstrapHtml } from "./bootstrap.ts";
 import { resolveWebDist, serveStatic, webDistBuiltAt, type StaticMount } from "./static.ts";
 
@@ -73,6 +74,122 @@ function authenticate(req: IncomingMessage): TenantContext {
 
 /** 前端 SPA 的入口路径别名。这些路径一律吐 index.html（hash 路由只占用 #） */
 const SPA_ENTRY = new Set(["/", "/console", "/console/", "/index.html"]);
+
+/**
+ * 登录路由处理器（无鉴权）。
+ *
+ * 暴露三个端点，对应 DreamAuth 官方推荐的后端形态：
+ *   POST /auth/session                 创建扫码会话 → 下发 sessionNo + 二维码
+ *   GET  /auth/session/:sessionNo      轮询会话状态
+ *   POST /auth/session/:sessionNo/complete  取授权结果 → 映射本地账号 → 签发 token
+ *
+ * 安全边界：
+ *   - 这些端点不读任何业务数据，只驱动「本次扫码会话」的状态机；
+ *   - `sessionNo` 是后端 create 时生成、本地登记的唯一句柄，前端拿它只能
+ *     轮询/取这一个会话，跨会话需要另一个 sessionNo（不信任前端自造 id）；
+ *   - 签发 token 时用**本地会话表**登记的 tenantId（而非请求体），
+ *     防止前端捏造租户。
+ */
+async function handleAuthRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  container: Container,
+  path: string,
+  method: string,
+): Promise<void> {
+  const { dreamAuth, repos, config } = container;
+  const traceId = String(req.headers["x-trace-id"] ?? randomUUID());
+
+  // 未启用 DreamAuth 时，明确返回「未启用」而不是 404/500，避免前端误判
+  if (!dreamAuth.ready) {
+    return json(res, 503, {
+      error: {
+        code: "E-DREAMAUTH-DISABLED",
+        message: "扫码登录未启用：请配置 BM_DA_ENABLED + BM_DA_ACCESS_KEY + BM_DA_SECRET_KEY",
+        userMessage: "扫码登录未启用，请联系管理员配置 DreamAuth 凭据",
+        retryable: false,
+        traceId,
+      },
+    });
+  }
+
+  try {
+    // 创建扫码会话
+    if (path === `${API_PREFIX}/auth/session` && method === "POST") {
+      const body = (await readBody(req)) as { tenantId?: string; bizState?: string };
+      // 租户默认用演示租户（单租户部署）；将来多租户时由管理端指定
+      const tenantId = String(body.tenantId ?? "tenant_demo");
+      const bizState = String(body.bizState ?? `${tenantId}:${randomUUID().slice(0, 8)}`);
+
+      const created = await dreamAuth.createSession(bizState);
+      // 本地镜像一份会话，供 complete 时按 sessionNo 校验、映射账号
+      repos.loginSessions.create({ sessionNo: created.sessionNo, tenantId, expireAt: created.expireAt });
+      return json(res, 200, { sessionNo: created.sessionNo, scene: created.scene, qrcode: created.qrcode, expireAt: created.expireAt });
+    }
+
+    // 轮询状态
+    const statusRoute = new RegExp(`^${API_PREFIX}/auth/session/([^/]+)$`).exec(path);
+    if (statusRoute && method === "GET") {
+      const sessionNo = statusRoute[1]!;
+      const local = repos.loginSessions.get(sessionNo);
+      if (!local) {
+        return json(res, 404, { error: { code: "E-AUTH-002", message: "会话不存在", userMessage: "扫码会话不存在或已过期", retryable: false, traceId } });
+      }
+      // 优先用本地状态；本地尚未被授权（仍 1/2）时向 DreamAuth 查一次最新状态
+      let status = local.status;
+      if (status < 3) {
+        const remote = await dreamAuth.getStatus(sessionNo);
+        status = remote.status;
+        if (remote.status !== local.status) repos.loginSessions.update(sessionNo, { status: remote.status });
+      }
+      return json(res, 200, { sessionNo, status, expireAt: local.expireAt });
+    }
+
+    // 取授权结果 + 映射账号 + 签发 token
+    const completeRoute = new RegExp(`^${API_PREFIX}/auth/session/([^/]+)/complete$`).exec(path);
+    if (completeRoute && method === "POST") {
+      const sessionNo = completeRoute[1]!;
+      const local = repos.loginSessions.get(sessionNo);
+      if (!local) {
+        return json(res, 404, { error: { code: "E-AUTH-002", message: "会话不存在", userMessage: "扫码会话不存在或已过期", retryable: false, traceId } });
+      }
+      if (local.consumedAt) {
+        return json(res, 409, { error: { code: "E-AUTH-002", message: "会话已消费", userMessage: "该扫码会话已使用，请重新扫码", retryable: false, traceId } });
+      }
+
+      const result = await dreamAuth.getResult(sessionNo);
+      if (!result.openid) {
+        return json(res, 401, { error: { code: "E-AUTH-001", message: "未取得授权", userMessage: "尚未完成授权，请先扫码并确认", retryable: true, traceId } });
+      }
+
+      // 用 openid 作稳定身份，upsert 本地账号
+      const userId = `u_${result.openid.replace(/[^a-zA-Z0-9]/g, "").slice(-12) || randomUUID().slice(0, 8)}`;
+      const user = repos.users.upsert({
+        userId,
+        tenantId: local.tenantId,
+        openid: result.openid,
+        nickname: local.nickname ?? undefined,
+      });
+      repos.loginSessions.update(sessionNo, { status: 6, openid: result.openid });
+      repos.loginSessions.consume(sessionNo);
+
+      // 签发自有 token：与既有鉴权约定一致（t.<tenantId>.<userId>）
+      const token = `t.${user.tenantId}.${user.userId}`;
+      return json(res, 200, { token, user: { userId: user.userId, tenantId: user.tenantId, nickname: user.nickname, openid: user.openid } });
+    }
+
+    return json(res, 404, { error: { code: "E-SYS-500", message: `未知登录路由 ${method} ${path}`, retryable: false, traceId } });
+  } catch (e) {
+    if (e instanceof DreamAuthError) {
+      return json(res, 502, {
+        error: { code: e.code, message: e.message, userMessage: "扫码登录服务暂不可用，请稍后重试", retryable: true, traceId },
+      });
+    }
+    const err = e instanceof Error ? e : new Error(String(e));
+    if (isAppError(e)) return json(res, e.httpStatus, e.toApiError(traceId));
+    return json(res, 500, { error: { code: "E-SYS-500", message: err.message, retryable: true, traceId } });
+  }
+}
 
 export function createGateway(container: Container, web: StaticMount = resolveWebDist()) {
   const { orchestrator, repos, config } = container;
@@ -155,6 +272,19 @@ export function createGateway(container: Container, web: StaticMount = resolveWe
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html), "Cache-Control": "no-cache" });
         return res.end(html);
       }
+    }
+
+    /**
+     * 登录路由（在鉴权之前处理）：登录本身**不能**要求 Bearer token，
+     * 否则用户还没登录就被 401 拦死。这里只暴露无状态/仅依赖扫码会话的端点，
+     * 不触碰任何业务数据；扫码会话的凭据（sessionNo）由后端在 create 时生成并下发，
+     * 前端拿到它也只能驱动「这个扫码会话」的轮询与取结果，不能越权访问别的租户。
+     *
+     * 注意 `/auth/users`（登录管理，读当前租户的用户与会话）**不在**这里——
+     * 它需要 tenantId，走下方鉴权后的分支。
+     */
+    if (path.startsWith(`${API_PREFIX}/auth`) && path !== `${API_PREFIX}/auth/users`) {
+      return handleAuthRoute(req, res, container, path, method);
     }
 
     let ctx: TenantContext;
@@ -270,6 +400,30 @@ export function createGateway(container: Container, web: StaticMount = resolveWe
         if (sub === "stream") {
           return streamJob(res, req, container, jobId);
         }
+      }
+
+      /* ── 登录管理（需鉴权：按当前租户返回用户与会话记录）── */
+
+      if (path === `${API_PREFIX}/auth/users` && method === "GET") {
+        const users = repos.users.list(ctx.tenantId).map((u) => ({
+          userId: u.userId,
+          tenantId: u.tenantId,
+          openid: u.openid,
+          nickname: u.nickname,
+          avatar: u.avatar,
+          createdAt: u.createdAt,
+          lastLoginAt: u.lastLoginAt,
+        }));
+        const sessions = repos.loginSessions.list(ctx.tenantId).map((s) => ({
+          sessionNo: s.sessionNo,
+          status: s.status,
+          openid: s.openid,
+          nickname: s.nickname,
+          createdAt: s.createdAt,
+          consumedAt: s.consumedAt,
+          expireAt: s.expireAt,
+        }));
+        return json(res, 200, { users, sessions });
       }
 
       /* ── 数据源与授权 ─────────────────────────────────── */

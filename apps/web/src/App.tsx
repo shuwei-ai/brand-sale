@@ -2,6 +2,8 @@ import { HashRouter, Navigate, Route, Routes, useNavigate } from "react-router-d
 import { Button, Result } from "antd";
 import { AppShell } from "./components/AppShell.tsx";
 import { LandingPage } from "./pages/LandingPage.tsx";
+import { LoginPage } from "./pages/LoginPage.tsx";
+import { AuthPage } from "./pages/AuthPage.tsx";
 import { NewJobPage } from "./pages/NewJobPage.tsx";
 import { JobListPage } from "./pages/JobListPage.tsx";
 import { JobDetailPage } from "./pages/JobDetailPage.tsx";
@@ -39,6 +41,8 @@ export function App() {
       <Routes>
         {/* 落地页在 AppShell 之外：它不带侧栏，是给人第一次打开时看的 */}
         <Route path="/" element={<LandingPage />} />
+        {/* 扫码登录页也独立于控制台：登录不需要先拿到 Bearer token */}
+        <Route path="/login" element={<LoginPage />} />
         <Route path="/console" element={<Navigate to="/jobs/new" replace />} />
         <Route element={<AppShell />}>
           <Route path="/jobs/new" element={<NewJobPage />} />
@@ -47,6 +51,7 @@ export function App() {
           <Route path="/kb" element={<KnowledgePage />} />
           <Route path="/governance" element={<GovernancePage />} />
           <Route path="/platforms" element={<PlatformsPage />} />
+          <Route path="/auth" element={<AuthPage />} />
           <Route path="*" element={<NotFound />} />
         </Route>
       </Routes>

@@ -17,6 +17,7 @@ import { createRegistry as createDataSourceRegistry } from "@brandsale/datasourc
 import { AgentPack } from "@brandsale/agent-pack";
 import { RenderService } from "@brandsale/render";
 import { EventBus, Orchestrator } from "@brandsale/orchestrator";
+import { DreamAuthClient } from "./dreamauth.ts";
 
 export interface Container {
   config: Config;
@@ -30,6 +31,8 @@ export interface Container {
   render: RenderService;
   /** 文档解析器：KB 入库通道用它把 pdf/docx 转成文本 */
   parser: DocumentParser;
+  /** DreamAuth 扫码登录客户端（第三方托管开放平台） */
+  dreamAuth: DreamAuthClient;
   bus: EventBus;
   orchestrator: Orchestrator;
   warnings: string[];
@@ -59,6 +62,7 @@ export function createContainer(config: Config = loadConfig()): Container {
   const pricing = new PricingStore(db, { allowDemo: config.allowDemoData });
   const datasources = createDataSourceRegistry(db, config);
   const render = new RenderService(config);
+  const dreamAuth = new DreamAuthClient(config.dreamAuth);
   // 文档解析器（P1-5）：BM_PARSER_URL 非空即启用 MinerU，否则仅支持纯文本。
   // 未配置时 pdf/docx 上传会明确报 415，而不是被当成文本塞进库。
   const parser = createParser(config);
@@ -181,6 +185,7 @@ export function createContainer(config: Config = loadConfig()): Container {
     agentPack,
     render,
     parser,
+    dreamAuth,
     bus,
     orchestrator,
     warnings,
