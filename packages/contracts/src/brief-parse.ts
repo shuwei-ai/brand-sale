@@ -346,6 +346,9 @@ const INDUSTRY_LEXICON: { industry: string; categories: { re: RegExp; name: stri
       { re: /口红|唇釉|唇膏/, name: "彩妆-唇部" },
       { re: /粉底|气垫|遮瑕/, name: "彩妆-底妆" },
       { re: /防晒/, name: "护肤品-防晒" },
+      /* 洁面品类：`category` 会被逐字当平台搜索词，「洗面奶」是人真的会输进搜索框的词，
+       * 比「护肤品-洁面」这种内部分类名更贴近平台真实语料（见 3C 词表那段的长注释）。 */
+      { re: /洗面奶|洗面乳|洁面乳|洁面/, name: "洗面奶" },
       { re: /洗发|护发/, name: "洗护发" },
     ],
   },
@@ -378,6 +381,21 @@ const INDUSTRY_LEXICON: { industry: string; categories: { re: RegExp; name: stri
       { re: /笔记本|电脑|laptop/i, name: "电脑" },
       { re: /手表|手环|watch|band/i, name: "智能穿戴" },
       { re: /音箱|音响|speaker/i, name: "音箱" },
+    ],
+  },
+  /*
+   * 家纺。与 3C 同理：`category` 会被逐字当平台搜索词，必须给"人真的会输进搜索框"
+   * 的中文词。「棉被 / 被子 / 四件套」这些口述里高频出现、但旧词表完全没覆盖，
+   * 命不中时 LLM 兜底常给英文标识符，在中文平台搜不到内容。
+   */
+  {
+    industry: "家纺",
+    categories: [
+      { re: /棉被|被子|被芯|冬被|夏被/, name: "被子" },
+      { re: /四件套|床品|床单|被套|枕套/, name: "床品四件套" },
+      { re: /枕头|枕芯|乳胶枕/, name: "枕头" },
+      { re: /毛毯|毯子|凉席/, name: "毛毯" },
+      { re: /床垫|床褥|乳胶垫/, name: "床垫" },
     ],
   },
 ];

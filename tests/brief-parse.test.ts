@@ -188,6 +188,46 @@ test("WP-C-12 冬装两类口述都能命中词表（羽绒服 / 保暖内衣）
   assert.equal(parseBriefUtterance("卖打底衫，小红书投 30 万", undefined, NOW).brief.category, "保暖内衣");
 });
 
+/* ── 家纺品类：棉被等口述能命中词表，不再落到 LLM 兜底 ───── */
+
+test("WP-C-13 家纺口述：棉被/四件套能命中词表，category 必须是中文搜索词", () => {
+  const d = parseBriefUtterance(
+    "双11 想在小红书和抖音做一波棉被的明星同款投放，预算 300 万，主要要曝光也要销量",
+    undefined,
+    NOW,
+  );
+  assert.equal(d.brief.industry, "家纺");
+  assert.equal(d.brief.category, "被子");
+  assert.match(d.brief.category ?? "", /[\u4e00-\u9fff]/, "category 必须含中文 —— 它会被逐字当平台搜索词");
+  assert.ok(!d.missing.includes("industry"), "词表命中后 industry 不该再进 missing");
+  assert.ok(!d.missing.includes("category"), "词表命中后 category 不该再进 missing");
+  assert.ok(d.filled.includes("industry"), "industry 应由规则段命中，而不是留给模型补");
+
+  assert.equal(parseBriefUtterance("四件套，抖音投 20 万", undefined, NOW).brief.category, "床品四件套");
+  assert.equal(parseBriefUtterance("卖乳胶枕，小红书投 10 万", undefined, NOW).brief.category, "枕头");
+});
+
+/* ── 缺失检测：行业/类目未命中词表时必须进 missing（不铺假默认值） ── */
+
+test("WP-C-14 行业/类目未被词表命中时进 missing，且不会被 defaults 短路", () => {
+  // 未命中词表 → industry/category 都该进 missing，等着 LLM 补全或追问用户
+  const d = parseBriefUtterance("做一波户外露营装备投放，预算 50 万", undefined, NOW);
+  assert.ok(d.missing.includes("industry"), "未命中的 industry 必须进 missing");
+  assert.ok(d.missing.includes("category"), "未命中的 category 必须进 missing");
+  assert.equal(d.brief.industry, undefined, "不该被悄悄补成假默认值");
+  assert.equal(d.brief.category, undefined, "不该被悄悄补成假默认值");
+
+  // 若调用方传了"写死的行业/类目"当 defaults，缺失检测会被短路——这正是本次要修的场景。
+  // 这里验证：defaults 里不带 industry/category 时，缺失检测如实反映"用户没说清"。
+  const withDefaults = parseBriefUtterance(
+    "做一波户外露营装备投放，预算 50 万",
+    { budget: { currency: "CNY", amount: 500_000 } },
+    NOW,
+  );
+  assert.ok(withDefaults.missing.includes("industry"), "defaults 没给行业，就该如实缺失");
+  assert.ok(withDefaults.missing.includes("category"));
+});
+
 /* ── 品牌语境触发（hasBrandContext，agent-pack 侧的补全段判定依据） ── */
 
 test("WP-C-BRAND hasBrandContext：元词 / 明星同款 / 并列名词都能触发，纯品类词不触发", () => {
