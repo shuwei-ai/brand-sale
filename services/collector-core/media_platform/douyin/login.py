@@ -56,6 +56,12 @@ class DouYinLogin(AbstractLogin):
             The verification accuracy of the slider verification is not very good... If there are no special requirements, it is recommended not to use Douyin login, or use cookie login
         """
 
+        # 路径 A：登录态只由前端「平台绑定」页管理。none 模式必须在**任何**登录 UI 交互
+        # 之前短路——抖音这里原本会先 popup_login_dialog() 点开登录弹层，再判断登录类型。
+        if config.LOGIN_TYPE == "none":
+            raise ValueError(
+                "[DouYinLogin.begin] 登录态失效（login=none）：请到前端「平台绑定」页为抖音重新扫码/填 cookie，采集内核不自行登录")
+
         # popup login dialog
         await self.popup_login_dialog()
 

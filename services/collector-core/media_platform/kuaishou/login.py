@@ -55,6 +55,9 @@ class KuaishouLogin(AbstractLogin):
             await self.login_by_mobile()
         elif config.LOGIN_TYPE == "cookie":
             await self.login_by_cookies()
+        elif config.LOGIN_TYPE == "none":
+            raise ValueError(
+                "[KuaishouLogin.begin] 登录态失效（login=none）：请到前端「平台绑定」页为快手重新扫码，采集内核不自行登录")
         else:
             raise ValueError("[KuaishouLogin.begin] Invalid Login Type Currently only supported qrcode or phone or cookie ...")
 

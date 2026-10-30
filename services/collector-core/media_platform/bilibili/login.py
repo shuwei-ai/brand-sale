@@ -85,6 +85,9 @@ class BilibiliLogin(AbstractLogin):
             await self.login_by_mobile()
         elif config.LOGIN_TYPE == "cookie":
             await self.login_by_cookies()
+        elif config.LOGIN_TYPE == "none":
+            raise ValueError(
+                "[BilibiliLogin.begin] 登录态失效（login=none）：请到前端「平台绑定」页为 B站重新扫码，采集内核不自行登录")
         else:
             raise ValueError(
                 "[BilibiliLogin.begin] Invalid Login Type Currently only supported qrcode or phone or cookie ...")

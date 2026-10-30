@@ -53,7 +53,10 @@ from media_platform.zhihu import ZhihuCrawler  # noqa: E402
 
 PLATFORMS = ("xhs", "dy", "ks", "bili", "wb", "tieba", "zhihu")
 CRAWLER_TYPES = ("search", "detail", "creator")
-LOGIN_TYPES = ("qrcode", "phone", "cookie")
+# `none` 是 brandsale 扩展：登录态**只由前端「平台绑定」页管理**（路径 A），
+# 采集内核遇到未登录时**不自行弹登录**（qrcode 会在无头/服务器上打开本机看图器死等），
+# 而是立即报错退出，把「去绑定页重新扫码」的提示交还给调用方。
+LOGIN_TYPES = ("none", "qrcode", "phone", "cookie")
 CDP_MODES = ("auto", "true", "false", "reuse")
 
 # detail 模式：CLI 的 --specified-id 落到哪个 config 列表
@@ -136,7 +139,14 @@ def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="brandsale 内嵌采集内核入口（MediaCrawler 内核）")
     p.add_argument("--platform", required=True, choices=PLATFORMS)
     p.add_argument("--type", dest="crawler_type", default="search", choices=CRAWLER_TYPES)
-    p.add_argument("--login-type", dest="login_type", default="qrcode", choices=LOGIN_TYPES)
+    p.add_argument(
+        "--login-type",
+        dest="login_type",
+        default="none",
+        choices=LOGIN_TYPES,
+        help="none=登录态由前端绑定页管理，未登录立即失败退出（默认）；"
+        "qrcode/phone/cookie=内核自行登录（仅本机有头调试用）",
+    )
     p.add_argument("--keywords", default="")
     p.add_argument("--specified-id", dest="specified_id", default="", help="detail 模式的 ID/URL 列表，逗号分隔")
     p.add_argument("--creator-id", dest="creator_id", default="", help="creator 模式的创作者 ID/URL 列表，逗号分隔")

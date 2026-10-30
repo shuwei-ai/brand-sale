@@ -66,6 +66,12 @@ export interface CrawlRequest {
    * 阶段采过了，再抓一遍只是把一次秒级的资料采集拖成几分钟。
    */
   profileOnly?: boolean;
+  /**
+   * 登录类型（透传给内核 `--login-type`）。缺省 `none`：登录态**只由前端「平台绑定」
+   * 页管理（路径 A）**，采集内核遇到未登录时立即失败退出，绝不自行弹登录（qrcode 会
+   * 在无头/服务器上打开本机看图器死等 600s）。仅本机有头调试时才需要显式传 qrcode/…。
+   */
+  loginType?: "none" | "qrcode" | "phone" | "cookie";
 }
 
 export interface CrawlOutcome {
@@ -129,6 +135,10 @@ export function buildRunnerArgs(req: CrawlRequest, paths: CorePaths): string[] {
   const keyword = s(params.keyword ?? params.query);
 
   const args = [paths.runPy, "--platform", platform, "--save-path", paths.dataDir];
+
+  // 登录态默认由前端绑定页管理（路径 A）：内核遇到未登录直接失败退出，不自行弹登录。
+  // 见 run.py 的 `--login-type none` 与各平台 login.py 的 begin() 短路分支。
+  args.push("--login-type", req.loginType ?? "none");
 
   if (op === "search") {
     args.push("--type", "search", "--keywords", keyword);

@@ -981,6 +981,21 @@ test("算子 → CLI 参数：未知算子直接抛错，不透传给内核", ()
   assert.throws(() => buildRunnerArgs(req({ platform: "xhs", op: "whatever" as never, params: {}, maxItems: 1, headless: false }), PATHS), /未知算子/);
 });
 
+test("登录类型：默认 none（路径 A，内核不自行弹登录）", () => {
+  const args = buildRunnerArgs(
+    req({ platform: "bili", op: "search", params: { keyword: "x" }, maxItems: 1, headless: false }),
+    PATHS,
+  );
+  assert.equal(valOf(args, "--login-type"), "none", "采集内核默认不自行登录，登录态只由前端绑定页管理");
+
+  // 显式传 qrcode 时透传（仅本机有头调试用）
+  const qr = buildRunnerArgs(
+    { ...req({ platform: "bili", op: "search", params: { keyword: "x" }, maxItems: 1, headless: false }), loginType: "qrcode" },
+    PATHS,
+  );
+  assert.equal(valOf(qr, "--login-type"), "qrcode");
+});
+
 /* ── 内核报错的提取（子进程非 0 退出时） ─────────────────────── */
 
 test("内核报错：取带消息的根因，不被外层的 tenacity.RetryError 带偏", () => {
