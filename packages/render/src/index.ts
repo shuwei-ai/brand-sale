@@ -103,6 +103,88 @@ const linkify = (s: string): string => {
 const mdInline = (s: string): string => linkify(s).replace(/\*\*([^*<>]{1,160}?)\*\*/g, "<strong>$1</strong>");
 const fmt = (n: number): string => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/\.?0+$/, ""));
 
+/* ── SVG 文本：按**像素宽**截断 + 原生悬浮显示全文 ────────────
+ *
+ * 为什么不能按固定字数截断：画布宽固定（900），但分类数、字号、中英混排都在变。
+ * 实测一份 11 个分类的柱图，格子只有 74px，而 `slice(0,8)` 的 8 个中文字在 11.5px 下
+ * 约 92px —— 标签直接压成一坨，且被截掉的 4 个字**没有任何途径能看到**。
+ * 所以这里改成：按估算宽度截断（拿到多少显示多少），全文塞进 SVG 原生 `<title>`，
+ * 鼠标悬浮即显示完整文本。零 JS、零依赖，打印与导出也不受影响。
+ */
+
+/** 估算文本像素宽：的全角字符按 1em，其余按 0.56em（Noto Sans / PingFang 的经验值） */
+const textWidth = (s: string, fontSize: number): number => {
+  let w = 0;
+  for (const ch of s) {
+    const code = ch.codePointAt(0) ?? 0;
+    const wide =
+      (code >= 0x1100 && code <= 0x115f) ||
+      (code >= 0x2e80 && code <= 0xa4cf) ||
+      (code >= 0xac00 && code <= 0xd7a3) ||
+      (code >= 0xf900 && code <= 0xfaff) ||
+      (code >= 0xfe30 && code <= 0xfe6f) ||
+      (code >= 0xff00 && code <= 0xff60) ||
+      (code >= 0xffe0 && code <= 0xffe6);
+    w += fontSize * (wide ? 1 : 0.56);
+  }
+  return w;
+};
+
+/**
+ * 按可用宽度截断并加省略号。
+ * `minChars` 是下限：宁可略微溢出，也不要把标签压成「…」这种零信息状态。
+ */
+const fitText = (s: string, maxW: number, fontSize: number, minChars = 2): string => {
+  const chars = [...s];
+  if (textWidth(s, fontSize) <= maxW) return s;
+  const ellW = textWidth("…", fontSize);
+  let out = "";
+  for (const ch of chars) {
+    if (textWidth(out + ch, fontSize) + ellW > maxW) break;
+    out += ch;
+  }
+  // 去掉尾部空格：否则「Koozzzzz …」看着截断了，实际那格空格仍把标签撑出槽位
+  out = out.replace(/\s+$/, "");
+  // 兜底：槽位极窄时省略号本身就超宽，此时保底显示 minChars，宁可略微溢出也不要空标签
+  if (out.length < minChars && chars.length > 0) out = chars.slice(0, minChars).join("").replace(/\s+$/, "");
+  return out + "…";
+};
+
+/**
+ * 生成一个 SVG 文本节点。
+ * `text` 是**实际渲染**的内容（可能已截断），`full` 是悬浮时显示的原文；
+ * 两者不同才挂 `title` 与可交互样式，避免给每个正常标签都加无意义的悬浮框。
+ */
+const svgText = (o: {
+  x: number;
+  y: number;
+  text: string;
+  full?: string;
+  size?: number;
+  fill?: string;
+  weight?: number | string;
+  anchor?: "start" | "middle" | "end";
+  rotate?: number;
+}): string => {
+  const size = o.size ?? 11.5;
+  const full = o.full ?? o.text;
+  const weight = o.weight ? ` font-weight="${o.weight}"` : "";
+  const rot = o.rotate ? ` transform="rotate(${o.rotate} ${o.x.toFixed(1)} ${o.y.toFixed(1)})"` : "";
+  // 被截断的标签给一个可交互提示（虚线下划线 + 悬浮变色，见 CSS .lbl-trunc）
+  const cls = o.text !== full ? ` class="lbl-trunc"` : "";
+  const title = o.text !== full ? `<title>${esc(full)}</title>` : "";
+  return `<text x="${o.x.toFixed(1)}" y="${o.y.toFixed(1)}" text-anchor="${o.anchor ?? "start"}" font-size="${size}" fill="${
+    o.fill ?? "#3b4048"
+  }"${weight}${rot}${cls}>${title}${esc(o.text)}</text>`;
+};
+
+/**
+ * 图表下方的一次性操作提示。
+ * 只在确实有标签被截断时出现——否则每个图都挂一句同样的说明，读者会当噪声过滤掉。
+ */
+const truncHint = (on: boolean): string =>
+  on ? `<div class="trunc-hint">标签过长已截断 · 鼠标悬停可查看完整名称</div>` : "";
+
 export class RenderService implements IRenderService {
   constructor(private readonly config: Config) {}
 
@@ -411,7 +493,7 @@ export class RenderService implements IRenderService {
   .kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:16px;margin:20px 0}
   .kpi .card{border:1px solid var(--line);border-radius:14px;padding:18px 20px;background:#fbfcfd}
   .kpi .card .l{color:var(--muted);font-size:13px;letter-spacing:.02em}
-  .kpi .card .v{font-family:var(--serif);font-size:24px;font-weight:700;margin-top:8px;font-variant-numeric:tabular-nums;line-height:1.3}
+  .kpi .card .v{font-family:var(--serif);font-size:24px;font-weight:700;margin-top:8px;font-variant-numeric:tabular-nums;line-height:1.3;overflow-wrap:anywhere}
   .kpi .card .t{margin-top:10px}
   .kpi.kpi-wide .card.lead{border-color:var(--accent);background:var(--accent-soft);box-shadow:0 2px 12px rgba(31,78,95,.08)}
   .kpi.kpi-wide .card.lead .v{font-size:28px}
@@ -428,7 +510,7 @@ export class RenderService implements IRenderService {
   .cites li{margin:8px 0;padding-left:14px;position:relative;line-height:1.7}
   .cites li::before{content:"·";position:absolute;left:0;color:#9aa1ab}
   .cites .badge{display:inline-block;font-size:11px;padding:0 7px;border-radius:999px;background:var(--accent-soft);color:var(--accent);border:1px solid #d6e2e7;margin-right:6px}
-  .cites a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(31,78,95,.3)}
+  .cites a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(31,78,95,.3);word-break:break-all}
   .cites a:hover{border-bottom-color:var(--accent)}
   .cites .citemeta{color:#a0a6b0}
   blockquote{border-left:3px solid var(--accent);margin:24px 0;padding:6px 0 6px 20px;color:#454b54;font-family:var(--serif);font-size:16px;line-height:1.75}
@@ -442,14 +524,19 @@ export class RenderService implements IRenderService {
   figure.chart,figure.matrix{margin:24px 0;border:1px solid var(--line);border-radius:14px;padding:24px 26px;background:#fff}
   figure.chart svg,figure.matrix svg{width:100%;height:auto;display:block}
   figure.chart figcaption,figure.matrix figcaption{color:var(--muted);font-size:12.5px;margin-top:10px;text-align:center;letter-spacing:.02em}
+  /* 图表标签被截断时：虚线下划线 + hover 变色，明确告诉读者「可以悬浮看全文」。
+     全文由 SVG 原生 <title> 提供，不依赖脚本，打印与导出同样安全。 */
+  svg .lbl-trunc{cursor:help;text-decoration:underline dotted rgba(107,114,128,.8);text-underline-offset:2px}
+  svg .lbl-trunc:hover{fill:#1f4e5f;text-decoration-color:#1f4e5f}
+  .trunc-hint{font-size:12px;color:#8a919b;text-align:center;margin-top:6px;letter-spacing:.02em}
   figure img{max-width:100%;border-radius:10px}
   figure figcaption{color:var(--muted);font-size:12.5px;margin-top:8px}
   .toc{margin:4px 0}
   .toc-row{display:flex;align-items:baseline;gap:14px;padding:13px 0;border-bottom:1px solid var(--line-soft);font-size:15px}
-  .toc-t{font-weight:500;color:var(--ink)}
+  .toc-t{font-weight:500;color:var(--ink);min-width:0;overflow-wrap:anywhere}
   .toc-d{flex:1;border-bottom:1px dotted #cbd2db;transform:translateY(-4px)}
   .toc-p{color:var(--muted);font-family:var(--serif);font-variant-numeric:tabular-nums}
-  .src{background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:40px 48px;margin-top:32px;font-size:14px}
+  .src{background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:40px 48px;margin-top:32px;font-size:14px;overflow-wrap:anywhere}
   .src h3{margin-top:0;font-family:var(--serif);font-size:18px}
   .excl{color:var(--warn)}
   .disc{margin-top:20px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:16px}
@@ -574,6 +661,12 @@ export class RenderService implements IRenderService {
     if (maxY === minY) maxY = minY + 1;
     const scaleY = (v: number) => M.t + ih - ((v - minY) / (maxY - minY)) * ih;
     const catX = (i: number) => M.l + (iw * (i + 0.5)) / Math.max(1, cats.length);
+    /** 每个分类在横轴上分到的宽度 —— 决定标签最多能显示几个字 */
+    const slotW = iw / Math.max(1, cats.length);
+    /** 格子窄时降一档字号，同样的宽度能多放进一个字 */
+    const catFont = slotW < 80 ? 10.5 : 11.5;
+    /** 是否有标签被截断 —— 有才在图表下方加操作提示 */
+    let truncated = false;
 
     const parts: string[] = [];
     // 网格 + 纵轴刻度
@@ -586,8 +679,19 @@ export class RenderService implements IRenderService {
     parts.push(`<line x1="${M.l}" y1="${M.t}" x2="${M.l}" y2="${M.t + ih}" stroke="#c9ced6" stroke-width="1"/>`);
     // 横轴标签
     cats.forEach((c, i) => {
+      // 每个分类只能分到 `slotW` 宽：分类越密，显示的字越少（不足就截断 + 悬浮看全文）
+      const shown = fitText(c, slotW - 12, catFont, 2);
+      if (shown !== c) truncated = true;
       parts.push(
-        `<text x="${catX(i).toFixed(1)}" y="${M.t + ih + 18}" text-anchor="middle" font-size="11.5" fill="#5c636e">${esc(c.length > 8 ? c.slice(0, 8) + "…" : c)}</text>`,
+        svgText({
+          x: catX(i),
+          y: M.t + ih + 18,
+          text: shown,
+          full: c,
+          size: catFont,
+          fill: "#5c636e",
+          anchor: "middle",
+        }),
       );
     });
 
@@ -603,9 +707,18 @@ export class RenderService implements IRenderService {
           const yv = scaleY(p.y);
           const x = M.l + ci * groupW + groupW * 0.14 + si * barW;
           const h = Math.abs(y0 - yv);
-          parts.push(`<rect x="${x.toFixed(1)}" y="${Math.min(y0, yv).toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, h).toFixed(1)}" fill="${color}" rx="2"/>`);
+          // 柱身自带悬浮说明：即使横轴标签被截断、柱顶数值因太密而省略，hover 也能看到完整分类与数值
+          parts.push(
+            `<rect x="${x.toFixed(1)}" y="${Math.min(y0, yv).toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, h).toFixed(
+              1,
+            )}" fill="${color}" rx="2"><title>${esc(`${p.x} · ${s.name}：${fmt(p.y)}`)}</title></rect>`,
+          );
           if (cats.length * block.series.length <= 24) {
-            parts.push(`<text x="${(x + barW / 2).toFixed(1)}" y="${(Math.min(y0, yv) - 4).toFixed(1)}" text-anchor="middle" font-size="10.5" fill="#3b4048">${fmt(p.y)}</text>`);
+            const label = fmt(p.y);
+            // 数值不截断（截掉数字等于给假数），放不下就不画，信息仍在柱子的悬浮里
+            if (textWidth(label, 10.5) <= barW + 8) {
+              parts.push(svgText({ x: x + barW / 2, y: Math.min(y0, yv) - 4, text: label, size: 10.5, fill: "#3b4048", anchor: "middle" }));
+            }
           }
         });
       });
@@ -616,29 +729,40 @@ export class RenderService implements IRenderService {
         const pts = s.points
           .map((p) => {
             const ci = cats.indexOf(p.x);
-            return ci < 0 ? null : { x: catX(ci), y: scaleY(p.y) };
+            return ci < 0 ? null : { x: catX(ci), y: scaleY(p.y), raw: p };
           })
-          .filter((v): v is { x: number; y: number } => v !== null);
+          .filter((v): v is { x: number; y: number; raw: { x: string; y: number } } => v !== null);
         if (block.chartType === "line" && pts.length > 1) {
           parts.push(`<polyline points="${pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}" fill="none" stroke="${color}" stroke-width="2.2"/>`);
         }
-        pts.forEach((p) => parts.push(`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="${color}"/>`));
+        pts.forEach((p) =>
+          parts.push(
+            `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="${color}"><title>${esc(
+              `${p.raw.x} · ${s.name}：${fmt(p.raw.y)}`,
+            )}</title></circle>`,
+          ),
+        );
       });
     }
 
     return `<figure class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(block.chartType)} 图表" preserveAspectRatio="xMidYMid meet">${legend}${parts.join(
       "",
-    )}</svg>${caption}</figure>`;
+    )}</svg>${caption}${truncHint(truncated)}</figure>`;
   }
 
   private svgLegend(names: string[], x0: number, y: number): string {
+    if (names.length === 0) return "";
+    const W = 900;
+    // 按项数均分可用宽度：靠前的长名字不能把后面几项挤出画布（旧版按自然宽累加，8 项长名字必溢出）
+    const per = Math.max(70, (W - x0 - 20) / names.length);
     let x = x0;
     const out: string[] = [];
     names.forEach((n, i) => {
       const color = CHART_COLORS[i % CHART_COLORS.length]!;
-      out.push(`<rect x="${x}" y="${y - 9}" width="11" height="11" rx="2" fill="${color}"/>`);
-      out.push(`<text x="${x + 16}" y="${y}" font-size="12" fill="#3b4048">${esc(n)}</text>`);
-      x += 16 + n.length * 12.5 + 22;
+      out.push(`<rect x="${x.toFixed(1)}" y="${y - 9}" width="11" height="11" rx="2" fill="${color}"/>`);
+      const text = fitText(n, per - 40, 12, 2);
+      out.push(svgText({ x: x + 16, y, text, full: n, size: 12, fill: "#3b4048" }));
+      x += 16 + textWidth(text, 12) + 22;
     });
     return out.join("");
   }
@@ -676,14 +800,19 @@ export class RenderService implements IRenderService {
       }
       angle = a2;
     });
-    // 右下图例（带占比）
+    // 右下图例（带占比）。名字与百分比各占一段固定宽度：名字超长必须截断，
+    // 否则会盖到右对齐的百分比上；条目多时压缩行距，避免整列掉出画布底边。
     let ly = 70;
+    const rowH = Math.min(24, Math.max(15, (H - 96) / Math.max(1, pts.length)));
     pts.forEach((p, i) => {
       const color = CHART_COLORS[i % CHART_COLORS.length]!;
-      parts.push(`<rect x="560" y="${ly - 10}" width="12" height="12" rx="2" fill="${color}"/>`);
-      parts.push(`<text x="580" y="${ly}" font-size="12.5" fill="#3b4048">${esc(p.x)}</text>`);
-      parts.push(`<text x="860" y="${ly}" text-anchor="end" font-size="12.5" fill="#5c636e" font-variant-numeric="tabular-nums">${((Math.max(0, p.y) / total) * 100).toFixed(1)}%</text>`);
-      ly += 24;
+      const pct = `${((Math.max(0, p.y) / total) * 100).toFixed(1)}%`;
+      parts.push(
+        `<rect x="560" y="${(ly - 10).toFixed(1)}" width="12" height="12" rx="2" fill="${color}"><title>${esc(`${p.x}：${fmt(p.y)}`)}</title></rect>`,
+      );
+      parts.push(svgText({ x: 580, y: ly, text: fitText(p.x, 236, 12.5, 2), full: p.x, size: 12.5, fill: "#3b4048" }));
+      parts.push(svgText({ x: 860, y: ly, text: pct, size: 12.5, fill: "#5c636e", anchor: "end" }));
+      ly += rowH;
     });
     return `<figure class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="饼图" preserveAspectRatio="xMidYMid meet">${legend}${parts.join("")}</svg>
       <figcaption>构成占比 · 纵轴 ${esc(block.axis?.yLabel ?? "占比")}</figcaption></figure>`;
@@ -700,8 +829,40 @@ export class RenderService implements IRenderService {
       const w = Math.max(40, (p.y / max) * (W - M.l - M.r));
       const x = M.l + (W - M.l - M.r - w) / 2;
       const y = top + i * rowH + 6;
-      parts.push(`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${(rowH - 12).toFixed(1)}" rx="4" fill="${CHART_COLORS[i % CHART_COLORS.length]}"/>`);
-      parts.push(`<text x="${(W / 2).toFixed(1)}" y="${(y + (rowH - 12) / 2 + 4).toFixed(1)}" text-anchor="middle" font-size="12.5" fill="#fff" font-weight="600">${esc(p.x)} · ${fmt(p.y)}</text>`);
+      const cy = y + (rowH - 12) / 2 + 4;
+      const full = `${p.x}：${fmt(p.y)}`;
+      parts.push(
+        `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${(rowH - 12).toFixed(1)}" rx="4" fill="${
+          CHART_COLORS[i % CHART_COLORS.length]
+        }"><title>${esc(full)}</title></rect>`,
+      );
+      if (w >= 140) {
+        // 宽条：白字压在条内居中；按条宽截断，全文走悬浮
+        parts.push(
+          svgText({
+            x: W / 2,
+            y: cy,
+            text: fitText(`${p.x} · ${fmt(p.y)}`, w - 20, 12.5, 3),
+            full,
+            size: 12.5,
+            fill: "#fff",
+            weight: 600,
+            anchor: "middle",
+          }),
+        );
+      } else {
+        // 窄条：白字会落到浅色底上（等于看不见），改为移到条的右侧用深色
+        parts.push(
+          svgText({
+            x: x + w + 8,
+            y: cy,
+            text: fitText(full, Math.max(56, W - M.r - (x + w) - 8), 12, 3),
+            full,
+            size: 12,
+            fill: "#3b4048",
+          }),
+        );
+      }
     });
     return `<figure class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="漏斗图" preserveAspectRatio="xMidYMid meet">${legend}${parts.join("")}</svg>
       <figcaption>转化漏斗 · 纵轴 ${esc(block.axis?.yLabel ?? "数值")}</figcaption></figure>`;
@@ -744,25 +905,97 @@ export class RenderService implements IRenderService {
     parts.push(`<line x1="${M.l}" y1="${M.t + ih / 2}" x2="${M.l + iw}" y2="${M.t + ih / 2}" stroke="#c9ced6" stroke-dasharray="4 4"/>`);
 
     // 点 + 标签
+    // 气泡贴在绘图区边界时，圆心与标签会一起跑出画布（实测顶部气泡的标签被切掉），
+    // 所以圆心先夹紧到 [M.t+r, M.t+ih-r]；标签再随之做纵向避让。
+    const labels: { x: number; y: number; text: string; full: string }[] = [];
+    let truncated = false;
     block.cells.forEach((c, i) => {
-      const x = scaleX(c.x);
-      const y = scaleY(c.y);
       const r = 6 + ((c.size ?? 1) / maxSize) * 8;
-      parts.push(`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r.toFixed(1)}" fill="${CHART_COLORS[i % CHART_COLORS.length]}" fill-opacity="0.78" stroke="#fff" stroke-width="1.5"/>`);
+      const x = Math.min(Math.max(scaleX(c.x), M.l + r), M.l + iw - r);
+      const y = Math.min(Math.max(scaleY(c.y), M.t + r), M.t + ih - r);
       parts.push(
-        `<text x="${(x + r + 4).toFixed(1)}" y="${(y + 4).toFixed(1)}" font-size="11.5" fill="#2c3138" font-weight="600">${esc(c.label.length > 10 ? c.label.slice(0, 10) + "…" : c.label)}</text>`,
+        `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r.toFixed(1)}" fill="${CHART_COLORS[i % CHART_COLORS.length]}" fill-opacity="0.78" stroke="#fff" stroke-width="1.5"><title>${esc(
+          `${c.label}（${block.xLabel} ${fmt(c.x)} · ${block.yLabel} ${fmt(c.y)}${c.size !== undefined ? ` · 规模 ${fmt(c.size)}` : ""}）`,
+        )}</title></circle>`,
       );
+      // 标签向右延伸，右侧只剩到画布边的距离：按这个宽度截断，全文悬浮可见
+      const shown = fitText(c.label, Math.max(40, W - 12 - (x + r + 4)), 11.5, 2);
+      if (shown !== c.label) truncated = true;
+      labels.push({ x: x + r + 4, y: y + 4, text: shown, full: c.label });
     });
+    // 纵向避让：点位密集时标签会叠成一团（实测 4 个标签压在同一处），按 y 排序后逐级下推；
+    // 推到底边还放不下就省略该标签——气泡本身仍带 tooltip，信息不会丢。
+    labels.sort((a, b) => a.y - b.y);
+    let lastY = Number.NEGATIVE_INFINITY;
+    for (const l of labels) {
+      const y = Math.max(l.y, lastY + 13);
+      lastY = y;
+      if (y > M.t + ih - 2) continue;
+      parts.push(svgText({ x: l.x, y, text: l.text, full: l.full, size: 11.5, fill: "#2c3138", weight: 600 }));
+    }
 
-    // 轴标签
-    parts.push(`<text x="${M.l + iw / 2}" y="${H - 12}" text-anchor="middle" font-size="12.5" fill="#5c636e">${esc(block.xLabel)} →</text>`);
-    parts.push(`<text x="18" y="${M.t + ih / 2}" text-anchor="middle" font-size="12.5" fill="#5c636e" transform="rotate(-90 18 ${M.t + ih / 2})">${esc(block.yLabel)} →</text>`);
-    // 象限角标
-    parts.push(`<text x="${M.l + 8}" y="${M.t + 16}" font-size="11" fill="#8a919b">高${esc(block.yLabel)} · 低${esc(block.xLabel)}</text>`);
-    parts.push(`<text x="${M.l + iw - 8}" y="${M.t + 16}" text-anchor="end" font-size="11" fill="#8a919b">高${esc(block.yLabel)} · 高${esc(block.xLabel)}</text>`);
-    parts.push(`<text x="${M.l + iw - 8}" y="${M.t + ih - 8}" text-anchor="end" font-size="11" fill="#8a919b">低${esc(block.yLabel)} · 高${esc(block.xLabel)}</text>`);
+    /*
+     * 轴标签（超长则截断，避免把画布两侧顶出去）。
+     * 除宽度外再加一道**字数**上限：旋转后的 y 轴标签即使宽度还能塞下，
+     * 25 个字竖排也会挤满整个左侧留白，读起来比截断更难。
+     */
+    const AXIS_MAX_CHARS = 18;
+    const clipChars = (s: string): string => ([...s].length > AXIS_MAX_CHARS ? `${[...s].slice(0, AXIS_MAX_CHARS).join("")}…` : s);
+    const xFull = `${block.xLabel} →`;
+    const yFull = `${block.yLabel} →`;
+    parts.push(
+      svgText({
+        x: M.l + iw / 2,
+        y: H - 12,
+        text: fitText(clipChars(xFull), iw, 12.5, 3),
+        full: xFull,
+        size: 12.5,
+        fill: "#5c636e",
+        anchor: "middle",
+      }),
+    );
+    parts.push(
+      svgText({
+        x: 18,
+        y: M.t + ih / 2,
+        text: fitText(clipChars(yFull), ih, 12.5, 3),
+        full: yFull,
+        size: 12.5,
+        fill: "#5c636e",
+        anchor: "middle",
+        rotate: -90,
+      }),
+    );
+    /*
+     * 象限角标。
+     * 只在**两个轴名都短**时才画：角标是「高X · 低Y」的拼接句，轴名一长（实测 25 字的
+     * 「本轮采集到的公开互动合计（点赞+评论+收藏+分享）」）就变成横贯半个画布的糊字，
+     * 截断后也只剩半句。这种情况下角标没有增量信息——轴标签已经说明方向了，索性不画。
+     */
+    if (block.xLabel.length <= 8 && block.yLabel.length <= 8) {
+      // 宽度上限取半个绘图区，避免左右两组角标在中线撞上
+      const cornerW = iw / 2 - 16;
+      for (const [anchor, corner] of [
+        ["start", `高${block.yLabel} · 低${block.xLabel}`],
+        ["end", `高${block.yLabel} · 高${block.xLabel}`],
+        ["end", `低${block.yLabel} · 高${block.xLabel}`],
+      ] as const) {
+        const isBottom = corner.startsWith("低");
+        parts.push(
+          svgText({
+            x: anchor === "start" ? M.l + 8 : M.l + iw - 8,
+            y: isBottom ? M.t + ih - 8 : M.t + 16,
+            text: fitText(corner, cornerW, 11, 3),
+            full: corner,
+            size: 11,
+            fill: "#8a919b",
+            anchor,
+          }),
+        );
+      }
+    }
 
     return `<figure class="matrix"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="象限矩阵" preserveAspectRatio="xMidYMid meet">${parts.join("")}</svg>
-      <figcaption>${esc(block.xLabel)} × ${esc(block.yLabel)} 象限定位（气泡大小表示规模）</figcaption></figure>`;
+      <figcaption>${esc(block.xLabel)} × ${esc(block.yLabel)} 象限定位（气泡大小表示规模）</figcaption>${truncHint(truncated)}</figure>`;
   }
 }
