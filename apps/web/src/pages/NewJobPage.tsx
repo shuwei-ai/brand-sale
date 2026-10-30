@@ -45,8 +45,18 @@ interface FormValues {
 }
 
 const DEFAULTS: FormValues = {
-  industry: "美妆",
-  category: "护肤品-精华",
+  /**
+   * 行业 / 类目**留空**，不放占位值。
+   *
+   * 曾写死 `industry: "美妆"` / `category: "护肤品-精华"`：这两个字段本应由
+   * 「一句话录入」从用户原话里**动态提取**（规则词表 + LLM 补全）。写死后，
+   * 用户输入"棉被投放"这类不含词表关键词的诉求时，`doParse` 把当前表单值
+   * （即写死的"美妆/护肤品-精华"）当 `defaults` 回传，规则段 `{...defaults,...parsed}`
+   * 会把它们先铺进去 → 缺失检测判定"已填" → LLM 补全的 missing 里根本没有
+   * industry/category → 永远提取不出"家纺/棉被"。留空后缺失检测才走得通。
+   */
+  industry: "",
+  category: "",
   /**
    * 品牌默认**留空**，不要放占位符。
    *
@@ -62,7 +72,12 @@ const DEFAULTS: FormValues = {
   retention: 0.2,
   window: [dayjs("2026-05-20"), dayjs("2026-06-20")],
   platforms: ["douyin", "xiaohongshu"],
-  notes: "主打新品抗老精华，竞品锁定 X/Y",
+  /**
+   * notes 默认**留空**：它是「意图与约束」而非事实数据，且会喂给任务拆解。
+   * 曾写死"主打新品抗老精华，竞品锁定 X/Y"，会把假事实（抗老精华 / 竞品 X/Y）
+   * 带进真实任务，污染竞品格局与差距矩阵——和假品牌 `brand_A` 是同一种坑。
+   */
+  notes: "",
 };
 
 /** 时间窗默认值：今天起 30 天。放函数里，避免模块加载时就固化住日期。 */
@@ -113,9 +128,16 @@ export function NewJobPage() {
     setParsing(true);
     try {
       const current = form.getFieldsValue();
+      /*
+       * 行业 / 类目**故意不回传**给解析接口。
+       *
+       * 它们是「一句话录入」要**动态提取**的目标，不是已知默认值。若把当前表单值
+       * （哪怕已是空串）当 `defaults` 回传，规则段 `{...defaults, ...parsed}` 会先铺一层，
+       * 导致缺失检测把"用户还没说清楚的行业/类目"误判成"已填"，LLM 补全段的 missing
+       * 里就没有这两个字段，永远提取不出来。回传的只应是真正的"合理默认"（预算量纲、
+       * 时间窗），让行业/类目老老实实走「规则词表 → LLM 补全 → 追问用户」的链路。
+       */
       const r = await api.parseBrief(text, {
-        industry: current.industry,
-        category: current.category,
         budget: { currency: "CNY", amount: Math.round((current.budgetWan || 0) * 10_000) },
         window: current.window
           ? { from: current.window[0].format("YYYY-MM-DD"), to: current.window[1].format("YYYY-MM-DD") }
